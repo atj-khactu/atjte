@@ -1,0 +1,12 @@
+{
+  "_comment": "A Lighter gateway: the only process signing with its API keys, so no two bots on one key ever send the same nonce. List the accounts its bots trade; 'main' takes the bare lighter_* names in gateway.env, any other name the same three names suffixed _<name>.",
+  "name": "lighter_main",
+  "venue": "lighter",
+  "network": "mainnet",
+  "listen_port": 5630,
+  "accounts": ["main"],
+  "msgs_per_min": 600,
+  "max_inflight": 50,
+  "account_dms_s": 300,
+  "clients": []
+}

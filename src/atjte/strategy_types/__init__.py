@@ -1,0 +1,1 @@
+"""The strategy types: one sub-package per engine (``perp``, ``spot``), one folder per type (``grid_bot``, ``bollinger_bot``, ``fixed_bot``, ``fixed_entry_exit``) holding the entry module and its settings template. See atjte.templates."""

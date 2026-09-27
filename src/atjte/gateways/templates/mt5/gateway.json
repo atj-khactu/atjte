@@ -1,0 +1,8 @@
+{
+  "_comment": "An MT5 gateway: ONE per terminal (one MT5 account). It holds the terminal for every bot on this machine and pushes their ticks.",
+  "name": "mt5_main",
+  "venue": "mt5",
+  "listen_port": 5620,
+  "tick_poll_ms": 10,
+  "clients": []
+}

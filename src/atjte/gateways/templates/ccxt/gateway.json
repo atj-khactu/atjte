@@ -1,0 +1,16 @@
+{
+  "_comment": "A CCXT gateway: ONE per exchange on the machine. It holds the accounts' keys and serves every bot on that exchange: reads, prices, fills and orders. 'main' uses the exchange's plain key names in gateway.env, any other account the same names with _<account> appended.",
+  "name": "coinbase_main",
+  "venue": "ccxt",
+  "exchange": "coinbase",
+  "listen_port": 5650,
+  "accounts": [
+    "main"
+  ],
+  "order_transport": "auto",
+  "default_type": "",
+  "msgs_per_min": 600,
+  "max_inflight": 40,
+  "account_dms_s": 60,
+  "clients": []
+}

@@ -1,0 +1,12 @@
+{
+  "_comment": "A Hyperliquid gateway: ONE per machine (Hyperliquid limits websockets per IP). List the accounts its bots trade; 'main' is the wallet itself, any other name needs hyperliquid_sub_account_<name> in gateway.env.",
+  "name": "hl_main",
+  "venue": "hyperliquid",
+  "listen_port": 5610,
+  "accounts": ["main"],
+  "dexes": ["xyz"],
+  "msgs_per_min": 1800,
+  "max_inflight": 90,
+  "account_dms_s": 60,
+  "clients": []
+}

@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atjte"
+version = "0.1.0"
+description = "ATJ trading engines: cross-venue arbitrage market making between crypto exchanges (CCXT) and CFD platforms (MetaTrader 5)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "ATJ Traders" }]
+keywords = ["trading", "arbitrage", "market-making", "ccxt", "kraken", "metatrader5", "fix"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    # 4.5.74: the first with Lighter createOrderWs/cancelOrderWs (venues.py ws_orders)
+    "ccxt>=4.5.74,<5",
+    # the FIX 4.4 codec (atjte.fix, the Kraken FIX gateway)
+    "simplefix>=1.0.17",
+    # the IANA time zones zoneinfo reads (trading blackouts); Windows ships none
+    "tzdata; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+# The MetaTrader 5 terminal API — Windows only, needed for the MT5 hedge leg.
+mt5 = ["MetaTrader5>=5.0.5735; platform_system == 'Windows'"]
+# The cTrader Open API connector (Twisted based).
+ctrader = ["ctrader-open-api>=0.9.2", "service_identity"]
+
+[project.scripts]
+atjte = "atjte.cli:main"
+atjte-gateway = "atjte.gateways.fix.gateway:main"
+
+[project.urls]
+Homepage = "https://github.com/atj-khactu/atjte"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# Templates and engine defaults are read as FILES (by an AST literal reader,
+# never imported) — by the control panel, the generator and the tests — so
+# they ship as package data as well as modules.
+atjte = [
+    "py.typed",
+    "engines/*/base_settings.py",
+    "engines/*/project_settings_template.py",
+    "strategy_types/*/*/*.py",
+    # what `atjte-gateway --new` copies (gateway.json, gateway.env.example, launchers)
+    "gateways/templates/*/*",
+]

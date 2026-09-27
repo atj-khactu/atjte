@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "TEMPLATE for a FIX gateway. Copy with: atjte-gateway --new <name>",
+    "Nothing here is secret: this file is TRACKED and meant to be read.",
+    "Credentials go in gateway.env beside it, which is gitignored.",
+    "An unknown setting is an ERROR, not a silent default."
+  ],
+  "name": "CHANGE_ME",
+  "venue": "kraken",
+  "host": "",
+  "trd_port": 4001,
+  "md_port": 4000,
+  "target_comp_id": "KRAKEN-TRD",
+  "listen_port": 5599,
+  "heartbeat_s": 60,
+  "rollover_utc": "22:00",
+  "rollover_grace_s": 120,
+  "ops_per_s": 1.5,
+  "market_data": true,
+  "symbol_default": "",
+  "tls_verify": true,
+  "trace": false,
+  "clients": []
+}
