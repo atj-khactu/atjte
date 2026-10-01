@@ -1,0 +1,29 @@
+{
+  "format": "acp-strategy-settings",
+  "version": 1,
+  "sample": true,
+  "label": "Small test — XYZ-JPY vs USDJPY (1x)",
+  "description": "A small, 1x preset to test XYZ-JPY/USDC:USDC vs MT5 USDJPY: 13 units per level ~ a 0.02-lot USDJPY hedge (about 2,000 USD; hedged by value through the project's FX pair); two grid levels per side, so at most 26 units each way; isolated margin; daily loss capped at 25 USD and 25,000 USD of volume per leg. Sizes assume a broker whose minimum lot is the usual one — Save checks them against the market the bot reports; start in DRY RUN.",
+  "kind": "grid",
+  "symbol_venue": "XYZ-JPY/USDC:USDC",
+  "symbol_mt5": "USDJPY",
+  "settings": {
+    "SPREAD_UNIT": "abs",
+    "LEVERAGE": "1",
+    "MARGIN_MODE": "isolated",
+    "DYNAMIC_ALLOCATION": "False",
+    "ALLOCATION_PCT": "None",
+    "RISK_UNIT": "abs",
+    "MAX_DAILY_LOSS_USD": "25",
+    "GRID_LEVELS": "2",
+    "GRID_CENTER": "0.0",
+    "GRID_SHORT": "True",
+    "GRID_STEP": "0.05",
+    "ORDER_VOLUME": "13",
+    "GRID_LEVEL_UNITS": "13",
+    "MAX_POSITION_UNITS": "26",
+    "MAX_SHORT_UNITS": "26",
+    "CLOSE_ONLY": "False",
+    "MAX_DAILY_VOLUME_USD": "25000"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "format": "acp-strategy-settings",
+  "version": 1,
+  "sample": true,
+  "label": "Small test — XYZ-EUR vs EURUSD (1x)",
+  "description": "A small, 1x preset to test XYZ-EUR/USDC:USDC vs MT5 EURUSD: 1,000 EUR per level = one 0.01-lot EURUSD hedge (about 1,100 USD); two grid levels per side, so at most 2000 units each way; isolated margin; daily loss capped at 25 USD and 15,000 USD of volume per leg. Sizes assume a broker whose minimum lot is the usual one — Save checks them against the market the bot reports; start in DRY RUN.",
+  "kind": "grid",
+  "symbol_venue": "XYZ-EUR/USDC:USDC",
+  "symbol_mt5": "EURUSD",
+  "settings": {
+    "SPREAD_UNIT": "abs",
+    "LEVERAGE": "1",
+    "MARGIN_MODE": "isolated",
+    "DYNAMIC_ALLOCATION": "False",
+    "ALLOCATION_PCT": "None",
+    "RISK_UNIT": "abs",
+    "MAX_DAILY_LOSS_USD": "25",
+    "GRID_LEVELS": "2",
+    "GRID_CENTER": "0.0",
+    "GRID_SHORT": "True",
+    "GRID_STEP": "0.0003",
+    "ORDER_VOLUME": "1000",
+    "GRID_LEVEL_UNITS": "1000",
+    "MAX_POSITION_UNITS": "2000",
+    "MAX_SHORT_UNITS": "2000",
+    "CLOSE_ONLY": "False",
+    "MAX_DAILY_VOLUME_USD": "15000"
+  }
+}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atjte"
-version = "0.2.0"
+version = "0.2.1"
 description = "ATJ trading engines: cross-venue arbitrage market making between crypto exchanges (CCXT) and CFD platforms (MetaTrader 5)"
 readme = "README.md"
 license = "MIT"
@@ -59,6 +59,7 @@ atjte = [
     "strategy_types/*/*/*.py",
     # what `atjte-gateway --new` copies (gateway.json, gateway.env.example, launchers)
     "gateways/templates/*/*",
-    # sample event calendars the control panel's Events page imports
+    # samples the control panel imports: event calendars, strategy settings
     "samples/*/*.csv",
+    "samples/*/*.json",
 ]
