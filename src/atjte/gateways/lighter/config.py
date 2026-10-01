@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from atjte.gateways import accounts as _A
+
 from atjte.credentials import LIGHTER_API_KEY_INDEX_RANGE, LIGHTER_L1_KEY_MAX_LEN, parse_env_text
 
 CONFIG_NAME = "gateway.json"
@@ -60,6 +62,7 @@ LIBRARY_NAME = "lighter_library_path"
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "accounts", "msgs_per_min",
           "max_inflight", "account_dms_s", "clients", "_comment"}
+_KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 
 
 class ConfigError(ValueError):
@@ -85,6 +88,9 @@ class GatewayConfig:
     max_inflight: int = 50
     account_dms_s: float = 300.0
     clients: list = field(default_factory=list)
+    #: account_state.json (:mod:`atjte.gateways.accounts`)
+    publish_accounts: bool = True
+    accounts_every_s: float = _A.EVERY_S
     library_path: str = ""
     #: account -> {"account_index", "api_key_index", "private_key"} (raw text)
     keys: dict = field(default_factory=dict)
@@ -196,6 +202,7 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         accounts=accounts, msgs_per_min=float(raw.get("msgs_per_min") or 600.0),
         max_inflight=int(raw.get("max_inflight") or 50), account_dms_s=dms,
         clients=[str(c) for c in (raw.get("clients") or [])])
+    cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
         env = {k.lower(): v for k, v in parse_env_text(envp.read_text(encoding="utf-8")).items()}

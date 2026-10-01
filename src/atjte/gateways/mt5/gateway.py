@@ -24,7 +24,9 @@ the daemon, a fake in the tests.
 """
 from __future__ import annotations
 
+import json
 import socket
+from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass, field
@@ -52,6 +54,12 @@ class Refusal(Exception):
     def __init__(self, text: str, kind: str = "invalid_order") -> None:
         super().__init__(text)
         self.kind = kind
+
+
+#: the panel's quote request is honoured this long after it was written
+QUOTE_REQUEST_MAX_AGE_S = 86400.0
+#: at most this many symbols quoted per account snapshot
+MAX_QUOTES = 50
 
 
 @dataclass
@@ -88,6 +96,8 @@ class MT5Gateway:
         self._lock = threading.RLock()
         self._clients: dict[str, _Client] = {}
         self._ticks: dict[str, Any] = {}            # symbol -> last Ticker
+        #: the panel's quotes.request (config.QUOTES_REQUEST_NAME); None = none
+        self.quote_request: Optional[Path] = None
         self._sig: dict[str, tuple] = {}            # symbol -> change signature
         self._ok_t = 0.0                            # last successful backend call
         self._health: dict = {"ok": True, "reasons": []}
@@ -452,6 +462,109 @@ class MT5Gateway:
         return {"listening": self._srv is not None, "port": self.port, "clients": clients,
                 "session": self.session(), "counters": dict(self.counters),
                 "symbols": sorted(self._ticks)}
+
+    def account_snapshot(self) -> dict:
+        """The terminal's account for account_state.json (:mod:`..accounts`):
+        equity, margin, positions and pending orders, each with its MAGIC and
+        the bot attached on it. Never the login, name or server."""
+        from .. import accounts as A
+        with self._lock:
+            by_magic = {c.magic: c.name for c in self._clients.values() if not c.readonly}
+        acc: dict = {"account": "terminal", "currency": None, "equity": None,
+                     "balances": None, "margin": None, "positions": None,
+                     "orders": None, "errors": {}, "scope": {}}
+        try:
+            a = self._backend("get_account")
+            acc["currency"] = a.currency
+            acc["equity"] = a.equity
+            acc["balances"] = [{"currency": a.currency, "total": a.balance,
+                                "free": None, "used": None}]
+        except Exception as e:                              # noqa: BLE001
+            acc["errors"]["balances"] = A._err(e)
+        try:
+            m = self._backend("get_margin")
+            acc["margin"] = {"used": m.used, "free": m.free, "level": m.level,
+                             "leverage": m.leverage}
+        except Exception as e:                              # noqa: BLE001
+            acc["errors"]["margin"] = A._err(e)
+
+        def magic_of(x) -> Optional[int]:
+            v = (x.raw or {}).get("magic") if isinstance(x.raw, dict) else None
+            return int(v) if v is not None else None
+        try:
+            rows = []
+            for p in self._backend("get_positions") or []:
+                mg = magic_of(p)
+                # MT5 keeps the swap with the open position and books it at
+                # the close (equity = balance + profit + swap): open PnL
+                swap = (p.raw or {}).get("swap") if isinstance(p.raw, dict) else None
+                upnl = (None if p.unrealized_pnl is None
+                        else p.unrealized_pnl + float(swap or 0.0))
+                rows.append({"symbol": p.symbol, "side": getattr(p.side, "value", str(p.side)),
+                             "contracts": p.size, "size": p.size, "entry": p.entry_price,
+                             "mark": p.current_price, "notional": None,
+                             "upnl": upnl, "swap": swap, "liq": None, "leverage": None,
+                             "ticket": p.position_id, "magic": mg,
+                             "client": by_magic.get(mg, "") if mg else ""})
+            acc["positions"] = sorted(rows, key=lambda r: (r["symbol"], r["ticket"] or ""))
+        except Exception as e:                              # noqa: BLE001
+            acc["errors"]["positions"] = A._err(e)
+        try:
+            rows = []
+            for o in self._backend("get_open_orders") or []:
+                mg = magic_of(o)
+                client = by_magic.get(mg, "") if mg else ""
+                rows.append({"id": o.order_id, "client_id": "", "symbol": o.symbol,
+                             "side": getattr(o.side, "value", str(o.side)),
+                             "type": getattr(o.type, "value", str(o.type)),
+                             "price": o.price, "amount": o.amount, "remaining": o.remaining,
+                             "reduce_only": False, "t": None, "magic": mg,
+                             "owner": "bot" if client else "foreign", "client": client})
+            acc["orders"] = rows
+        except Exception as e:                              # noqa: BLE001
+            acc["errors"]["orders"] = A._err(e)
+        held = {p["symbol"] for p in acc["positions"] or []}
+        return {"accounts": [acc], "quotes": self.quotes(held)}
+
+    def requested_symbols(self) -> set:
+        """The symbols the panel asked to have quoted (``quote_request``);
+        a request older than a day is forgotten."""
+        if self.quote_request is None:
+            return set()
+        try:
+            body = json.loads(Path(self.quote_request).read_text(encoding="utf-8"))
+            if self._clock() - float(body.get("t") or 0) > QUOTE_REQUEST_MAX_AGE_S:
+                return set()
+            return {str(s) for s in body.get("symbols") or [] if s}
+        except (OSError, ValueError, TypeError, AttributeError):
+            return set()
+
+    def quotes(self, extra=()) -> dict:
+        """``{symbol: {bid, ask, mid, t}}`` for the symbols the bots stream,
+        the open positions (``extra``) and the panel's request — the panel's
+        reference price (the bps calculator) without a terminal connection.
+        At most MAX_QUOTES symbols; one that cannot be read is left out."""
+        with self._lock:
+            ticks = dict(self._ticks)
+        want = sorted((set(ticks) | set(extra) | self.requested_symbols()))[:MAX_QUOTES]
+        out = {}
+        for sym in want:
+            t = ticks.get(sym)
+            if t is None:
+                try:
+                    t = self._backend("get_ticker", sym)
+                except Exception:                           # noqa: BLE001
+                    continue
+            try:
+                bid, ask = float(t.bid), float(t.ask)
+            except (TypeError, ValueError):
+                continue
+            if bid <= 0 or ask <= 0:
+                continue
+            ts = getattr(t, "timestamp", None)
+            out[sym] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2.0,
+                        "t": ts.timestamp() if ts is not None else self._clock()}
+        return out
 
 
 def _kind_of(e: Exception) -> str:

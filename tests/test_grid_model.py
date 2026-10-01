@@ -583,7 +583,7 @@ class TestGridTwoSided(unittest.TestCase):
 
 
 class TestGridTakeProfit(unittest.TestCase):
-    """``take_profit`` (GRID_TAKE_PROFIT_USD): every exit sits that far from
+    """``take_profit`` (GRID_TAKE_PROFIT): every exit sits that far from
     its own entry — None = one step, bit-identical to the classic grid — and
     a held side's take-profit is never cut short by the other side's entry,
     which grid_two_sided withholds while that side is held."""

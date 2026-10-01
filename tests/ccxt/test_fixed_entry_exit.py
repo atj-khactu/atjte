@@ -58,8 +58,8 @@ def by_key(orders):
 
 
 class FixedEntryExitWiringTest(unittest.TestCase):
-    LEVELS = {"LONG_ENTRY_SPREAD_USD": -15.0, "LONG_EXIT_SPREAD_USD": 0.0,
-              "SHORT_ENTRY_SPREAD_USD": 15.0, "SHORT_EXIT_SPREAD_USD": 0.0,
+    LEVELS = {"LONG_ENTRY_SPREAD": -15.0, "LONG_EXIT_SPREAD": 0.0,
+              "SHORT_ENTRY_SPREAD": 15.0, "SHORT_EXIT_SPREAD": 0.0,
               "ORDER_SIZE_UNITS": 1.0, "MAX_POSITION_UNITS": 3.0,
               "MAX_SHORT_UNITS": 3.0, "EXIT_CLIP_UNITS": None}
 
@@ -120,7 +120,7 @@ class FixedEntryExitWiringTest(unittest.TestCase):
         self.assertAlmostEqual(d["sell-long-exit"].size, 0.5)
 
     def test_long_only_when_the_short_entry_is_none(self):
-        fee.SHORT_ENTRY_SPREAD_USD = None
+        fee.SHORT_ENTRY_SPREAD = None
         self.assertEqual(set(by_key(make_bot(0.0)._desired_orders())), {"buy-long-entry"})
 
     def test_clip_is_one_entry(self):
@@ -135,7 +135,7 @@ class FixedEntryExitWiringTest(unittest.TestCase):
         self.assertEqual(g["pos_units_signed"], 1.4)
         self.assertEqual(g["direction"], "long")
         self.assertEqual(g["levels"], [-15.0, 0.0, 15.0])
-        fee.SHORT_ENTRY_SPREAD_USD = None
+        fee.SHORT_ENTRY_SPREAD = None
         g = make_bot(-0.5)._extra_state()["fixed_entry_exit"]
         self.assertEqual(g["direction"], "short")
         self.assertEqual(g["levels"], [-15.0, 0.0])

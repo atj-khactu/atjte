@@ -74,6 +74,15 @@ class HyperliquidGatewayClient(GatewayConnector):
             return gw.read("fetch_closed_orders", symbol=symbol, since=since, limit=limit,
                            params=dict(params or {}))
 
+        def fetch_ohlcv(symbol, timeframe="1m", since=None, limit=None, params=None):
+            return gw.read("fetch_ohlcv", symbol=symbol, timeframe=timeframe,
+                           since=since, limit=limit)
+
+        def fetch_funding_history(symbol=None, since=None, limit=None, params=None):
+            return gw.read("fetch_funding_history", symbol=symbol, since=since,
+                           limit=limit, params=dict(params or {}))
+
         for fn in (fetch_balance, fetch_positions, fetch_open_orders, fetch_order,
-                   fetch_my_trades, fetch_closed_orders):
+                   fetch_my_trades, fetch_closed_orders, fetch_ohlcv,
+                   fetch_funding_history):
             setattr(x, fn.__name__, fn)

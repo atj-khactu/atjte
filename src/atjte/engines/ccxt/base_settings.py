@@ -220,7 +220,8 @@ PANEL_LEASE_S = 60.0
 # order on SYMBOL_MT5, magic-tagged). ONE attempt, no retry loop: on failure
 # all crypto quotes come down (no new exposure) and the reconcile below is
 # the safeguard that repairs parity. Keep the threshold >= one broker min lot
-# in base units — residues below it cannot be hedged.
+# in base units — residues below it cannot be hedged. None = exactly one MT5
+# min lot (read from the terminal at start, in base units).
 # MT5_MAGIC (the hedge book's tag, unique per PROJECT) is identity: it is
 # in project_settings.py, allocated by the control panel.
 MT5_DEVIATION_POINTS = 20
@@ -246,7 +247,7 @@ HEDGE_THRESHOLD_UNITS = 1.0
 HEDGE_MODE = 'event'
 # What the hedge writes in the MT5 order's comment field — what you read in
 # the terminal's Trade/History tabs beside each ticket. Empty = "hedge
-# <strategy key>". MT5 truncates the comment at 31 characters, and some
+# <market> <strategy key>" ("hedge XYZ-EUR grid"). MT5 truncates the comment at 31 characters, and some
 # brokers overwrite it entirely; MT5_MAGIC, not this, is what the bot
 # identifies its own book by, so a broker that rewrites it costs nothing.
 MT5_COMMENT = ""
@@ -266,14 +267,14 @@ RECONCILE_TOLERANCE_UNITS = 1.0  # >= one broker min lot in base units
 # order's spread level (buy: venue bid − MT5 bid must average AT/BELOW the
 # level; sell: venue ask − MT5 ask must average AT/ABOVE it) — the quote then
 # goes in maker-clamped near the touch and is pulled once the average
-# retreats past the level by BASIS_RELEASE_USD (hysteresis, so top-of-book
+# retreats past the level by BASIS_RELEASE (hysteresis, so top-of-book
 # wiggle can't chatter it on/off). Fail-safe: no fresh full-window average
 # (feed stale, session just reopened, warm-up) means no orders.
 # False = classic quoting: the desired orders rest at their levels around
 # the clock and chase them.
 BASIS_TRIGGER = True
 BASIS_WINDOW_S = 5.0        # rolling basis-average window (s)
-BASIS_RELEASE_USD = 0.25    # pull the quote once avg is this far back inside
+BASIS_RELEASE = 0.25    # pull the quote once avg is this far back inside
 
 # --- Limit-price optimisation off the basis average (None = off) ---
 # An order (entry or exit) whose spread level the rolling BASIS_WINDOW_S
@@ -290,6 +291,12 @@ BASIS_RELEASE_USD = 0.25    # pull the quote once avg is this far back inside
 # the level), so every fill is at/better than the strategy's level; no
 # fresh average = the level. USD per base unit of spread.
 OPTIMIZE_LIMIT_OFFSET = None
+# Whether a TAKER-allowed order (ALLOW_TAKER_ENTRY / ALLOW_TAKER_EXIT) is
+# optimised too. False = a taker order is always priced AT its level: once
+# the market is through it, it crosses and fills there, instead of asking
+# the average's better price and waiting for the spread to come back to it.
+# Maker orders are optimised either way.
+OPTIMIZE_LIMIT_TAKER = True
 
 # --- Spread entry window (absolute; None on an edge = that edge open) ---
 # NEW entries on BOTH sides rest only while the live mid-spread (venue mid −
@@ -318,6 +325,38 @@ SELL_MIN_SPREAD = None
 # entries dropped. Ignored entirely on a spot market.
 FUNDING_RATE_MAX_ABS = None      # e.g. 0.0002 = 2 bp per funding period
 
+# --- Oracle basis filter (new entries only) ---
+# The ORACLE BASIS = the venue's oracle price − the reference price (k × the
+# MT5 mid), in spread points, averaged over BASIS_WINDOW_S — where the venue's
+# own oracle puts the fair spread. With the filter on (the rule of the
+# atj-hyperliquid-arbitrage bot) a BUY entry rests only at or below it and a
+# SELL entry only at or above it: never buy above, or sell below, the oracle's
+# fair value. ORACLE_BASIS_MAX adds an optional symmetric limit: no entries at
+# all while |oracle basis| > it (None = not used). Exits are never gated. On
+# but no oracle price known (a venue without one, or none received yet):
+# entries dropped (fail-safe). Hyperliquid publishes it on the ticker (oraclePx).
+ORACLE_BASIS_FILTER = False
+ORACLE_BASIS_MAX = None          # spread points, e.g. 0.002 on xyz:EUR
+
+# --- Exposure (perpetuals) ---
+# LEVERAGE / MARGIN_MODE are SET on the venue once at bot start, through the
+# gateway (Hyperliquid updateLeverage; a refusal — e.g. switching the mode
+# with a position open — is logged, not fatal). 1x unless set; None = leave
+# the account's.
+LEVERAGE = 1                     # whole number, e.g. 5
+MARGIN_MODE = "isolated"         # "isolated" | "cross"
+# Dynamic caps: with DYNAMIC_ALLOCATION on and ALLOCATION_PCT set, the
+# position is capped at
+#   min(quoting equity, hedging equity in USD) × ALLOCATION_PCT / 100
+#   × LEVERAGE / quoting mid       (base units, each side)
+# recomputed every ALLOCATION_REFRESH_S — the % of the smaller account that
+# may be committed as margin. The fixed caps (MAX_POSITION_UNITS /
+# MAX_SHORT_UNITS) still apply on top. No entries until the first recompute.
+# None = off (the fixed caps alone).
+DYNAMIC_ALLOCATION = False       # True = the dynamic caps below are in force
+ALLOCATION_PCT = None            # e.g. 25 = a quarter of the smaller account
+ALLOCATION_REFRESH_S = 60.0
+
 # --- Session / staleness gate ---
 # A CFD stops ticking when its market is closed (nights/weekends). If the
 # MT5 quote hasn't changed for this long the bot cancels its crypto quotes and
@@ -332,6 +371,19 @@ MT5_STALE_S = 300.0
 # measured; the login is also checked before every single hedge.)
 MT5_HEALTH_INTERVAL_S = 5.0
 MT5_HEALTH_RETRY_S = 1.0
+
+# --- Limit unit: absolute amounts or percentages ---
+# "abs" (default): MAX_DAILY_LOSS_USD and the margin floors below are amounts,
+# as written (USD / the venue's quote / the MT5 account currency).
+# "pct": they are PERCENTAGES —
+#   MAX_DAILY_LOSS_USD: of the strategy's capital (venue equity + MT5 equity in
+#     USD), taken once per risk day (at the day's first reading);
+#   MIN_VENUE_AVAILABLE_MARGIN_USD, DERISK_VENUE_AVAILABLE_MARGIN_USD: of the
+#     venue account's margin equity;
+#   MIN_MT5_FREE_MARGIN_OPEN, DERISK_MT5_FREE_MARGIN: of the MT5 equity.
+# Margin levels, the liquidation distance and the safety factor are already
+# percentages / ratios and do not change.
+RISK_UNIT = "abs"
 
 # --- Margin / soft risk gates (block NEW entries; exits keep running) ---
 BALANCE_REFRESH_S = 60.0         # how often (s) to poll margins/positions
@@ -370,10 +422,15 @@ CLOSE_ONLY = False
 # the day rolls; a PnL that recovers does NOT re-open the book.
 # Volumes are traded notional in USD per venue (crypto fills / MT5 hedge
 # executions), so the caps also bound the hedging cost of a bad day.
-# The day boundary is the MACHINE's local midnight — the operator's day and
-# the one the dashboard's "today" figures use; True = UTC midnight instead.
+# The day boundary is midnight in the ACP timezone (the workspace's, set on the
+# panel's Settings page — atjte.clock). LEGACY, only when none is set: True = UTC
+# midnight, False = the machine's local midnight.
 RISK_DAY_UTC = False
 MAX_DAILY_LOSS_USD = None            # today's PnL <= -this -> close-only for the day
+# ONE daily volume cap for both exchanges: either exchange's notional traded
+# today >= this -> close-only. The per-exchange names below override it for
+# that exchange only (None = the shared cap).
+MAX_DAILY_VOLUME_USD = None
 MAX_DAILY_VENUE_VOLUME_USD = None    # crypto notional traded today >= this -> close-only
 MAX_DAILY_MT5_VOLUME_USD = None      # MT5 hedge notional traded today >= this -> close-only
 
@@ -405,11 +462,62 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 #    ("2026-09-10 12:30", "US CPI", 5, 10)]. Past events never fire again.
 # A mis-typed entry or an unknown timezone raises AT STARTUP — a schedule
 # that silently does nothing is worse than no schedule.
-BLACKOUT_TZ = "UTC"              # IANA name; all entries below are read in it
+# IANA name every entry below (and the sessions, the holidays) is read in;
+# None = the ACP timezone (the panel's Settings page — atjte.clock), the
+# machine's local time when ACP has none
+BLACKOUT_TZ = None
 BLACKOUT_BEFORE_MIN = 2.0        # default minutes BEFORE the moment
 BLACKOUT_AFTER_MIN = 2.0         # default minutes AFTER it
 DAILY_BLACKOUTS = []             # market opens / rollover (recurring)
 MACRO_EVENTS = []                # scheduled macroeconomic releases (one-off)
+# 4) Trading sessions — the hours of each weekday the bot may quote, in
+#    BLACKOUT_TZ wall clock; outside them it is a blackout like the others.
+#    None = no limit that day; "closed" (or "") = no trading that day; else
+#    ranges "HH:MM-HH:MM, HH:MM-HH:MM" (24:00 allowed as an end — a session
+#    over midnight is two ranges, one on each day).
+SESSION_MON = None
+SESSION_TUE = None
+SESSION_WED = None
+SESSION_THU = None
+SESSION_FRI = None
+SESSION_SAT = None
+SESSION_SUN = None
+# 5) HOLIDAYS — dates the market is closed, in BLACKOUT_TZ: "YYYY-MM-DD"
+#    (the whole day) or "YYYY-MM-DD HH:MM-HH:MM" (those hours), optionally
+#    as (…, "label"): [("2026-12-25", "Christmas"), "2026-12-24 18:00-24:00"]
+HOLIDAYS = []
+# 6) MARKET_OPEN_BREAKS — no quotes around the major cash opens (Tokyo 09:00,
+#    London 08:00, New York 09:30, each in its own clock, Monday to Friday):
+#    MARKET_OPEN_BREAK_MIN before and after each.
+MARKET_OPEN_BREAKS = False
+MARKET_OPEN_BREAK_MIN = 5.0
+# 7) The shared EVENTS calendar (<workspace>/data/events.csv, the panel's
+#    Events page: holidays, early closes, CPI / NFP / central banks — each row
+#    in its own timezone, tagged with the markets it affects). This strategy
+#    pauses on the rows tagged with one of BREAK_MARKETS (or ALL), e.g.
+#    "US EU"; None = the markets of SYMBOL_MT5 (US500 -> US, EURUSD -> EU US).
+BREAK_MARKETS = None
+#    BREAK_ASSET_CLASS narrows it: a row naming asset classes (an NYSE holiday:
+#    Indices) pauses only strategies of one of them. None = the class of
+#    SYMBOL_MT5 (US500 -> Indices, EURUSD -> FX, XAUUSD -> Commodities).
+BREAK_ASSET_CLASS = None
+
+# --- Spread unit: absolute price points or basis points ---
+# "abs" (default): every price-gap setting below is in the pair's own
+# price points, as written. "bps": they are basis points of the quoting
+# price (1 bp = price / 10,000), so one template fits every instrument —
+# GRID_STEP, GRID_CENTER, GRID_TAKE_PROFIT, BUY/SELL_SPREAD, the entry / exit
+# spreads, BASIS_RELEASE, BUY_MAX / SELL_MIN_SPREAD, ORACLE_BASIS_MAX,
+# OPTIMIZE_LIMIT_OFFSET, REQUOTE_MIN_MOVE. They are converted to points at
+# the quoting mid (venue mid; HEDGE_RATIO x MT5 mid while it has none) once
+# the bot has a price — nothing is quoted before — and re-anchored once a day:
+# after the risk day rolls (ACP midnight), at the first break in quoting
+# (a session break / blackout) within BPS_REANCHOR_WAIT_H hours, else then.
+# BPS_REANCHOR_DRIFT_PCT (None = off) also re-anchors when the price has moved
+# that far from the anchor.
+SPREAD_UNIT = "abs"
+BPS_REANCHOR_WAIT_H = 6.0
+BPS_REANCHOR_DRIFT_PCT = None
 
 # --- Margin de-risk: EXIT the position, not just stop entering (None = off) ---
 # Any threshold breached while a position is open arms a de-risk latch:
@@ -426,7 +534,10 @@ MACRO_EVENTS = []                # scheduled macroeconomic releases (one-off)
 # not arm it (a false flatten is itself a risk event) — a failed read
 # already stops entries through the margin gate above.
 DERISK_VENUE_AVAILABLE_MARGIN_USD = None  # USD — venue available margin floor (perp only)
-DERISK_VENUE_LIQ_DISTANCE_PCT = None      # % of mark — distance to the liquidation price (perp only)
+DERISK_VENUE_LIQ_DISTANCE_PCT = None      # % — distance to the liquidation price (perp only), of:
+# "entry" = the entry -> liquidation cushion still left (entry 10 from liquidation,
+# mark 2 from it = 20%); "mark" = the distance in % of the mark price
+LIQ_DISTANCE_BASE = "entry"
 DERISK_MT5_MARGIN_LEVEL = None            # % — MT5 margin level floor (broker stop-out is well below)
 DERISK_MT5_FREE_MARGIN = None             # account ccy — MT5 free margin floor
 

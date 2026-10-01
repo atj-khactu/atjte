@@ -168,5 +168,99 @@ class DescribeTest(unittest.TestCase):
         self.assertEqual(describe([], [], UTC), "none")
 
 
+class SessionsTest(unittest.TestCase):
+    """SESSION_MON..SUN and HOLIDAYS: outside the allowed hours and on a
+    holiday the bot is in a blackout like any other."""
+    PRG = ZoneInfo("Europe/Prague")
+
+    def t(self, text):
+        return datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=self.PRG).timestamp()
+
+    def span(self, w):
+        return (datetime.fromtimestamp(w.start, self.PRG).strftime("%a %H:%M"),
+                datetime.fromtimestamp(w.end, self.PRG).strftime("%a %H:%M"))
+
+    def setUp(self):
+        # weekdays 08:00-22:00, Saturday closed, Sunday no limit
+        from atjte.engines.common import blackout as B
+        self.B = B
+        self.S = B.parse_sessions(["08:00-22:00"] * 5 + ["closed", None])
+
+    def test_no_zone_is_the_machines_local_time(self):
+        """BLACKOUT_TZ None (no ACP timezone either): naive local datetimes,
+        so a session reads on the machine's clock."""
+        B = self.B
+        noon = datetime(2026, 10, 1, 12, 0).timestamp()          # Thursday, local
+        self.assertIsNone(B.session_gap(noon, self.S, None))
+        late = datetime(2026, 10, 1, 23, 0).timestamp()
+        w = B.session_gap(late, self.S, None)
+        self.assertEqual(datetime.fromtimestamp(w.start).strftime("%a %H:%M"), "Thu 22:00")
+        self.assertEqual(datetime.fromtimestamp(w.end).strftime("%a %H:%M"), "Fri 08:00")
+        h = B.parse_holidays(["2026-12-25"], None)[0]
+        self.assertEqual(datetime.fromtimestamp(h.start).strftime("%Y-%m-%d %H:%M"),
+                         "2026-12-25 00:00")
+
+    def test_market_open_breaks(self):
+        """Tokyo 09:00, London 08:00, New York 09:30, each in its own clock,
+        Mon-Fri, 5 min either side; nothing at the weekend."""
+        B = self.B
+        opens = B.market_open_specs(5, 5)
+        self.assertEqual([s.label for s in opens], ["Tokyo open", "London open",
+                                                    "New York open"])
+        ny = ZoneInfo("America/New_York")
+        at = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=ny).timestamp()
+        w = active_window(at("2026-10-01 09:27"), [], [], ny, opens=opens)   # Thu
+        self.assertEqual((w.label, w.kind), ("New York open", "market open"))
+        self.assertEqual(w.end - w.start, 600.0)
+        self.assertIsNone(active_window(at("2026-10-01 09:40"), [], [], ny, opens=opens))
+        self.assertIsNone(active_window(at("2026-10-03 09:30"), [], [], ny, opens=opens))  # Sat
+        # London 08:00 BST = 03:00 New York
+        self.assertEqual(active_window(at("2026-10-02 03:00"), [], [], ny,
+                                       opens=opens).label, "London open")
+        nxt = next_window(at("2026-10-01 09:40"), [], [], ny, opens=opens)
+        self.assertEqual(nxt.label, "Tokyo open")            # Thu 20:00 NY = Fri 09:00 JST
+
+    def test_parsing(self):
+        B = self.B
+        self.assertEqual(B.parse_sessions(["08:00-12:00, 13:00-24:00"] + [None] * 6)[0],
+                         [(480, 720), (780, 1440)])
+        self.assertEqual(B.parse_sessions([""] + [None] * 6)[0], [])
+        self.assertFalse(B.sessions_limited(B.parse_sessions([None] * 7)))
+        self.assertFalse(B.sessions_limited(B.parse_sessions(["00:00-24:00"] * 7)))
+        for bad in ("22:00-02:00", "8-12", "08:00", "25:00-26:00", 8):
+            with self.assertRaises(RuntimeError):
+                B.parse_sessions([bad] + [None] * 6)
+
+    def test_inside_and_outside_a_session(self):
+        B = self.B
+        self.assertIsNone(B.session_gap(self.t("2026-10-01 10:00"), self.S, self.PRG))
+        w = B.session_gap(self.t("2026-10-01 23:00"), self.S, self.PRG)     # Thu night
+        self.assertEqual((self.span(w), w.kind), (("Thu 22:00", "Fri 08:00"), "session"))
+        # Friday's close runs over the closed Saturday to Sunday's open day
+        w = B.session_gap(self.t("2026-10-03 12:00"), self.S, self.PRG)
+        self.assertEqual(self.span(w), ("Fri 22:00", "Sun 00:00"))
+        self.assertIsNone(B.session_gap(self.t("2026-10-04 12:00"), self.S, self.PRG))
+        nxt = B.next_session_gap(self.t("2026-10-02 12:00"), self.S, self.PRG)
+        self.assertEqual(self.span(nxt), ("Fri 22:00", "Sun 00:00"))
+
+    def test_the_engine_windows_include_sessions_and_holidays(self):
+        B = self.B
+        hol = B.parse_holidays([("2026-12-25", "Christmas"), "2026-12-24 18:00-24:00"],
+                               self.PRG)
+        self.assertEqual([h.label for h in hol], ["holiday 2026-12-24 18:00-24:00", "Christmas"])
+        w = active_window(self.t("2026-12-25 09:00"), [], [], self.PRG,
+                          sessions=self.S, holidays=hol)              # an open Friday
+        self.assertEqual((w.label, w.kind), ("Christmas", "holiday"))
+        w = active_window(self.t("2026-10-01 23:00"), [], [], self.PRG, sessions=self.S)
+        self.assertEqual(w.kind, "session")
+        nxt = next_window(self.t("2026-12-24 09:00"), [], [], self.PRG, holidays=hol)
+        self.assertEqual(nxt.label, "holiday 2026-12-24 18:00-24:00")
+        for bad in ("2026-13-01", ("2026-12-25", 5), 20261225):
+            with self.assertRaises(RuntimeError):
+                B.parse_holidays([bad], self.PRG)
+        self.assertIn("Sat closed", B.describe_sessions(self.S))
+        self.assertIn("Sun no limit", B.describe_sessions(self.S))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

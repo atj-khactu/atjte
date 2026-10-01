@@ -108,6 +108,19 @@ class ReadsTest(ClientCase):
             self.assertIn(w, whats)
         self.assertTrue(all(r[0] == "sub1" for r in self.up.reads))   # the account's
 
+    def test_candles_and_funding_payments_are_reads_through_the_gateway(self):
+        """1 m candles (the report's history, an indicator's warm-up) and the
+        account's funding payments (Hyperliquid pays funding hourly as cash):
+        both through the gateway, never the venue."""
+        x = self.conn.exchange
+        del self.up.reads[:]
+        x.fetch_ohlcv(EUR, "1m", since=1000, limit=5)
+        x.fetch_funding_history(EUR, since=2000)
+        got = {r[1]: r[2] for r in self.up.reads}
+        self.assertEqual(got["fetch_ohlcv"]["timeframe"], "1m")
+        self.assertEqual(got["fetch_ohlcv"]["limit"], 5)
+        self.assertEqual(got["fetch_funding_history"]["since"], 2000)
+
 
 class FeedTest(ClientCase):
     def test_a_ticker_push_reaches_the_engine(self):

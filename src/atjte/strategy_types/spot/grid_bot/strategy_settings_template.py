@@ -29,9 +29,9 @@ CLOSE_ONLY = False
 
 # --- The grid (two-sided inventory grid on the signed spot position) ---
 # spread = Kraken PAXG spot mid − MT5 XAUUSD mid (USD/oz). Grid
-# levels sit every GRID_STEP_USD of spread on both sides of GRID_CENTER_USD:
+# levels sit every GRID_STEP of spread on both sides of GRID_CENTER:
 #   long side:  oz #k is BOUGHT at center − step·k  (k = 1..GRID_LEVELS: −1, −2, −3 ...)
-#               and its take-profit sits GRID_TAKE_PROFIT_USD above the
+#               and its take-profit sits GRID_TAKE_PROFIT above the
 #               entry — by default one step, the NEXT level up: oz #k of
 #               the CURRENT long SELLS at center − step·k + TP: oz #1 at
 #               the center (0), oz #2 at −1, oz #3 at −2 ...
@@ -45,7 +45,7 @@ CLOSE_ONLY = False
 # never cross. At most one buy and one sell rest on the venue (the level
 # nearest the market per side — a held side's take-profit out-ranks the
 # other side's entry); the next level goes up within a fast pass of a fill.
-GRID_STEP_USD = 1.0          # distance between grid levels (USD/oz of spread)
+GRID_STEP = 1.0          # distance between grid levels (spread points)
 GRID_LEVELS = 3              # levels per side (entries stop here; exits
                              # ladder as deep as the position actually goes)
 GRID_LEVEL_UNITS = 1.0           # oz per grid level; >= one MT5 min lot (1 oz)
@@ -57,23 +57,23 @@ GRID_LEVEL_UNITS = 1.0           # oz per grid level; >= one MT5 min lot (1 oz)
 # every fill can be hedged. None = GRID_UNIT_OZ (one level = one order).
 ORDER_VOLUME = 1.0
 
-# Take-profit distance of every grid level (USD/oz of spread, > 0): oz #k
+# Take-profit distance of every grid level (spread points, > 0): oz #k
 # of the long, bought at center − step·k, sells at center − step·k + TP;
 # oz #k of the short, sold at center + step·k, covers at center + step·k − TP.
-# None = GRID_STEP_USD — the classic grid above, exit at the next level.
+# None = GRID_STEP — the classic grid above, exit at the next level.
 # 2.0 with a 1 USD step: buy at −1 → sell at +1, buy at −2 → sell at 0,
 # buy at −3 → sell at −1 (short: sell at +1 → cover at −1, ...).
 # While a side is held, its take-profit is the only order on that side of
 # the book: the other side's first entry (which would merely reduce the
 # position, untagged as an exit) is withheld until flat — so a take-profit
 # wider than 2 x step is honoured, not cut short by that entry.
-GRID_TAKE_PROFIT_USD = None
+GRID_TAKE_PROFIT = None
 
-# Center of the grid (USD/oz of spread). 0.0 = the grid the task describes
+# Center of the grid (spread points). 0.0 = the grid the task describes
 # (buy at −1 / sell at +1). PAXG spot structurally trades BELOW the CFD —
 # set this to the structural mean to sit the grid around it instead of
 # around zero (the dashboard's spread chart shows where it sits).
-GRID_CENTER_USD = 0.0
+GRID_CENTER = 0.0
 
 # Hard caps on the position (oz), each side. Entries are trimmed deepest
 # level first so resting orders can never fill past a cap. The long side
@@ -94,10 +94,10 @@ MAX_SHORT_UNITS = None          # short cap; None = MAX_POSITION_OZ, capped at t
 # and chase the reference. True = an order is submitted only while the
 # rolling BASIS_WINDOW_S average of the side-aware basis (buy: Kraken bid −
 # MT5 bid, sell: Kraken ask − MT5 ask) is at/through its grid level, and it
-# is pulled once the average retreats BASIS_RELEASE_USD back inside.
+# is pulled once the average retreats BASIS_RELEASE back inside.
 BASIS_TRIGGER = True         # default ON (orders go in only when the basis average is through their level)
 BASIS_WINDOW_S = 5.0         # rolling basis-average window (s)
-BASIS_RELEASE_USD = 0.25     # hysteresis before a live quote is pulled (USD/oz)
+BASIS_RELEASE = 0.25     # hysteresis before a live quote is pulled (USD/oz)
 
 # Limit-price optimisation off the basis average (engine feature; None =
 # off). When the BASIS_WINDOW_S average is already THROUGH an order's grid
@@ -137,7 +137,6 @@ BASE_INVENTORY_UNITS = 0.0
 # machine's LOCAL midnight (the dashboard's "today"); True = UTC midnight.
 # Scale hint: one round trip of ORDER_VOLUME oz moves ~4.4 kUSD of notional
 # through EACH venue, so the two volume caps are also a cap on churn.
-RISK_DAY_UTC = False
 MAX_DAILY_LOSS_USD = None            # e.g. 200 -> close-only below -200 USD today
 MAX_DAILY_VENUE_VOLUME_USD = None   # e.g. 500000 -> perp notional traded today
 MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded today
@@ -185,7 +184,7 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 #                        ("13:30", "US cash open")]
 # A mis-typed entry or an unknown timezone raises AT STARTUP — a schedule
 # that silently does nothing is worse than no schedule.
-BLACKOUT_TZ = "UTC"          # IANA name; every entry below is read in it
+BLACKOUT_TZ = None          # IANA name every entry below is read in; None = the ACP timezone
 BLACKOUT_BEFORE_MIN = 2.0    # default minutes BEFORE the moment
 BLACKOUT_AFTER_MIN = 2.0     # default minutes AFTER it
 DAILY_BLACKOUTS = []

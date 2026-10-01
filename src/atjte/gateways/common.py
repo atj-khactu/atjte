@@ -12,9 +12,44 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Any, Callable, Optional
+
+
+#: how often / how long :func:`replace_retrying` tries: 10 x 25 ms
+REPLACE_ATTEMPTS = 10
+REPLACE_DELAY_S = 0.025
+
+
+_sleep = time.sleep
+
+
+def replace_retrying(tmp, path, attempts: Optional[int] = None,
+                     delay_s: Optional[float] = None, sleep=None) -> None:
+    """``os.replace(tmp, path)``, retried while Windows refuses it.
+
+    On Windows the swap fails with "Access is denied" (PermissionError)
+    whenever ANOTHER process has ``path`` open at that instant — the control
+    panel reading a gateway's heartbeat, an indexer, an antivirus scan. A
+    read takes milliseconds, so a short retry gets through. Measured
+    2026-09-28: one such collision on ``gateway_state.json`` stopped an MT5
+    gateway outright, and with it every bot's hedge. Raises the last error
+    when every attempt was refused (the caller decides what that costs).
+    The defaults are read at CALL time (REPLACE_ATTEMPTS, REPLACE_DELAY_S,
+    ``_sleep``), so a test can shorten or script them."""
+    n = max(1, REPLACE_ATTEMPTS if attempts is None else attempts)
+    delay = REPLACE_DELAY_S if delay_s is None else delay_s
+    nap = _sleep if sleep is None else sleep
+    for i in range(n):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == n - 1:
+                raise
+            nap(delay)
 
 
 def jsonable(x: Any) -> Any:
@@ -28,19 +63,29 @@ def jsonable(x: Any) -> Any:
     return str(x)
 
 
+#: what the OTHER markets leave behind: the raw venue ``info`` and the fee
+#: ``tiers`` (the same table on every market — 0.5 MB of Kraken spot's)
+_SLIM_DROP = ("info", "tiers")
+
+
 def markets_payload(x, symbol: str = "") -> dict:
     """``{"markets": {...}, "currencies": {...}}`` from a loaded CCXT
     instance. ``symbol``'s market travels whole (the engine reads its
     ``info``: margin tiers, a HIP-3 ``baseName``); the rest keep what
-    precision, limits and a ``sym in markets`` test need. Kept under the
-    wire's 1 MiB line even for a venue listing thousands of markets."""
+    precision, limits and a ``sym in markets`` test need, without their
+    ``info``, fee ``tiers`` or None fields: ``set_markets`` on the bot's
+    side drops a None field itself and fills every missing one from the
+    market structure and the exchange's fee defaults, so leaving them out
+    changes no market the bot builds. With them Kraken spot's 1,454 markets
+    came to 1.8 MB, over the wire's line (``protocol.MAX_LINE``)."""
     markets = getattr(x, "markets", None) or {}
     out = {}
     for sym, m in markets.items():
         if sym == symbol:
             out[sym] = jsonable(m)
         else:
-            out[sym] = jsonable({k: v for k, v in (m or {}).items() if k != "info"})
+            out[sym] = jsonable({k: v for k, v in (m or {}).items()
+                                 if k not in _SLIM_DROP and v is not None})
     currencies = {code: jsonable({k: v for k, v in (c or {}).items() if k not in ("info", "networks")})
                   for code, c in (getattr(x, "currencies", None) or {}).items()}
     return {"markets": out, "currencies": currencies}

@@ -2,14 +2,17 @@
 system consults: the connectors refuse any other CCXT id, the control
 panel offers only these on its settings page and in its market catalogue.
 
-Five exchanges, keyed by the CCXT ids that reach them (an exchange with a
-separate derivatives API is two ids)::
+Six venues, keyed by the CCXT ids that reach them (an exchange with a
+separate derivatives API is two ids; ``ibkr`` is not a CCXT exchange at all —
+its gateway hands the bot CCXT-SHAPED markets, so the engine's math is the
+same)::
 
     kraken         Kraken spot                 krakenfutures   Kraken Futures (perpetuals)
     coinbase       Coinbase (Advanced Trade)
     binance        Binance spot                binanceusdm     Binance USDⓈ-M (perpetuals)
     hyperliquid    Hyperliquid (perpetuals + spot)
     lighter        Lighter (perpetuals)
+    ibkr           Interactive Brokers (listed futures, through TWS / IB Gateway)
 
 ``family`` is the exchange name a user thinks in (``kraken``, ``binance``);
 ``kind`` says what the id trades. Adding an exchange is adding a row here
@@ -23,7 +26,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 #: The exchanges, in the order the panel lists them.
-FAMILIES = ("kraken", "coinbase", "binance", "hyperliquid", "lighter")
+FAMILIES = ("kraken", "coinbase", "binance", "hyperliquid", "lighter", "ibkr")
+
+#: The ids that are NOT CCXT exchanges: their gateway speaks the platform's
+#: own API and hands the bot CCXT-SHAPED markets, tickers and fills, so the
+#: engine is unchanged — but nothing may look them up in ``ccxt`` /
+#: ``ccxt.pro`` (the registry's honesty tests, the panel's catalogue).
+NON_CCXT = ("ibkr",)
 
 
 #: the order-execution transports, most direct last. These are the values of
@@ -44,7 +53,7 @@ class Venue:
     id: str            # the CCXT id
     family: str        # the exchange (one of FAMILIES)
     label: str
-    kind: str          # "spot" | "perp" | "both"
+    kind: str          # "spot" | "perp" | "future" (dated contracts) | "both"
     passphrase: bool = False   # the private API needs a third credential
     nonce: bool = False        # nonces are tracked per key (one key per process)
     private_key: bool = False  # signs with a PRIVATE KEY (an on-chain style key:
@@ -89,6 +98,10 @@ SUPPORTED: dict[str, Venue] = {
                          private_key=True, wallet=True, ws_orders=True, ws_amend=True),
     "lighter": Venue("lighter", "lighter", "Lighter (perpetuals)", "perp", private_key=True,
                      ws_orders=True, client_order_ids=True),
+    # not a CCXT exchange: the IBKR gateway (atjte.gateways.ibkr) speaks TWS's
+    # API and hands the bot CCXT-shaped markets, tickers and fills. The keys
+    # live in TWS itself (the gateway knows only the account id).
+    "ibkr": Venue("ibkr", "ibkr", "Interactive Brokers (futures)", "future"),
 }
 
 
@@ -168,13 +181,14 @@ def transports(exchange_id: Optional[str]) -> tuple[str, ...]:
 #: EVERY platform connection goes through a gateway (:mod:`atjte.gateways`).
 #: Which gateway kind serves a venue — its own where it has one, the CCXT
 #: gateway otherwise; a Kraken venue can also take the Kraken FIX gateway.
-GATEWAY_KIND_OF = {"hyperliquid": "hyperliquid", "lighter": "lighter"}
+GATEWAY_KIND_OF = {"hyperliquid": "hyperliquid", "lighter": "lighter", "ibkr": "ibkr"}
 FIX_GATEWAY_VENUES = ("kraken", "krakenfutures")
 #: the bot-side connector for each gateway kind (``VENUE_CLIENT``)
 GATEWAY_CONNECTORS = {
     "ccxt": "atjte.clients.gateway.CcxtGatewayClient",
     "hyperliquid": "atjte.clients.gateway.HyperliquidGatewayClient",
     "lighter": "atjte.clients.gateway.LighterGatewayClient",
+    "ibkr": "atjte.clients.gateway.IbkrGatewayClient",
     "fix:kraken": "atjte.clients.gateway.KrakenFixClient",
     "fix:krakenfutures": "atjte.clients.gateway.KrakenFuturesFixClient",
 }
@@ -226,13 +240,14 @@ def venue(exchange_id: Optional[str]) -> Venue:
 
 def ids(kind: Optional[str] = None, family: Optional[str] = None) -> list[str]:
     """The supported CCXT ids, optionally only those trading *kind*
-    (``"spot"`` / ``"perp"``; a ``"both"`` venue counts for either) or of
-    one *family*."""
+    (``"spot"`` / ``"perp"``; a ``"both"`` venue counts for either, and a
+    ``"future"`` venue counts as ``"perp"`` — the engine trades a dated
+    contract exactly as a perpetual) or of one *family*."""
     out = []
     for v in SUPPORTED.values():
         if family and v.family != family:
             continue
-        if kind and v.kind not in (kind, "both"):
+        if kind and v.kind not in (kind, "both") and not (kind == "perp" and v.kind == "future"):
             continue
         out.append(v.id)
     return out

@@ -282,12 +282,25 @@ def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
 
 # ── the margin de-risk trigger ───────────────────────────────────────────────
 def liq_distance_pct(pos_units: float, mark: Optional[float],
-                     liq_price: Optional[float]) -> Optional[float]:
-    """How far the mark is from the venue's liquidation price, in percent of
-    the mark. None when flat or when either price is missing (the crypto venue
-    publishes no liquidation price for a flat account)."""
+                     liq_price: Optional[float],
+                     entry: Optional[float] = None) -> Optional[float]:
+    """How far the mark is from the venue's liquidation price, in percent:
+
+    - ``entry`` None — of the mark (|mark − liq| / mark);
+    - ``entry`` given — of the entry → liquidation cushion still left
+      (|mark − liq| / |entry − liq|): entry 10 from liquidation and the mark
+      2 from it = 20%. Above 100% once the position is in profit.
+
+    None when flat, when a price is missing (the crypto venue publishes no
+    liquidation price for a flat account) or when entry and liquidation
+    coincide."""
     if abs(pos_units) < EPS or not mark or not liq_price or mark <= 0:
         return None
+    if entry is not None:
+        cushion = abs(float(entry) - float(liq_price))
+        if cushion <= 0:
+            return None
+        return abs(mark - liq_price) / cushion * 100.0
     return abs(mark - liq_price) / mark * 100.0
 
 

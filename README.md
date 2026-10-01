@@ -1,8 +1,9 @@
 # atjte — ATJ trading engines
 
-Cross-venue arbitrage market making: a crypto leg on an exchange (Kraken spot,
-Kraken Futures, Coinbase, Binance, Hyperliquid, Lighter) quoted against a CFD
-leg on MetaTrader 5, with the CFD hedged fill by fill.
+Cross-venue arbitrage market making: a quoting leg on an exchange (Kraken spot,
+Kraken Futures, Coinbase, Binance, Hyperliquid, Lighter — or listed futures at
+Interactive Brokers) quoted against a CFD leg on MetaTrader 5, with the CFD
+hedged fill by fill.
 
 **Every platform connection goes through a GATEWAY** (`atjte.gateways`): a
 per-account / per-machine / per-terminal daemon that owns the keys, the
@@ -18,11 +19,13 @@ control panel is a separate application built on it.
 ```
 pip install atjte[mt5]             # from PyPI
 pip install -e ".[mt5]"            # from a checkout of this repository (editable)
+pip install atjte[mt5,ibkr]        # + the IBKR gateway (ib_async, for TWS / IB Gateway)
 ```
 
 `mt5` pulls the MetaTrader 5 terminal API (Windows only; the MT5 GATEWAY is
 the one process that needs it). `ctrader` adds the cTrader Open API
-connector. The Lighter gateway signs through Lighter's own signer library
+connector. `ibkr` adds `ib_async`, what the IBKR gateway speaks to TWS with.
+The Lighter gateway signs through Lighter's own signer library
 (`lighter_library_path`, from github.com/elliottech/lighter-python). `ccxt` and
 `simplefix` (the Kraken FIX gateway's codec) are always installed.
 
@@ -34,12 +37,14 @@ connector. The Lighter gateway signs through Lighter's own signer library
 | `atjte.gateways.fix` | Kraken spot / Kraken Futures orders over FIX 4.4; reads, prices, fills over its CCXT side | SenderCompID | `KrakenFixClient` / `KrakenFuturesFixClient` (`ORDER_TRANSPORT = 'fix'`) |
 | `atjte.gateways.hyperliquid` | Hyperliquid (10 websockets per IP) | machine | `HyperliquidGatewayClient` (default) |
 | `atjte.gateways.lighter` | Lighter (one signer and nonce per API key) | machine | `LighterGatewayClient` (default) |
+| `atjte.gateways.ibkr` | Interactive Brokers listed futures through TWS / IB Gateway (`ib_async`); the login stays in TWS, the gateway knows the account id; post-only and reduce-only emulated, amends in place, no venue-side cancel-all | TWS login (one API client id) | `IbkrGatewayClient` (default) |
 | `atjte.gateways.mt5` | the MT5 terminal: ticks, hedges, the deal history | terminal | `MT5GatewayClient` (`MT5_CLIENT`, default) |
 
 ```
 atjte-gateway --new coinbase_main --venue ccxt --exchange coinbase
 atjte-gateway --new kraken_live   --venue kraken          # Kraken FIX (krakenfutures: -DRV)
 atjte-gateway --new hl_main       --venue hyperliquid
+atjte-gateway --new ib_paper      --venue ibkr --network paper
 atjte-gateway --new mt5_main      --venue mt5
 atjte-gateway --list
 atjte-gateway coinbase_main                                # run it (or: the panel's Gateways page)
@@ -76,8 +81,11 @@ refuses any `VENUE_CLIENT` / `MT5_CLIENT` that does not go through a gateway.
 
 ## Supported exchanges
 
-Five, by their CCXT ids (`atjte.venues` is the one list; the connectors refuse
-any other id and the control panel offers only these):
+Six, by their CCXT ids (`atjte.venues` is the one list; the connectors refuse
+any other id and the control panel offers only these; `ibkr` is not a CCXT
+exchange — its gateway hands the bot CCXT-shaped markets, `MGC/USD:USD-261229`,
+with the multiplier as `contractSize`, so the engine trades a dated future as
+it trades a perpetual, in base units):
 
 | exchange | CCXT ids |
 |---|---|
@@ -86,6 +94,7 @@ any other id and the control panel offers only these):
 | Binance | `binance` (spot), `binanceusdm` (USDⓈ-M perpetuals) |
 | Hyperliquid | `hyperliquid` |
 | Lighter | `lighter` |
+| Interactive Brokers | `ibkr` (listed futures; options later) |
 
 Every exchange trades through its gateway (the table above): the venue's own
 (Hyperliquid, Lighter) or the exchange's CCXT gateway, and Kraken spot / Kraken

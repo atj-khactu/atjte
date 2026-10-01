@@ -80,6 +80,8 @@ class FakeExchange:
             return rows[ofs:ofs + limit]
         rows = [t for t in self.trades if t["symbol"] == symbol
                 and (since is None or t["timestamp"] >= since)]
+        if self.mode == "tail" and since is None:
+            return rows[-limit:]        # CCXT with no since: the NEWEST page
         return rows[:limit]
 
 
@@ -146,7 +148,36 @@ class PagingTest(unittest.TestCase):
         self.assertEqual(len(got), 230)
         self.assertEqual(len({t["id"] for t in got}), 230)
         self.assertEqual(len(x.calls), 3)
-        self.assertEqual(x.calls[1]["since"], (T0 + 99 * 60) * 1000 + 1)
+        self.assertEqual(x.calls[1]["since"], (T0 + 99 * 60) * 1000)   # AT the newest ms
+
+    def test_a_page_ending_inside_one_millisecond_loses_nothing(self):
+        """An order's partial fills share one millisecond; a page boundary
+        inside it must not skip the rest of them."""
+        trades = [_trade(i, T0 + i * 60, symbol="PAXG/USDC:USDC") for i in range(95)]
+        trades += [_trade(100 + i, T0 + 95 * 60, symbol="PAXG/USDC:USDC") for i in range(12)]
+        trades += [_trade(200 + i, T0 + 96 * 60 + i, symbol="PAXG/USDC:USDC") for i in range(20)]
+        x = FakeExchange(trades, "generic")
+        got = B.fetch_venue_trades(x, "lighter", "PAXG/USDC:USDC", T0, sleep=NOSLEEP)
+        self.assertEqual(len(got), 127)
+
+    def test_a_full_page_inside_one_millisecond_steps_past_it(self):
+        trades = [_trade(i, T0, symbol="PAXG/USDC:USDC") for i in range(100)]
+        trades += [_trade(500 + i, T0 + 60 + i, symbol="PAXG/USDC:USDC") for i in range(5)]
+        x = FakeExchange(trades, "generic")
+        got = B.fetch_venue_trades(x, "lighter", "PAXG/USDC:USDC", T0, sleep=NOSLEEP)
+        self.assertEqual(len(got), 105)
+        self.assertLessEqual(len(x.calls), 3)
+
+    def test_hyperliquid_from_the_beginning_starts_at_the_epoch(self):
+        """CCXT's Hyperliquid serves the NEWEST trades when asked with no
+        since; paging forward from there found nothing, and a backfill "since
+        the beginning" read the latest 100 fills of 532 and stopped."""
+        trades = [_trade(i, T0 + i * 60, symbol="XYZ-JP225/USDC:USDC") for i in range(230)]
+        x = FakeExchange(trades, "tail")
+        got = B.fetch_venue_trades(x, "hyperliquid", "XYZ-JP225/USDC:USDC", None,
+                                   sleep=NOSLEEP)
+        self.assertEqual(len(got), 230)
+        self.assertEqual(x.calls[0]["since"], 0)
 
     def test_fill_records_carry_the_fee_in_usd(self):
         recs = B.to_fill_records([_trade(1, T0, fee=0.001, fee_ccy="XAUT", price=4000.0)],

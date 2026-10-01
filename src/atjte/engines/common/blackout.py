@@ -11,6 +11,15 @@ Two schedules, both off by default, both expressed in ONE timezone
   twice a year.
 - **events** (``MACRO_EVENTS``) — one absolute date and time each: CPI, NFP,
   an FOMC decision. They simply stop matching once they are past.
+- **trading sessions** (``SESSION_MON`` … ``SESSION_SUN``) — the hours of
+  each weekday the bot may quote; outside them it is a blackout like the
+  others (:func:`parse_sessions`, :func:`session_gap`). ``None`` for a day =
+  no limit that day.
+- **holidays** (``HOLIDAYS``) — dates the market is closed, a whole day or
+  a range of hours (:func:`parse_holidays`).
+- **major market opens** (``MARKET_OPEN_BREAKS``) — the Tokyo, London and
+  New York cash opens, Monday to Friday, each in its own clock, with a
+  window of ``MARKET_OPEN_BREAK_MIN`` either side (:func:`market_open_specs`).
 
 Each entry carries a window that OPENS ``before`` minutes ahead of the
 moment and CLOSES ``after`` minutes past it (2 / 2 by default). Inside a
@@ -173,6 +182,206 @@ def parse_events(entries: Optional[Sequence], before_min: float, after_min: floa
     return sorted(out, key=lambda e: e.ts)
 
 
+#: the major cash opens: (key, region, city, exchange timezone, (hour, minute))
+#: — Monday to Friday, in the exchange's own clock (its DST followed)
+MARKET_OPENS = (("asia", "Asia", "Tokyo", "Asia/Tokyo", (9, 0)),
+                ("eu", "EU", "London", "Europe/London", (8, 0)),
+                ("us", "US", "New York", "America/New_York", (9, 30)))
+
+
+@dataclass(frozen=True)
+class OpenSpec:
+    """A weekday market open in its exchange's timezone."""
+    tz: object
+    hour: int
+    minute: int
+    before_s: float
+    after_s: float
+    label: str
+
+
+def market_open_specs(before_min: float, after_min: float) -> list[OpenSpec]:
+    """The :data:`MARKET_OPENS` as blackout specs, ``before`` / ``after``
+    minutes either side."""
+    b, a = _window_minutes(before_min, after_min, 5.0, 5.0, "MARKET_OPEN_BREAK_MIN")
+    return [OpenSpec(ZoneInfo(z), h, m, b, a, f"{city} open")
+            for _k, _r, city, z, (h, m) in MARKET_OPENS]
+
+
+def _open_windows(spec: OpenSpec, now: float, offsets=(-1, 0, 1, 2, 3)) -> list[Window]:
+    """The open's windows on the weekdays around ``now`` (its own calendar)."""
+    today = datetime.fromtimestamp(now, spec.tz).date()
+    out = []
+    for off in offsets:
+        d = today + timedelta(days=off)
+        if d.weekday() > 4:
+            continue
+        moment = datetime.combine(d, dtime(spec.hour, spec.minute), tzinfo=spec.tz).timestamp()
+        out.append(Window(moment - spec.before_s, moment + spec.after_s, spec.label,
+                          "market open"))
+    return out
+
+
+#: the session settings, Monday first (``datetime.weekday()`` order)
+SESSION_NAMES = ("SESSION_MON", "SESSION_TUE", "SESSION_WED", "SESSION_THU",
+                 "SESSION_FRI", "SESSION_SAT", "SESSION_SUN")
+#: what a session setting may say for a day with no trading at all
+CLOSED_WORDS = ("", "closed", "none", "off", "-")
+
+
+def _hhmm(text: str, what: str, allow_24: bool = False) -> int:
+    """Minutes after midnight of ``"HH:MM"`` (``"24:00"`` as an END)."""
+    try:
+        hh, mm = text.strip().split(":")
+        h, m = int(hh), int(mm)
+    except ValueError as e:
+        raise RuntimeError(f"{what}: {text!r} is not 'HH:MM' ({e})") from e
+    if allow_24 and (h, m) == (24, 0):
+        return 24 * 60
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise RuntimeError(f"{what}: {text!r} is not a valid time of day")
+    return h * 60 + m
+
+
+def parse_ranges(text: str, what: str) -> list[tuple[int, int]]:
+    """``"08:00-12:00, 13:00-22:00"`` -> ``[(480, 720), (780, 1320)]``
+    (minutes after midnight, end exclusive, ``24:00`` allowed as an end).
+    A range must end after it starts — split one over midnight in two days."""
+    out = []
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            raise RuntimeError(f"{what}: {part!r} must be a range 'HH:MM-HH:MM'")
+        a, b = part.split("-", 1)
+        start, end = _hhmm(a, what), _hhmm(b, what, allow_24=True)
+        if end <= start:
+            raise RuntimeError(f"{what}: {part!r} ends before it starts — a session "
+                               f"over midnight is two ranges, one on each day")
+        out.append((start, end))
+    return sorted(out)
+
+
+def parse_sessions(values: Sequence) -> dict[int, Optional[list[tuple[int, int]]]]:
+    """The seven session settings (Monday first) -> ``{weekday: ranges}``.
+    ``None`` = no limit that day; ``""`` / ``"closed"`` = no trading at all;
+    else ranges (:func:`parse_ranges`). Raises on anything unreadable, at
+    startup."""
+    out: dict[int, Optional[list[tuple[int, int]]]] = {}
+    for day, (name, v) in enumerate(zip(SESSION_NAMES, values)):
+        if v is None:
+            out[day] = None
+        elif not isinstance(v, str):
+            raise RuntimeError(f"{name}: expected 'HH:MM-HH:MM, ...', 'closed' or "
+                               f"None — got {v!r}")
+        elif v.strip().lower() in CLOSED_WORDS:
+            out[day] = []
+        else:
+            out[day] = parse_ranges(v, name)
+    return out
+
+
+def sessions_limited(sessions: dict) -> bool:
+    """True when any day limits trading (the schedule is not 24/7)."""
+    return any(r is not None and r != [(0, 24 * 60)] for r in sessions.values())
+
+
+def _open_intervals(sessions: dict, now: float, tz, days=(-1, 0, 1, 2, 3, 4, 5, 6, 7, 8)):
+    """The allowed intervals (epoch) on the days around ``now``, merged."""
+    today = datetime.fromtimestamp(now, tz).date()
+    spans = []
+    for off in days:
+        d = today + timedelta(days=off)
+        ranges = sessions.get(d.weekday())
+        if ranges is None:
+            ranges = [(0, 24 * 60)]
+        midnight = datetime.combine(d, dtime(0, 0), tzinfo=tz)
+        for a, b in ranges:
+            # wall clock -> epoch through the zone (DST-correct): minutes
+            # from local midnight, re-resolved as local times
+            start = (midnight + timedelta(minutes=a)).replace(tzinfo=None)
+            end = (midnight + timedelta(minutes=b)).replace(tzinfo=None)
+            spans.append((start.replace(tzinfo=tz).timestamp(),
+                          end.replace(tzinfo=tz).timestamp()))
+    spans.sort()
+    merged: list[list[float]] = []
+    for a, b in spans:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
+
+
+def session_gap(now: float, sessions: dict, tz) -> Optional[Window]:
+    """The time outside the trading sessions that ``now`` falls in, as a
+    window (from the last session's end to the next one's start), or None
+    inside a session or with no limit."""
+    if not sessions_limited(sessions):
+        return None
+    spans = _open_intervals(sessions, now, tz)
+    if any(a <= now < b for a, b in spans):
+        return None
+    start = max((b for a, b in spans if b <= now), default=now)
+    end = min((a for a, b in spans if a > now), default=now + 7 * 86400.0)
+    return Window(start, end, "outside trading sessions", "session")
+
+
+def next_session_gap(now: float, sessions: dict, tz) -> Optional[Window]:
+    """The next stretch outside the sessions that has not started yet."""
+    if not sessions_limited(sessions):
+        return None
+    spans = _open_intervals(sessions, now, tz)
+    for a, b in spans:
+        if a <= now < b:
+            nxt = min((x for x, _y in spans if x > b), default=b + 7 * 86400.0)
+            return Window(b, nxt, "outside trading sessions", "session")
+    return None
+
+
+@dataclass(frozen=True)
+class HolidaySpec:
+    """A market holiday: a closed span, epoch seconds."""
+    start: float
+    end: float
+    label: str
+
+
+def parse_holidays(entries: Optional[Sequence], tz) -> list[HolidaySpec]:
+    """``HOLIDAYS`` -> closed spans in ``tz``. Per entry: ``"YYYY-MM-DD"``
+    (the whole day), ``"YYYY-MM-DD HH:MM-HH:MM"`` (those hours), either
+    optionally as ``(…, "label")``. Raises on anything unreadable."""
+    out: list[HolidaySpec] = []
+    for entry in (entries or ()):
+        what = f"HOLIDAYS entry {entry!r}"
+        label = None
+        if isinstance(entry, (tuple, list)):
+            if not entry or not isinstance(entry[0], str) or len(entry) > 2 \
+                    or (len(entry) == 2 and not isinstance(entry[1], str)):
+                raise RuntimeError(f"{what}: expected 'YYYY-MM-DD' or "
+                                   f"('YYYY-MM-DD', 'label')")
+            head = entry[0]
+            label = entry[1] if len(entry) == 2 else None
+        elif isinstance(entry, str):
+            head = entry
+        else:
+            raise RuntimeError(f"{what}: expected 'YYYY-MM-DD' or ('YYYY-MM-DD', 'label')")
+        day_text, _, hours = head.strip().partition(" ")
+        try:
+            day = datetime.strptime(day_text, "%Y-%m-%d").date()
+        except ValueError as e:
+            raise RuntimeError(f"{what}: the date must be 'YYYY-MM-DD' ({e})") from e
+        ranges = parse_ranges(hours, what) if hours.strip() else [(0, 24 * 60)]
+        midnight = datetime.combine(day, dtime(0, 0))
+        for a, b in ranges:
+            out.append(HolidaySpec(
+                (midnight + timedelta(minutes=a)).replace(tzinfo=tz).timestamp(),
+                (midnight + timedelta(minutes=b)).replace(tzinfo=tz).timestamp(),
+                label or f"holiday {head.strip()}"))
+    return sorted(out, key=lambda h: h.start)
+
+
 def _daily_windows(spec: DailySpec, now: float, tz, offsets=(-1, 0, 1)) -> list[Window]:
     """The spec's window on the days around ``now`` — one per offset, so a
     window that reaches over midnight (or over a DST step) is still found
@@ -188,10 +397,25 @@ def _daily_windows(spec: DailySpec, now: float, tz, offsets=(-1, 0, 1)) -> list[
 
 
 def active_window(now: float, daily: Sequence[DailySpec],
-                  events: Sequence[EventSpec], tz) -> Optional[Window]:
+                  events: Sequence[EventSpec], tz, *, sessions: Optional[dict] = None,
+                  holidays: Sequence[HolidaySpec] = (),
+                  opens: Sequence[OpenSpec] = ()) -> Optional[Window]:
     """The blackout covering ``now``, or None. When several overlap, the one
-    that ends LAST wins — quoting resumes only once every window is over."""
+    that ends LAST wins — quoting resumes only once every window is over.
+    Outside the trading sessions, a holiday and a market open's window
+    count as windows too."""
     best: Optional[Window] = None
+    for spec in opens:
+        for w in _open_windows(spec, now):
+            if w.contains(now) and (best is None or w.end > best.end):
+                best = w
+    gap = session_gap(now, sessions, tz) if sessions else None
+    if gap is not None:
+        best = gap
+    for h in holidays:
+        w = Window(h.start, h.end, h.label, "holiday")
+        if w.contains(now) and (best is None or w.end > best.end):
+            best = w
     for spec in events:
         w = Window(spec.ts - spec.before_s, spec.ts + spec.after_s, spec.label, "event")
         if w.contains(now) and (best is None or w.end > best.end):
@@ -204,10 +428,23 @@ def active_window(now: float, daily: Sequence[DailySpec],
 
 
 def next_window(now: float, daily: Sequence[DailySpec],
-                events: Sequence[EventSpec], tz) -> Optional[Window]:
+                events: Sequence[EventSpec], tz, *, sessions: Optional[dict] = None,
+                holidays: Sequence[HolidaySpec] = (),
+                opens: Sequence[OpenSpec] = ()) -> Optional[Window]:
     """The next window that has not started yet (soonest start), or None —
-    what the heartbeat shows as "next blackout"."""
+    what the heartbeat shows as "next blackout" (the next session close and
+    holiday included)."""
     best: Optional[Window] = None
+    gap = next_session_gap(now, sessions, tz) if sessions else None
+    if gap is not None and gap.start > now:
+        best = gap
+    for h in holidays:
+        if h.start > now and (best is None or h.start < best.start):
+            best = Window(h.start, h.end, h.label, "holiday")
+    for spec in opens:
+        for w in _open_windows(spec, now):
+            if w.start > now and (best is None or w.start < best.start):
+                best = w
     for spec in events:
         w = Window(spec.ts - spec.before_s, spec.ts + spec.after_s, spec.label, "event")
         if w.start > now and (best is None or w.start < best.start):
@@ -217,6 +454,23 @@ def next_window(now: float, daily: Sequence[DailySpec],
             if w.start > now and (best is None or w.start < best.start):
                 best = w
     return best
+
+
+def describe_sessions(sessions: dict) -> str:
+    """``Mon 08:00-22:00 · Sat closed · Sun no limit`` for the banner."""
+    days = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+    parts = []
+    for d, name in enumerate(days):
+        r = sessions.get(d)
+        if r is None:
+            text = "no limit"
+        elif not r:
+            text = "closed"
+        else:
+            text = ", ".join(f"{a // 60:02d}:{a % 60:02d}-{b // 60:02d}:{b % 60:02d}"
+                             for a, b in r)
+        parts.append(f"{name} {text}")
+    return " · ".join(parts)
 
 
 def describe(specs_daily: Sequence[DailySpec], specs_events: Sequence[EventSpec],

@@ -44,7 +44,11 @@ from atjte.gateways.fix.protocol import (  # noqa: F401  (re-exported)
 )
 
 # ── ops a client sends ───────────────────────────────────────────────────────
-CLIENT_OPS = frozenset({HELLO, PLACE, AMEND, CANCEL, CANCEL_ALL, PING, BYE, READ})
+#: set this client's symbol's leverage and margin mode (isolated / cross) —
+#: what the strategy's LEVERAGE / MARGIN_MODE ask for, once at bot start
+SET_LEVERAGE = "set_leverage"
+CLIENT_OPS = frozenset({HELLO, PLACE, AMEND, CANCEL, CANCEL_ALL, PING, BYE, READ,
+                        SET_LEVERAGE})
 ORDER_OPS = frozenset({PLACE, AMEND, CANCEL, CANCEL_ALL})
 
 #: what a ``read`` may ask for: the CCXT private reads the engine makes
@@ -52,7 +56,13 @@ ORDER_OPS = frozenset({PLACE, AMEND, CANCEL, CANCEL_ALL})
 #: (``symbol``, ``symbols``, ``id``, ``since``, ``limit``, ``params``). The
 #: gateway adds the account (its ``user`` / sub-account) itself.
 READ_WHAT = ("fetch_balance", "fetch_positions", "fetch_open_orders",
-             "fetch_order", "fetch_my_trades", "fetch_closed_orders", "markets")
+             "fetch_order", "fetch_my_trades", "fetch_closed_orders", "markets",
+             # public 1 m candles: a bot backfills its report bars and warms its
+             # indicators from them at startup (no account involved)
+             "fetch_ohlcv",
+             # the account's funding payments: paid hourly as cash, never as a
+             # fill and with no accrual on the position to watch
+             "fetch_funding_history")
 #: the read that hands a bot its market list (``{"markets", "currencies"}``,
 #: :func:`atjte.gateways.common.markets_payload`): the bot loads it into a
 #: CCXT instance that opens no connection of its own

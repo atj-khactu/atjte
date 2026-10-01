@@ -19,23 +19,58 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
+from ..common import replace_retrying
 from . import cloid as CL
 from . import config as C
 
 
-def write_state(path: Path, body: dict) -> None:
-    fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(path.parent))
+def publish_dexes(folder: Path, network: str, log) -> None:
+    """Write ``dexes.json``: the HIP-3 builder dexes Hyperliquid lists
+    (``info`` ``perpDexs``, one public request), for the panel's gateway
+    form — the panel holds no venue connection, so the gateway tells it.
+    Mainnet only (testnet runs on the main dex). In a thread, never raises:
+    a list that cannot be read leaves the last one in place."""
+    if network != "mainnet":
+        return
+
+    def run() -> None:
+        try:
+            import ccxt
+            raw = ccxt.hyperliquid({"timeout": 15000}).publicPostInfo({"type": "perpDexs"})
+            dexes = [{"name": str(d.get("name") or ""), "full_name": str(d.get("fullName") or "")}
+                     for d in raw or [] if isinstance(d, dict) and d.get("name")]
+            if write_state(folder / C.DEXES_NAME, {"t": time.time(), "network": network,
+                                                   "dexes": dexes}):
+                log(f"HIP-3 dexes listed: {len(dexes)} ({C.DEXES_NAME})")
+        except Exception as e:                               # noqa: BLE001
+            log(f"could not list the HIP-3 dexes: {type(e).__name__}: {e}")
+    threading.Thread(target=run, name="hl-dexes", daemon=True).start()
+
+
+def write_state(path: Path, body: dict) -> bool:
+    """The heartbeat the control panel reads, written atomically. NEVER
+    raises: a heartbeat that cannot be written this second is skipped (the
+    panel sees it age), it must not stop the gateway — an uncaught
+    PermissionError here (the panel reading the file at that instant, on
+    Windows) once took an MT5 gateway, and every bot's hedge, down.
+    Returns whether it was written. Shared by the Hyperliquid, Lighter,
+    MT5 and CCXT daemons."""
+    tmp = None
     try:
+        fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(body, f, indent=1, default=str)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+        replace_retrying(tmp, path)
+        return True
+    except Exception:                                       # noqa: BLE001
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        return False
 
 
 def stop_requested(folder: Path) -> bool:
@@ -47,6 +82,29 @@ def stop_requested(folder: Path) -> bool:
     except OSError:
         pass
     return True
+
+
+def handle_reserve_request(folder: Path, gw, log) -> Optional[dict]:
+    """The operator's "Buy requests", if one is waiting: a stale, malformed
+    or unconfirmed request is dropped and reported, never spent. The
+    outcome lands in the heartbeat (``last_reserve``) under the request id."""
+    req = C.take_reserve_request(folder)
+    if req is None:
+        return None
+    if req.get("error") or req.get("stale") is not None or not req.get("confirmed"):
+        why = (req.get("error") or
+               (f"older than {C.RESERVE_MAX_AGE_S:g}s" if req.get("stale") is not None
+                else "not confirmed by the operator"))
+        out = {"id": req.get("id", ""), "ok": False, "t": time.time(),
+               "account": req.get("account"), "weight": req.get("weight"),
+               "text": f"request purchase discarded: {why}"}
+        gw.last_reserve = out
+        log(f"{gw.LABEL}: {out['text']}")
+        return out
+    out = gw.reserve(req["account"], req["weight"], confirmed=True,
+                     cost_usdc=req["cost_usdc"])
+    out["id"] = req["id"]
+    return out
 
 
 def _ask_network() -> str:
@@ -139,25 +197,41 @@ def main(argv=None) -> int:
     log(f"{cfg.name}: {cfg.network.upper()} — loading Hyperliquid markets "
         f"({', '.join(cfg.dexes) or 'main dex'}) for account(s) {', '.join(cfg.accounts)}")
     up.start()
+    # the markets it loaded (its HIP-3 dexes' too) for the panel's New
+    # strategy dialog, and the dexes the venue lists for its gateway form
+    write_state(cfg.dir / C.MARKETS_NAME, {"t": time.time(), "network": cfg.network,
+                                            "dexes": list(cfg.dexes),
+                                            "markets": up.market_rows()})
+    publish_dexes(cfg.dir, cfg.network, log)
     gw = HlGateway(up, port=cfg.listen_port, token=cfg.token,
                    slots=CL.SlotRegistry(cfg.dir / C.SLOTS_NAME),
                    allowed_clients=set(cfg.clients), msgs_per_min=cfg.msgs_per_min,
                    max_inflight=cfg.max_inflight, account_dms_s=cfg.account_dms_s,
                    network=cfg.network, log=log)
     gw.start()
+    from atjte.gateways.accounts import AccountPublisher
+    accounts = AccountPublisher(cfg.dir, gw.account_snapshot, name=cfg.name, venue="hyperliquid",
+                                every_s=cfg.accounts_every_s,
+                                enabled=cfg.publish_accounts, log=log)
+    accounts.start()
     if not cfg.token:
         log("WARNING: no hl_gateway_token — any process on this machine can attach")
     state = cfg.dir / C.STATE_NAME
     stop_requested(cfg.dir)                 # a stale signal must not stop this start
+    # a purchase left from before this start is never made (see RESERVE_MAX_AGE_S)
+    if C.take_reserve_request(cfg.dir) is not None:
+        log(f"{cfg.name}: a request purchase left from before this start — discarded")
     try:
         while not stop.wait(1.0):
+            handle_reserve_request(cfg.dir, gw, log)
             s = gw.status()
             ready = s["upstream"]["public_ok"] and all(s["upstream"]["accounts"].values())
             write_state(state, {"name": cfg.name, "pid": os.getpid(), "t": time.time(),
                                 "dialect": "hyperliquid", "venue": "hyperliquid",
                                 "network": cfg.network,
                                 "listen_port": gw.port, "clients_allowed": list(cfg.clients),
-                                "token_set": bool(cfg.token), "accounts": list(cfg.accounts),
+                                "token_set": bool(cfg.token),
+                                "publish_accounts": cfg.publish_accounts, "accounts": list(cfg.accounts),
                                 "session": {"ready": ready,
                                             "state": "ready" if ready else "degraded",
                                             "reason": "" if ready else "a stream is down",
@@ -167,6 +241,7 @@ def main(argv=None) -> int:
                 log(f"{cfg.name}: stop signal — shutting down cleanly")
                 break
     finally:
+        accounts.stop()
         gw.stop()
         up.stop()
         try:

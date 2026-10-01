@@ -29,18 +29,18 @@ CLOSE_ONLY = False
 
 # --- The two levels ---
 # spread = crypto mid − MT5 mid (USD per base unit). ONE post-only buy rests
-# at BUY_SPREAD_USD (crypto cheap against the CFD) and ONE post-only sell at
-# SELL_SPREAD_USD (crypto rich), ORDER_SIZE_UNITS each, on every position.
+# at BUY_SPREAD (crypto cheap against the CFD) and ONE post-only sell at
+# SELL_SPREAD (crypto rich), ORDER_SIZE_UNITS each, on every position.
 # No ladder and no exit rungs at 0: a buy filled at the buy level is unwound
 # by the sell at the sell level and vice versa, so each round trip captures
 # the WHOLE distance between them — at the price of holding the position
-# until the spread swings all the way across. BUY_SPREAD_USD must be below
-# SELL_SPREAD_USD (the bot refuses to start otherwise: its own orders would
+# until the spread swings all the way across. BUY_SPREAD must be below
+# SELL_SPREAD (the bot refuses to start otherwise: its own orders would
 # cross), and the gap should comfortably exceed the round-trip cost —
 # both venues' fees plus the MT5 symbol's own spread, which the hedge pays
 # twice.
-BUY_SPREAD_USD = -15.0
-SELL_SPREAD_USD = 15.0
+BUY_SPREAD = -15.0
+SELL_SPREAD = 15.0
 
 # Size of each resting order, in base units. Keep it >= one MT5 min lot
 # (min_lot x contract_size, logged at startup) so every fill can be hedged;
@@ -63,19 +63,19 @@ MAX_SHORT_UNITS = 3.0
 
 # --- Optional: separate exit levels (None = off) ---
 # Off, a held position is unwound by the OPPOSITE ENTRY (the sell at
-# SELL_SPREAD_USD closes a long). On, a held position gets its own exit
+# SELL_SPREAD closes a long). On, a held position gets its own exit
 # order at a level BETWEEN the two entries, which rests ahead of the
 # same-side entry while the entries keep accumulating behind it:
-#   LONG_EXIT_SPREAD_USD   the SELL level that closes a long
-#                          (BUY_SPREAD_USD < it <= SELL_SPREAD_USD)
-#   SHORT_EXIT_SPREAD_USD  the BUY level that closes a short
-#                          (BUY_SPREAD_USD <= it < SELL_SPREAD_USD)
+#   LONG_EXIT_SPREAD   the SELL level that closes a long
+#                          (BUY_SPREAD < it <= SELL_SPREAD)
+#   SHORT_EXIT_SPREAD  the BUY level that closes a short
+#                          (BUY_SPREAD <= it < SELL_SPREAD)
 # e.g. 0.0 / 0.0 takes profit as soon as the spread returns to par — smaller
 # per trip than the full −15 → +15 swing, but far more often.
 # EXIT_CLIP_UNITS caps ONE exit order, so a big position is walked out a
 # clip at a time; None = the whole position in one order.
-LONG_EXIT_SPREAD_USD = None
-SHORT_EXIT_SPREAD_USD = None
+LONG_EXIT_SPREAD = None
+SHORT_EXIT_SPREAD = None
 EXIT_CLIP_UNITS = None
 
 # --- Engine overrides (optional) ---
@@ -88,10 +88,10 @@ EXIT_CLIP_UNITS = None
 # MT5 reference. True = an order is submitted only while the rolling
 # BASIS_WINDOW_S average of the side-aware basis (buy: crypto bid − MT5 bid,
 # sell: crypto ask − MT5 ask) is at/through its level, and it is pulled once
-# the average retreats BASIS_RELEASE_USD back inside.
+# the average retreats BASIS_RELEASE back inside.
 BASIS_TRIGGER = True         # default ON (orders go in only when the basis average is through their level)
 BASIS_WINDOW_S = 5.0         # rolling basis-average window (s)
-BASIS_RELEASE_USD = 0.25     # hysteresis before a live quote is pulled (USD/unit)
+BASIS_RELEASE = 0.25     # hysteresis before a live quote is pulled (spread points)
 
 # Limit-price optimisation off the basis average (engine feature; None =
 # off). When the BASIS_WINDOW_S average is already THROUGH an order's level,
@@ -127,7 +127,6 @@ FUNDING_RATE_MAX_ABS = None
 # state, so a restart resumes the same day instead of starting the count
 # again. The day boundary is the machine's LOCAL midnight (the dashboard's
 # "today"); True = UTC midnight.
-RISK_DAY_UTC = False
 MAX_DAILY_LOSS_USD = None            # e.g. 200 -> close-only below -200 USD today
 MAX_DAILY_VENUE_VOLUME_USD = None    # e.g. 500000 -> crypto notional traded today
 MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded today
@@ -143,7 +142,7 @@ MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded 
 # figure that could not be read (a failed read already stops entries through
 # the ordinary margin gate). The first two are PERPETUAL only.
 DERISK_VENUE_AVAILABLE_MARGIN_USD = None  # USD, venue available margin
-DERISK_VENUE_LIQ_DISTANCE_PCT = None      # % of mark to the liquidation price
+DERISK_VENUE_LIQ_DISTANCE_PCT = None      # % to the liquidation price (of the entry cushion or the mark: LIQ_DISTANCE_BASE)
 DERISK_MT5_MARGIN_LEVEL = None            # %, MT5 margin level (stop-out is well below)
 DERISK_MT5_FREE_MARGIN = None             # account ccy, MT5 free margin
 
@@ -173,7 +172,7 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 #                        ("13:30", "US cash open")]
 # A mis-typed entry or an unknown timezone raises AT STARTUP — a schedule
 # that silently does nothing is worse than no schedule.
-BLACKOUT_TZ = "UTC"          # IANA name; every entry below is read in it
+BLACKOUT_TZ = None          # IANA name every entry below is read in; None = the ACP timezone
 BLACKOUT_BEFORE_MIN = 2.0    # default minutes BEFORE the moment
 BLACKOUT_AFTER_MIN = 2.0     # default minutes AFTER it
 DAILY_BLACKOUTS = []

@@ -54,6 +54,7 @@ from atjte.fix import kraken as K
 from atjte.fix.codec import Msg
 from atjte.fix.session import FixSession, SessionDown
 
+from .. import accounts as A
 from ..common import ReadCache
 from . import protocol as P
 
@@ -970,6 +971,33 @@ class FixGateway:
                 "session": self.session_status(),
                 "upstream": self.up.status() if self.up is not None else None}
 
+    def account_snapshot(self) -> dict:
+        """The account's balances, positions and open orders (account_state.json,
+        :mod:`..accounts`), read on the CCXT side through the bots' cache. An
+        order is its bot's when this gateway placed it (by the venue's order
+        id, or the ClOrdID where the REST side reports it)."""
+        if self.up is None:
+            raise RuntimeError("this gateway has no CCXT side to read the account with")
+
+        def read(what: str, args: dict):
+            return self._reads.get(ACCOUNT, what, args,
+                                   lambda: self.up.read(ACCOUNT, what, args))
+        with self._lock:
+            holders = {c.symbol: c.name for c in self._clients.values()
+                       if c.symbol and not c.readonly}
+            by_oid = {k: v.client for k, v in self._by_orderid.items()}
+            by_cl = {k: v.client for k, v in self._by_clordid.items()}
+
+        def owner(o: dict) -> tuple[str, str]:
+            name = (by_oid.get(str(o.get("id") or ""))
+                    or by_cl.get(str(o.get("clientOrderId") or "")))
+            return ("bot", name) if name else ("foreign", "")
+        acc = {"account": ACCOUNT,
+               **A.ccxt_account(read, args=A.positional_args, symbols=holders,
+                                owner_of=owner, holder_of=lambda s: holders.get(s, ""))}
+        return {"accounts": [acc], "exchange": self.up.exchange_id,
+                "dialect": self.dialect.name}
+
 
 def write_state(path, gw: "FixGateway", cfg, pid: int) -> None:
     """The daemon's heartbeat for the control panel: the gateway's
@@ -987,13 +1015,15 @@ def write_state(path, gw: "FixGateway", cfg, pid: int) -> None:
             "listen_port": gw.port, "clients_allowed": list(cfg.clients),
             "keys_from": cfg.creds_source, "sender_from": cfg.sender_source,
             "token_set": bool(cfg.token), "sandbox": bool(cfg.status().get("sandbox")),
+            "publish_accounts": bool(getattr(cfg, "publish_accounts", True)),
             "market_data": gw.md_session is not None,
             **gw.status()}
     fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(body, f, indent=1, default=str)
-        os.replace(tmp, path)
+        from atjte.gateways.common import replace_retrying
+        replace_retrying(tmp, path)       # Windows: the panel may be reading it
     except Exception:
         try:
             os.unlink(tmp)
@@ -1050,11 +1080,12 @@ def _reject_kind(text: str) -> str:
 _OTHER_VENUES = {"hyperliquid": "atjte.gateways.hyperliquid.config",
                  "lighter": "atjte.gateways.lighter.config",
                  "ccxt": "atjte.gateways.ccxt.config",
+                 "ibkr": "atjte.gateways.ibkr.config",
                  "mt5": "atjte.gateways.mt5.config"}
 
 
 def _other_venue(argv: list):
-    """``hyperliquid`` / ``lighter`` / ``ccxt`` / ``mt5`` when the command is for one of those (by
+    """``hyperliquid`` / ``lighter`` / ``ccxt`` / ``ibkr`` / ``mt5`` when the command is for one of those (by
     ``--venue``, or because the named gateway's folder is one of theirs),
     else None — a Kraken FIX gateway."""
     for i, a in enumerate(argv):
@@ -1110,6 +1141,9 @@ def main(argv=None) -> int:
     if other == "ccxt":
         from atjte.gateways.ccxt.daemon import main as ccxt_main
         return ccxt_main(args_in)
+    if other == "ibkr":
+        from atjte.gateways.ibkr.daemon import main as ib_main
+        return ib_main(args_in)
 
     ap = argparse.ArgumentParser(prog="atjte-gateway")
     ap.add_argument("gateway", nargs="?", type=Path,
@@ -1230,6 +1264,10 @@ def main(argv=None) -> int:
     session.start()
     if md is not None:
         md.start()
+    accounts = A.AccountPublisher(cfg.dir, gw.account_snapshot, name=cfg.name,
+                                  venue="kraken_fix", every_s=cfg.accounts_every_s,
+                                  enabled=cfg.publish_accounts, log=log)
+    accounts.start()
     log(f"gateway {cfg.name}: {cfg.dialect.name} FIX {cfg.host}:{cfg.trd_port} as "
         f"{cfg.target_comp_id}; keys from {cfg.creds_source}, SenderCompID from "
         f"{cfg.sender_source}; clients "
@@ -1263,6 +1301,7 @@ def main(argv=None) -> int:
             if stop_requested(cfg.dir):
                 bye()
     finally:
+        accounts.stop()
         for c in list(gw._clients.values()):
             gw._reap(c, reason="the gateway is stopping")
         gw.stop()

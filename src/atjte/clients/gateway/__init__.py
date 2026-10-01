@@ -7,6 +7,8 @@ key; it leases a gateway (:mod:`atjte.gateways`) over loopback:
   (Coinbase, Binance, Kraken spot, Kraken Futures REST orders);
 - ``HyperliquidGatewayClient`` / ``LighterGatewayClient`` — through the
   machine's Hyperliquid / Lighter gateway;
+- ``IbkrGatewayClient`` — Interactive Brokers futures through the IBKR
+  gateway (TWS / IB Gateway);
 - ``KrakenFixClient`` / ``KrakenFuturesFixClient`` — Kraken spot /
   derivatives with order entry over the Kraken FIX gateway (which serves the
   reads, prices and fills too);
@@ -22,6 +24,7 @@ _LAZY = {"CcxtGatewayClient": ".ccxt_gateway",
          "KrakenFuturesFixClient": ".kraken_futures_fix",
          "HyperliquidGatewayClient": ".hyperliquid_gateway",
          "LighterGatewayClient": ".lighter_gateway",
+         "IbkrGatewayClient": ".ibkr_gateway",
          "MT5GatewayClient": ".mt5_gateway"}
 
 __all__ = [*_LAZY]

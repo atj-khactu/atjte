@@ -204,6 +204,21 @@ class OrdersTest(GatewayCase):
         with self.assertRaises(ccxt.InvalidOrder):
             b.cancel(o["id"])
 
+    def test_a_stream_down_refuses_new_orders_but_never_a_cancel(self):
+        """Quotes come DOWN when a stream drops: the bot's cancels must reach
+        the venue then, while a new order waits for the streams."""
+        c = self.lease()
+        o = c.place("buy", 0.01, 100.0)
+        o2 = c.place("buy", 0.01, 99.0)
+        from atjte.gateways.fix.client import GatewayDown
+        self.up.priv = False                          # the fills stream drops
+        with self.assertRaises(GatewayDown):
+            c.place("buy", 0.01, 98.0)
+        c.cancel(o["id"])
+        self.assertIn(("cancel", "main", BTC, [o["id"]]), self.up.calls)
+        c.cancel_all()
+        self.assertTrue(any(x[0] == "cancel" and o2["id"] in x[3] for x in self.up.calls))
+
     def test_amend_where_the_path_cannot_is_the_venues_refusal(self):
         c = self.lease()
         o = c.place("buy", 0.01, 100.0)
@@ -273,6 +288,66 @@ class ReadsTest(GatewayCase):
         c = self.lease()
         m = c.read("markets")
         self.assertIn(BTC, m["markets"])
+
+
+class MarketsPayloadTest(unittest.TestCase):
+    """The markets read on a venue with thousands of markets: Kraken spot's
+    1,454 came to 1.8 MB, over the 1 MiB line, and a PAXG/USD bot could not
+    start (2026-09-29)."""
+
+    @staticmethod
+    def venue(n: int = 1500):
+        tiers = {"taker": [[i * 1e4, 0.0026 - i * 1e-5] for i in range(10)],
+                 "maker": [[i * 1e4, 0.0016 - i * 1e-5] for i in range(10)]}
+        x = ccxt.kraken()
+        markets = {}
+        for i in range(n):
+            sym = f"C{i}/USD"
+            m = x.safe_market_structure({
+                "id": f"C{i}USD", "symbol": sym, "base": f"C{i}", "quote": "USD",
+                "baseId": f"C{i}", "quoteId": "USD", "type": "spot", "spot": True,
+                "active": True, "taker": 0.0026, "maker": 0.0016,
+                "precision": {"amount": 1e-5, "price": 0.01},
+                "limits": {"amount": {"min": 1.0, "max": None},
+                           "cost": {"min": 0.5, "max": None}},
+                "info": {"raw": "x" * 400}})
+            m["tiers"] = tiers
+            markets[sym] = m
+        x.set_markets(markets)
+        return x
+
+    def test_the_bots_market_travels_whole_and_the_others_slim(self):
+        from atjte.gateways.common import markets_payload
+        p = markets_payload(self.venue(3), "C1/USD")
+        self.assertIn("info", p["markets"]["C1/USD"])
+        self.assertIn("tiers", p["markets"]["C1/USD"])
+        other = p["markets"]["C0/USD"]
+        self.assertNotIn("info", other)
+        self.assertNotIn("tiers", other)
+        self.assertNotIn(None, other.values())
+        self.assertEqual(other["precision"], {"amount": 1e-5, "price": 0.01})
+
+    def test_a_kraken_sized_list_fits_the_line_and_loads_the_same(self):
+        from atjte.gateways.common import markets_payload
+        from atjte.gateways.fix import protocol as P
+        x = self.venue(1500)
+        line = P.dumps({"op": "result", "value": markets_payload(x, "C1/USD")})
+        self.assertLess(len(line), P.MAX_LINE)       # dumps raised here before
+        got = ccxt.kraken()
+        got.set_markets(markets_payload(x, "C1/USD")["markets"])
+        for sym in ("C0/USD", "C1499/USD"):
+            a, b = got.market(sym), x.market(sym)
+            for k in ("id", "base", "quote", "type", "spot", "active", "precision",
+                      "limits", "taker", "maker", "contract", "linear", "subType"):
+                self.assertEqual(a[k], b[k], f"{sym} {k}")
+        self.assertEqual(got.amount_to_precision("C0/USD", 1.234567),
+                         x.amount_to_precision("C0/USD", 1.234567))
+
+    def test_the_line_carries_a_market_list_of_several_megabytes(self):
+        from atjte.gateways.fix import protocol as P
+        big = {"op": "result", "value": "x" * (3 << 20)}      # Binance-sized
+        r = P.LineReader()
+        self.assertEqual(list(r.feed(P.dumps(big)))[0]["value"], big["value"])
 
 
 class AdoptionTest(unittest.TestCase):

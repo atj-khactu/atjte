@@ -58,6 +58,11 @@ Log = Callable[[str], None]
 PAGE_KRAKEN_SPOT = 50
 PAGE_DEFAULT = 100
 MAX_PAGES = 2000                 # a hard stop: 200k fills is more than any bot here has
+#: forward-paged venues whose CCXT ``fetch_my_trades`` with NO ``since``
+#: serves the NEWEST page (the tail) — paging forward from its newest trade
+#: then finds nothing, so a backfill "since the beginning" read 100 fills and
+#: stopped. On these "the beginning" starts at the epoch.
+FROM_EPOCH = frozenset({"hyperliquid"})
 #: seconds between pages — Kraken Futures' fills endpoint is rate-limited
 #: per account (apiLimitExceeded after a burst); the others are gentler
 PACE_S = {"krakenfutures": 2.0, "kraken": 1.5}
@@ -180,7 +185,8 @@ def fetch_venue_trades(exchange, exchange_id: str, symbol: str,
       ``continuationToken`` until the venue offers none or the page reaches
       back past ``since``;
     - ``kraken`` (spot): FORWARDS by ``ofs`` from ``since``, 50 a page;
-    - anything else: FORWARDS by ``since`` (the newest timestamp + 1 ms).
+    - anything else: FORWARDS by ``since`` (from the newest timestamp),
+      from the epoch on a :data:`FROM_EPOCH` venue when no ``since`` is given.
 
     Pages are paced (``PACE_S``) and a rate-limit reply is retried after a
     wait; when the venue still refuses, or fails otherwise, :class:`Partial`
@@ -270,6 +276,8 @@ def _fetch_pages(exchange, exchange_id, symbol, since_ms, keep, result, log, max
                 break
     else:
         cursor = since_ms
+        if cursor is None and exchange_id in FROM_EPOCH:
+            cursor = 0
         while pages < max_pages:
             if pages:
                 sleep(pace)
@@ -279,11 +287,23 @@ def _fetch_pages(exchange, exchange_id, symbol, since_ms, keep, result, log, max
             log(f"venue page {pages}: {len(batch)} trades")
             if not batch:
                 break
-            keep(batch)
+            kept = keep(batch)
             newest = max(int(t.get("timestamp") or 0) for t in batch)
-            if len(batch) < PAGE_DEFAULT or (cursor is not None and newest <= cursor):
+            if len(batch) < PAGE_DEFAULT:
                 break
-            cursor = newest + 1
+            # The next page starts AT the newest millisecond, not after it: a
+            # venue stamps an order's partial fills with one millisecond (on
+            # Hyperliquid, routinely), and a page ending inside it skipped the
+            # rest. The overlap is deduplicated by id; a page with nothing new
+            # steps past its
+            # millisecond, and one older than the cursor means the venue
+            # ignored ``since``.
+            if kept:
+                cursor = newest
+            elif cursor is not None and newest < cursor:
+                break
+            else:
+                cursor = newest + 1
     return result()
 
 
@@ -336,7 +356,7 @@ def to_fill_records(trades: list[dict], exchange_id: str, symbol: str,
             fee_usd=reporting.fee_usd(_f(fee.get("cost")), fee.get("currency"), price,
                                       base, quote),
             order_id=str(t["order"]) if t.get("order") else None, source="backfill",
-            realized_usd=_f((t.get("info") or {}).get("realized_pnl")),
+            realized_usd=reporting.venue_realized_pnl(t.get("info")),
             taker_or_maker=str(t.get("takerOrMaker") or "")))
     return out
 

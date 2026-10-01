@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from ..common import replace_retrying
+
 TAG = 0xA71E
 MAX_SLOT = 0xFFFF
 
@@ -104,4 +106,4 @@ class SlotRegistry:
         tmp = self.path.with_name(self.path.name + ".tmp")
         tmp.write_text(json.dumps({"slots": self._slots}, indent=1, sort_keys=True),
                        encoding="utf-8")
-        os.replace(tmp, self.path)
+        replace_retrying(tmp, self.path)     # Windows: a reader may hold it

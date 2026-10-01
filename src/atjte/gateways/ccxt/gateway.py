@@ -33,6 +33,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from atjte.gateways import accounts as A
+from atjte.gateways.common import replace_retrying
 from atjte.gateways.hyperliquid import protocol as P
 from atjte.gateways.hyperliquid.gateway import (  # noqa: F401  (re-exported)
     READ_TTL_S as _HL_TTL, GatewayRefusal, HlGateway, _Client, _Owned,
@@ -88,6 +90,7 @@ class CcxtGateway(HlGateway):
     SUPPORTS_AMEND = True
     READ_WHAT = READ_WHAT
     READ_TTL_S = READ_TTL_S
+    _account_args = staticmethod(A.positional_args)
 
     def __init__(self, upstream, *, port: int = DEFAULT_PORT,
                  owners_file: Optional[Path] = None, slots=None,
@@ -138,6 +141,9 @@ class CcxtGateway(HlGateway):
                 "account": c.account, "network": self.network, "orders": path,
                 "supports_amend": amend, "exchange": self.up.exchange_id}
 
+    def account_snapshot(self) -> dict:
+        return {**super().account_snapshot(), "exchange": self.up.exchange_id}
+
     # ── ownership, persisted ─────────────────────────────────────────────────
     def _order_op(self, c: _Client, op: str, msg: dict) -> Any:
         try:
@@ -167,7 +173,7 @@ class CcxtGateway(HlGateway):
             self._owners_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._owners_file.with_name(self._owners_file.name + ".tmp")
             tmp.write_text(json.dumps({"orders": body}, indent=1), encoding="utf-8")
-            os.replace(tmp, self._owners_file)
+            replace_retrying(tmp, self._owners_file)   # Windows: a reader may hold it
         except OSError as e:
             self._log(f"{self.LABEL}: owners file not saved ({e})")
 

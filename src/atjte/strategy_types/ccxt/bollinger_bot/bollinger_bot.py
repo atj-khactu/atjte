@@ -33,7 +33,7 @@ The spread (crypto mid − MT5 mid, USD per base unit) is summarised by a
   not parked at the bands 24/5 — a quote is submitted only while the
   rolling ``BASIS_WINDOW_S`` average of the side-aware basis (buy: perp bid
   − MT5 bid; sell: perp ask − MT5 ask) is at/through its band level, and it
-  is pulled once the average retreats ``BASIS_RELEASE_USD`` back inside.
+  is pulled once the average retreats ``BASIS_RELEASE`` back inside.
 
 Band inputs, in preference order:
 
@@ -65,7 +65,6 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -129,7 +128,6 @@ BAR_GRACE_MIN = 90   # samples/closes older than BB_PERIOD_MIN + this many
                      # minutes no longer count toward the bands. Must exceed
                      # the ~64 min daily MT5 maintenance break yet stay
                      # far below the weekend gap
-DEFAULT_SRV_OFFSET_S = 3 * 3600.0   # IC server time is usually UTC+3
 
 SAMPLES_PER_WINDOW = BB_PERIOD_MIN * 60   # full band window in 1 s samples
 
@@ -190,46 +188,16 @@ class BollingerBot(ArbBot):
         return ORDER_SIZE_UNITS        # entry AND exit clip
 
     # ── 1-min close series ───────────────────────────────────────────────────
-    def _mt5_utc_offset_s(self) -> float:
-        """MT5 timestamps are epoch numbers in the broker server's timezone;
-        infer the UTC offset from a fresh tick (snapped to 30 min), falling
-        back to the usual UTC+3. The tick is trusted only if it ADVANCES over
-        a re-read: a quote frozen by the session break would otherwise
-        poison the offset and mis-key the whole backfill."""
-        off = DEFAULT_SRV_OFFSET_S
-        try:
-            t1 = (self.mt5.get_ticker(SYMBOL_MT5).raw or {}).get("time")
-            for _ in range(3):
-                time.sleep(1.0)
-                t2 = (self.mt5.get_ticker(SYMBOL_MT5).raw or {}).get("time")
-                if t1 and t2 and float(t2) > float(t1):
-                    cand = float(t2) - time.time()
-                    snapped = round(cand / 1800.0) * 1800.0
-                    if abs(cand - snapped) < 120.0:
-                        off = snapped
-                    break
-        except Exception:
-            pass
-        return off
-
     def _backfill_bars(self) -> None:
-        """Seed the close series from REST history (the crypto venue 1m
-        candles x MT5 M1 rates, minute-open timestamps intersected) so the
-        bands are live at startup. Best-effort: on any failure the bot warms
-        up from live samples instead (~BB_PERIOD_MIN minutes)."""
+        """Seed the close series from history through the GATEWAYS (the
+        exchange's 1 m candles x the MT5 M1 rates, :meth:`history_closes`,
+        minute-open timestamps intersected) so the bands are live at startup.
+        Best-effort: a leg its gateway serves no history for leaves the bot
+        warming up from live samples instead (~BB_PERIOD_MIN minutes)."""
         try:
-            import MetaTrader5 as mt5m   # same terminal MT5Client attached to
             now = time.time()
             since = now - self._bars.maxlen * 60.0
-            kr = {int(ts // 1000): float(c) for ts, _o, _h, _l, c, _v in
-                  self.venue.exchange.fetch_ohlcv(
-                      SYMBOL_VENUE, "1m", since=int(since * 1000), limit=self._bars.maxlen)}
-            off = self._mt5_utc_offset_s()
-            frm = datetime.fromtimestamp(since + off, tz=timezone.utc)
-            to = datetime.fromtimestamp(now + off + 300.0, tz=timezone.utc)
-            rates = mt5m.copy_rates_range(SYMBOL_MT5, mt5m.TIMEFRAME_M1, frm, to)
-            xa = {int(r["time"]) - int(off): float(r["close"])
-                  for r in (rates if rates is not None else ())}
+            kr, xa = self.history_closes(since, now)
             # the engine's spread: venue − HEDGE_RATIO × MT5
             merged = [(ts, kr[ts] - HEDGE_RATIO * xa[ts]) for ts in sorted(kr) if ts in xa]
             for ts, close in merged[-self._bars.maxlen:]:

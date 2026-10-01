@@ -73,6 +73,9 @@ class GatewayConnector(CCXTClient):
     GATEWAY_CLASS = HlGatewayClient
     DEFAULT_GATEWAY_PORT = 0
     TOKEN_NAME = ""
+    #: the networks the gateway may be on (the hello names one, the gateway
+    #: refuses a mismatch); IBKR's are live / paper
+    NETWORKS: tuple = ("mainnet", "testnet")
     #: the credential-bearing options a bot's settings may carry and this
     #: process must drop (they belong to the gateway)
     PRIVATE_OPTIONS = ("vaultAddress", "subAccountAddress", "accountIndex",
@@ -96,8 +99,9 @@ class GatewayConnector(CCXTClient):
         kwargs.pop("password", None)
         kwargs.update(api_key="", api_secret="", options=opts or None)
         super().__init__(*args, **kwargs)
-        if network not in ("mainnet", "testnet"):
-            raise ValueError(f"VENUE_CLIENT_OPTIONS network {network!r}: mainnet or testnet")
+        if network not in self.NETWORKS:
+            raise ValueError(f"VENUE_CLIENT_OPTIONS network {network!r}: one of "
+                             f"{' / '.join(self.NETWORKS)}")
         self.network = network
         self.account = account
         self.symbol = symbol
@@ -225,6 +229,24 @@ class GatewayConnector(CCXTClient):
     def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> bool:
         self.gateway.cancel(order_id)
         return True
+
+    def set_leverage(self, leverage: int, margin_mode: str = "isolated") -> dict:
+        """The symbol's leverage and margin mode, through the gateway. Raises
+        NotImplementedError where the gateway has no such operation."""
+        fn = getattr(self.gateway, "set_leverage", None)
+        if fn is None:
+            raise NotImplementedError(f"{self.name}: leverage is not set through "
+                                      f"this gateway")
+        return fn(int(leverage), margin_mode)
+
+    def set_leverage(self, leverage: int, margin_mode: str = "isolated") -> dict:
+        """The symbol's leverage and margin mode, through the gateway. Raises
+        NotImplementedError where the gateway has no such operation."""
+        fn = getattr(self.gateway, "set_leverage", None)
+        if fn is None:
+            raise NotImplementedError(f"{self.name}: leverage is not set through "
+                                      f"this gateway")
+        return fn(int(leverage), margin_mode)
 
     def cancel_all_orders(self) -> int:
         """Every order THIS strategy has resting — never another's."""

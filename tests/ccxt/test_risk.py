@@ -219,6 +219,12 @@ class LiqDistanceTest(unittest.TestCase):
         self.assertIsNone(liq_distance_pct(0.0, 4400.0, 3960.0))
         self.assertIsNone(liq_distance_pct(1.0, None, 3960.0))
         self.assertIsNone(liq_distance_pct(1.0, 4400.0, None))
+        # entry-based: the share of the entry -> liquidation cushion left
+        # (entry 10 from liquidation, mark 2 from it = 20%)
+        self.assertAlmostEqual(liq_distance_pct(1.0, 92.0, 90.0, entry=100.0), 20.0)
+        self.assertAlmostEqual(liq_distance_pct(-1.0, 108.0, 110.0, entry=100.0), 20.0)
+        self.assertAlmostEqual(liq_distance_pct(1.0, 105.0, 90.0, entry=100.0), 150.0)
+        self.assertIsNone(liq_distance_pct(1.0, 92.0, 90.0, entry=90.0))   # no cushion
 
 
 class DeriskTest(unittest.TestCase):

@@ -20,6 +20,18 @@ from .gateway import DEFAULT_PORT
 
 
 class HlGatewayClient(GatewayClient):
+    def set_leverage(self, leverage: int, margin_mode: str) -> dict:
+        """This client's symbol's leverage and margin mode (P.SET_LEVERAGE)."""
+        return self.request(lambda r: {"op": P.SET_LEVERAGE, "id": r,
+                                       "leverage": int(leverage),
+                                       "margin_mode": margin_mode})
+
+    def set_leverage(self, leverage: int, margin_mode: str) -> dict:
+        """This client's symbol's leverage and margin mode (P.SET_LEVERAGE)."""
+        return self.request(lambda r: {"op": P.SET_LEVERAGE, "id": r,
+                                       "leverage": int(leverage),
+                                       "margin_mode": margin_mode})
+
     """One bot's lease on the Hyperliquid gateway (and on the Lighter and
     CCXT gateways, which speak the same wire): the hello names the ACCOUNT."""
 

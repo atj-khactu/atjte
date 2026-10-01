@@ -14,6 +14,7 @@ the gateway, and sends every order op to it.
 | `fix` | `gateways/fix` | Kraken spot / Kraken Futures orders over FIX 4.4 (+ a CCXT side for reads, prices, fills) | SenderCompID |
 | `hyperliquid` | `gateways/hyperliquid` | Hyperliquid | machine |
 | `lighter` | `gateways/lighter` | Lighter | machine |
+| `ibkr` | `gateways/ibkr` | Interactive Brokers futures through TWS / IB Gateway (the login stays in TWS) | TWS login (API client id) |
 | `mt5` | `gateways/mt5` | one MetaTrader 5 terminal | terminal |
 
 What every gateway owns, and why none of it can live in a bot:
@@ -23,13 +24,14 @@ What every gateway owns, and why none of it can live in a bot:
   bots colliding all day and never colliding.
 - **the orders, by owner**: a bot can amend and cancel only its own orders. A
   restarted gateway re-adopts what it placed (FIX: ClOrdIDs; Hyperliquid /
-  Lighter: the client id carries the owner; CCXT: `owners.json`) and never
-  touches anything else.
+  Lighter: the client id carries the owner; IBKR: the order reference; CCXT:
+  `owners.json`) and never touches anything else.
 - **a dead man's switch per bot**: a bot that stops pinging, or whose
   connection closes, has its orders cancelled by the gateway's reaper. The
   venues' own switches are account-wide, so they are useless with several
   bots on one account. Where a venue has one, the gateway keeps it armed per
-  ACCOUNT as the backstop for the gateway itself dying.
+  ACCOUNT as the backstop for the gateway itself dying. Interactive Brokers
+  has none: an IBKR gateway that dies leaves its orders resting in TWS.
 - **the budgets and the reads**: one message budget for everyone, and a short
   per-account read cache that every order op on that account invalidates.
 
@@ -43,6 +45,9 @@ refusal.
     gateway.json       what it connects to, its accounts, its listen port
     gateway.env        its keys and the loopback token — read from this file only
     gateway_state.json the heartbeat the control panel reads (while running)
+    account_state.json every account's balances, positions and open orders
+                       (with each order's owner), every 15 s — accounts.py;
+                       off with "publish_accounts": false
     stop.signal        dropped by the panel to stop it cleanly
     logs/
 atjte/gateways/templates/<kind>/         tracked: what --new copies
@@ -55,7 +60,7 @@ VARIABLE that holds it, never by value. This project is livestreamed.
 ## Run
 
 ```
-atjte-gateway --new NAME --venue ccxt --exchange coinbase    # or kraken / krakenfutures / hyperliquid / lighter / mt5
+atjte-gateway --new NAME --venue ccxt --exchange coinbase    # or kraken / krakenfutures / hyperliquid / lighter / ibkr / mt5
 atjte-gateway --list
 atjte-gateway NAME --check                                    # resolve everything, connect to nothing
 atjte-gateway NAME                                            # run it (Ctrl+C reaps every client first)

@@ -10,12 +10,16 @@ from atjte import venues as V
 
 
 class TestVenues(unittest.TestCase):
-    def test_the_five_exchanges(self):
-        self.assertEqual(V.FAMILIES, ("kraken", "coinbase", "binance", "hyperliquid", "lighter"))
+    def test_the_six_venues(self):
+        self.assertEqual(V.FAMILIES, ("kraken", "coinbase", "binance", "hyperliquid", "lighter",
+                                      "ibkr"))
         self.assertEqual({v.family for v in V.SUPPORTED.values()}, set(V.FAMILIES))
         for v in V.SUPPORTED.values():
-            self.assertIn(v.kind, ("spot", "perp", "both"))
+            self.assertIn(v.kind, ("spot", "perp", "future", "both"))
             self.assertEqual(v.id, V.normalise(v.id))
+        # the one that is not a CCXT exchange is named as such
+        self.assertEqual(V.NON_CCXT, ("ibkr",))
+        self.assertEqual(V.venue("ibkr").kind, "future")
 
     def test_lookup_and_normalisation(self):
         self.assertTrue(V.is_supported("kraken_futures"))
@@ -36,11 +40,25 @@ class TestVenues(unittest.TestCase):
         self.assertNotIn("kraken", V.ids(kind="perp"))
         self.assertNotIn("lighter", V.ids(kind="spot"))
         self.assertEqual(V.ids()[0], "kraken")
+        # a dated future is traded as a perpetual: it counts as one
+        self.assertIn("ibkr", V.ids(kind="perp"))
+        self.assertNotIn("ibkr", V.ids(kind="spot"))
 
     def test_every_supported_id_is_a_ccxt_exchange(self):
+        """... except the ones the registry itself names as not being one
+        (their gateway builds CCXT-shaped markets)."""
         import ccxt
         for cid in V.ids():
+            if cid in V.NON_CCXT:
+                self.assertNotIn(cid, ccxt.exchanges, cid)
+                continue
             self.assertIn(cid, ccxt.exchanges, cid)
+
+    def test_a_non_ccxt_venue_goes_through_its_own_gateway(self):
+        self.assertEqual(V.gateway_kinds("ibkr"), ("ibkr",))
+        self.assertEqual(V.gateway_connector("ibkr"), "atjte.clients.gateway.IbkrGatewayClient")
+        with self.assertRaises(ValueError):
+            V.gateway_connector("ibkr", fix=True)
 
     def test_the_connectors_refuse_other_exchanges(self):
         from atjte.clients.ccxt_client import CCXTClient
@@ -99,6 +117,9 @@ class TransportTest(unittest.TestCase):
         import ccxt.pro as cp
         for vid in V.ids():
             v = V.venue(vid)
+            if vid in V.NON_CCXT:
+                self.assertFalse(v.ws_orders or v.ws_amend or v.fix, vid)
+                continue
             has = getattr(cp, vid)({"enableRateLimit": False}).has
             self.assertEqual(v.ws_orders,
                              bool(has.get("createOrderWs") and has.get("cancelOrderWs")),

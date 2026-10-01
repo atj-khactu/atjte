@@ -31,6 +31,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from atjte.gateways.common import replace_retrying
 from atjte.gateways.hyperliquid.gateway import (  # noqa: F401  (re-exported)
     GatewayRefusal, HlGateway, Upstream, _Owned,
 )
@@ -128,7 +129,7 @@ class LighterGateway(HlGateway):
             tmp = self._markets_file.with_name(self._markets_file.name + ".tmp")
             tmp.write_text(json.dumps({"markets": sorted(self._markets)}, indent=1),
                            encoding="utf-8")
-            os.replace(tmp, self._markets_file)
+            replace_retrying(tmp, self._markets_file)  # Windows: a reader may hold it
         except OSError as e:
             self._log(f"{self.LABEL}: markets file not saved ({e})")
 
@@ -143,6 +144,11 @@ class LighterGateway(HlGateway):
         info = o.get("info") or {}
         tif = str(info.get("time_in_force") or "") if isinstance(info, dict) else ""
         return bool(o.get("postOnly")) or tif == "post-only"
+
+    def _known_symbols(self, account: str) -> set:
+        """Lighter lists open orders per market only: every market this
+        gateway has served on the account is looked at, not just today's."""
+        return super()._known_symbols(account) | {s for a, s in self._markets if a == account}
 
     def _busy_accounts(self) -> set:
         """Armed while a bot is ATTACHED, not only while an order rests: the

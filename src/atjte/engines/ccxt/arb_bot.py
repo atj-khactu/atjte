@@ -15,6 +15,8 @@ next to its own ``strategy_settings.py``:
   direction, one direction held at a time
 - ``strategies/bollinger_bot`` — Bollinger-band quoting of the spread
 - ``strategies/grid_bot`` — static two-sided inventory grid of the spread
+- ``strategies/grid_futures_bot`` — the grid with its center on a dated
+  future's fair basis (carry x days to expiry), re-set once a day
 
 Import contract: the strategy entry point puts ITS folder first on
 ``sys.path`` and then imports this module, which reads ``strategy_settings``
@@ -114,7 +116,7 @@ inherits them):
   position carried across midnight books its whole PnL on the day it is
   closed. The volumes are traded notional per venue. A breach latches
   CLOSE-ONLY — exits keep quoting, no new entry — for the rest of the day
-  (local midnight, or UTC with ``RISK_DAY_UTC``); the day's book is
+  (midnight in the ACP timezone, ``atjte.clock``); the day's book is
   persisted with the position state, so a restart resumes the same day
   rather than starting the count again.
 - **Trading blackouts** (``atjte.engines.common.blackout``) — quoting is suspended
@@ -231,11 +233,14 @@ from atjte.clients.base import (OrderSide, OrderStatus, OrderType,  # noqa: E402
                                 PositionSide, Trade)
 from atjte.instance_lock import InstanceLock as _InstanceLock  # noqa: E402
 from atjte import reporting as _reporting                              # noqa: E402
+from atjte import clock as _clock                                      # noqa: E402
+from atjte import events as _events                                    # noqa: E402
+from atjte import workspace as _ws                                     # noqa: E402
 
 from ..common.grid_model import DesiredOrder, one_per_side, round_to_step  # noqa: E402
 from . import base_settings as _base                                   # noqa: E402
 from .risk import (                                                    # noqa: E402
-    DayBook, Ledger, combined_unrealized, daily_limit_reasons, day_key,
+    DayBook, Ledger, combined_unrealized, daily_limit_reasons,
     derisk_reasons, funding_settled, liq_distance_pct,
 )
 from ..common import blackout as _blackout                             # noqa: E402
@@ -401,38 +406,203 @@ MT5_HEALTH_RETRY_S = float(_cfg("MT5_HEALTH_RETRY_S") or 1.0)
 MT5_RECONNECT_S = 10.0          # a lost terminal channel is re-opened this often
 BASIS_TRIGGER = _cfg("BASIS_TRIGGER")
 BASIS_WINDOW_S = _cfg("BASIS_WINDOW_S")
-BASIS_RELEASE_USD = _cfg("BASIS_RELEASE_USD")
+BASIS_RELEASE = _cfg("BASIS_RELEASE")
 OPTIMIZE_LIMIT_OFFSET = _cfg("OPTIMIZE_LIMIT_OFFSET")
+OPTIMIZE_LIMIT_TAKER = bool(_cfg("OPTIMIZE_LIMIT_TAKER"))
 BALANCE_REFRESH_S = _cfg("BALANCE_REFRESH_S")
 REPORT_SNAPSHOT_S = float(_cfg("REPORT_SNAPSHOT_S"))
 REPORT_DEALS_S = float(_cfg("REPORT_DEALS_S"))
+#: how far back the report's 1 m bars are filled from the gateways' history
+#: at startup — the control panel's chart window
+REPORT_HISTORY_S = 24 * 3600.0
+#: candles per venue request, and the most requests one history read makes
+HISTORY_PAGE = 720
+HISTORY_PAGES = 4
+#: the broker server's usual UTC offset, when no advancing tick can tell it
+DEFAULT_SRV_OFFSET_S = 3 * 3600.0
+#: how often a venue's funding PAYMENT history is read (a venue that pays
+#: funding as cash with no accrual on the position: Hyperliquid, hourly), the
+#: overlap each read re-covers, and how far back the first read of a run goes
+FUNDING_POLL_S = 300.0
+FUNDING_OVERLAP_S = 3 * 3600.0
+FUNDING_FIRST_LOOKBACK_S = 36 * 3600.0
 MIN_MARGIN_LEVEL_MT5 = _cfg("MIN_MARGIN_LEVEL_MT5")
 MIN_MT5_FREE_MARGIN_OPEN = _cfg("MIN_MT5_FREE_MARGIN_OPEN")
 MIN_VENUE_AVAILABLE_MARGIN_USD = _cfg("MIN_VENUE_AVAILABLE_MARGIN_USD")
 PLACE_MARGIN_SAFETY = float(_cfg("PLACE_MARGIN_SAFETY"))
 CLOSE_ONLY = _cfg("CLOSE_ONLY")
 RISK_DAY_UTC = bool(_cfg("RISK_DAY_UTC"))
+
+
+#: the price-gap settings SPREAD_UNIT = "bps" converts (basis points of the
+#: quoting price -> the pair's price points)
+BPS_NAMES = ("GRID_STEP", "GRID_CENTER", "GRID_TAKE_PROFIT", "BUY_SPREAD", "SELL_SPREAD",
+             "LONG_ENTRY_SPREAD", "SHORT_ENTRY_SPREAD", "LONG_EXIT_SPREAD",
+             "SHORT_EXIT_SPREAD", "BASIS_RELEASE", "BUY_MAX_SPREAD", "SELL_MIN_SPREAD",
+             "ORACLE_BASIS_MAX", "OPTIMIZE_LIMIT_OFFSET", "REQUOTE_MIN_MOVE")
+# "bps" converts; anything else ("abs", the default; "points") is as written
+SPREAD_UNIT = str(_cfg("SPREAD_UNIT") or "abs").strip().lower()
+BPS_REANCHOR_WAIT_S = float(_cfg("BPS_REANCHOR_WAIT_H") or 6.0) * 3600.0
+BPS_REANCHOR_DRIFT_PCT = _cfg("BPS_REANCHOR_DRIFT_PCT")
+
+
+def _bps_value(name):
+    try:
+        return _cfg(name)
+    except RuntimeError:
+        return None
+
+
+#: the bps values as written (before any conversion), for every re-anchor
+BPS_ORIG = ({n: _bps_value(n) for n in BPS_NAMES} if SPREAD_UNIT == "bps" else {})
+
+
+def _bps_modules():
+    """Every loaded module that reads the price-gap settings as constants:
+    this engine, the strategy settings and the strategy types."""
+    out = [sys.modules[__name__], _settings]
+    for name, mod in list(sys.modules.items()):
+        if mod is not None and name.startswith("atjte.strategy_types"):
+            out.append(mod)
+    out += [m for m in list(sys.modules.values())
+            if m is not None and getattr(m, "__file__", None)
+            and str(getattr(m, "__file__", "")).startswith(str(STRATEGY_DIR))
+            and m not in out]
+    return out
+
+
+def bps_to_points(bps: float, ref: float) -> float:
+    """``bps`` basis points of ``ref`` in price points (10 significant
+    decimals: a tick-exact grid comes from the strategy's own rounding)."""
+    return round(float(bps) * float(ref) / 10_000.0, 10)
+
+
+def apply_bps(ref: float) -> dict:
+    """Convert every BPS_ORIG setting to points at ``ref`` and set it where it
+    is read (:func:`_bps_modules`); the grid's derived take-profit follows.
+    Returns ``{name: points}``."""
+    out = {}
+    for name, v in BPS_ORIG.items():
+        if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        out[name] = bps_to_points(v, ref)
+    for mod in _bps_modules():
+        for name, pts in out.items():
+            if hasattr(mod, name):
+                setattr(mod, name, pts)
+        if hasattr(mod, "TAKE_PROFIT_EFFECTIVE") and hasattr(mod, "GRID_STEP"):
+            tp = getattr(mod, "GRID_TAKE_PROFIT", None)
+            mod.TAKE_PROFIT_EFFECTIVE = mod.GRID_STEP if tp is None else tp
+    return out
+
+
+def _risk_zone():
+    """The risk day's timezone: the ACP timezone (the workspace's, set on the
+    panel's Settings page — :mod:`atjte.clock`), read once at start; with none
+    set, UTC under the legacy ``RISK_DAY_UTC``, else the machine's local day
+    (``None``)."""
+    try:
+        name = _clock.zone_name(_ws.current(STRATEGY_DIR))
+    except Exception:
+        name = ""
+    if name:
+        return name, _clock.zone(_ws.current(STRATEGY_DIR))
+    if RISK_DAY_UTC:
+        return "UTC", timezone.utc
+    return "", None
+
+
+RISK_TZ_NAME, RISK_TZ = _risk_zone()
+RISK_TZ_LABEL = RISK_TZ_NAME or "machine local"
+
+
+def _day(ts=None) -> str:
+    """``YYYY-MM-DD`` of the risk day *ts* (now by default) falls in."""
+    return _clock.day_key(ts, tz=RISK_TZ)
 MAX_DAILY_LOSS_USD = _cfg("MAX_DAILY_LOSS_USD")
+MAX_DAILY_VOLUME_USD = _cfg("MAX_DAILY_VOLUME_USD")
 MAX_DAILY_VENUE_VOLUME_USD = _cfg("MAX_DAILY_VENUE_VOLUME_USD")
 MAX_DAILY_MT5_VOLUME_USD = _cfg("MAX_DAILY_MT5_VOLUME_USD")
+# the one cap for both exchanges; a per-exchange cap, where set, overrides it
+if MAX_DAILY_VENUE_VOLUME_USD is None:
+    MAX_DAILY_VENUE_VOLUME_USD = MAX_DAILY_VOLUME_USD
+if MAX_DAILY_MT5_VOLUME_USD is None:
+    MAX_DAILY_MT5_VOLUME_USD = MAX_DAILY_VOLUME_USD
 DERISK_VENUE_AVAILABLE_MARGIN_USD = _cfg("DERISK_VENUE_AVAILABLE_MARGIN_USD")
 DERISK_VENUE_LIQ_DISTANCE_PCT = _cfg("DERISK_VENUE_LIQ_DISTANCE_PCT")
 DERISK_MT5_MARGIN_LEVEL = _cfg("DERISK_MT5_MARGIN_LEVEL")
 DERISK_MT5_FREE_MARGIN = _cfg("DERISK_MT5_FREE_MARGIN")
+# the liquidation distance: "entry" = % of the entry -> liquidation cushion
+# left, "mark" = % of the mark (base_settings)
+LIQ_DISTANCE_BASE = "mark" if str(_cfg("LIQ_DISTANCE_BASE") or "entry").strip().lower()     == "mark" else "entry"
+# "pct": the daily loss and the margin floors are percentages (base_settings)
+RISK_UNIT = str(_cfg("RISK_UNIT") or "abs").strip().lower()
+RISK_PCT = RISK_UNIT in ("pct", "%", "percent")
+
+
+def pct_limit(value, base) -> Optional[float]:
+    """A limit as the gates compare it: ``value`` as written (RISK_UNIT abs),
+    or ``value`` % of ``base`` (pct). None / non-positive = off; a pct limit
+    whose base is unknown is off for now (a failed read already holds
+    entries through the margin gate)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0:
+        return None
+    if not RISK_PCT:
+        return v
+    if base is None:
+        return None
+    return v / 100.0 * float(base)
 SESSION_REOPEN_BLACKOUT_MIN = _cfg("SESSION_REOPEN_BLACKOUT_MIN")
 BLACKOUT_TZ = _cfg("BLACKOUT_TZ")
 BLACKOUT_BEFORE_MIN = _cfg("BLACKOUT_BEFORE_MIN")
 BLACKOUT_AFTER_MIN = _cfg("BLACKOUT_AFTER_MIN")
 DAILY_BLACKOUTS = _cfg("DAILY_BLACKOUTS")
 MACRO_EVENTS = _cfg("MACRO_EVENTS")
+HOLIDAYS = _cfg("HOLIDAYS")
 # Parsed HERE, at import: a mis-typed schedule or an unknown timezone must
 # stop the bot at startup, not turn into a window that never fires.
-BLACKOUT_ZONE = _blackout.parse_tz(BLACKOUT_TZ)
+# No BLACKOUT_TZ of its own = the ACP timezone (read once, at start), and
+# with none set the machine's local time (zone None: naive local datetimes,
+# DST followed by the OS)
+if not (isinstance(BLACKOUT_TZ, str) and BLACKOUT_TZ.strip()):
+    try:
+        BLACKOUT_TZ = _clock.zone_name(_ws.current(STRATEGY_DIR)) or None
+    except Exception:
+        BLACKOUT_TZ = None
+BLACKOUT_ZONE = _blackout.parse_tz(BLACKOUT_TZ) if BLACKOUT_TZ else None
+if not BLACKOUT_TZ:
+    BLACKOUT_TZ = "machine local"
 DAILY_SPECS = _blackout.parse_daily(DAILY_BLACKOUTS, BLACKOUT_BEFORE_MIN,
                                     BLACKOUT_AFTER_MIN)
 EVENT_SPECS = _blackout.parse_events(MACRO_EVENTS, BLACKOUT_BEFORE_MIN,
                                      BLACKOUT_AFTER_MIN, BLACKOUT_ZONE)
 REOPEN_BLACKOUT_S = max(0.0, float(SESSION_REOPEN_BLACKOUT_MIN or 0.0)) * 60.0
+# the trading sessions (Mon..Sun) and the market holidays, same zone
+SESSIONS = _blackout.parse_sessions([_cfg(n) for n in _blackout.SESSION_NAMES])
+HOLIDAY_SPECS = _blackout.parse_holidays(HOLIDAYS, BLACKOUT_ZONE)
+# the shared events calendar, for this strategy's markets (read once, at start)
+BREAK_MARKETS = (_events.split_markets(_cfg("BREAK_MARKETS"))
+                 if _cfg("BREAK_MARKETS") else _events.default_markets(SYMBOL_MT5))
+BREAK_ASSET_CLASS = (str(_cfg("BREAK_ASSET_CLASS")) if _cfg("BREAK_ASSET_CLASS")
+                     else _events.default_asset_class(SYMBOL_MT5))
+try:
+    CALENDAR = _events.events_for(BREAK_MARKETS, _ws.current(STRATEGY_DIR),
+                                  default_tz=_clock.zone_name(_ws.current(STRATEGY_DIR))
+                                  or "UTC", asset_class=BREAK_ASSET_CLASS)
+except Exception:
+    CALENDAR = []
+HOLIDAY_SPECS = sorted(HOLIDAY_SPECS + [_blackout.HolidaySpec(e.start, e.end, e.label)
+                                        for e in CALENDAR], key=lambda h: h.start)
+# the major market opens, when they are breaks (each in its exchange's clock)
+_OPEN_MIN = _cfg("MARKET_OPEN_BREAK_MIN")
+OPEN_SPECS = (_blackout.market_open_specs(_OPEN_MIN, _OPEN_MIN)
+              if bool(_cfg("MARKET_OPEN_BREAKS")) else [])
 MAX_CONSECUTIVE_ERRORS = _cfg("MAX_CONSECUTIVE_ERRORS")
 ERROR_BACKOFF_S = _cfg("ERROR_BACKOFF_S")
 POSITION_RECONCILE_INTERVAL_S = _cfg("POSITION_RECONCILE_INTERVAL_S")
@@ -441,6 +611,71 @@ POSITION_RECONCILE_TOLERANCE_UNITS = _cfg("POSITION_RECONCILE_TOLERANCE_UNITS")
 BUY_MAX_SPREAD = _cfg("BUY_MAX_SPREAD")
 SELL_MIN_SPREAD = _cfg("SELL_MIN_SPREAD")
 FUNDING_RATE_MAX_ABS = _cfg("FUNDING_RATE_MAX_ABS")
+ORACLE_BASIS_FILTER = _cfg("ORACLE_BASIS_FILTER")
+ORACLE_BASIS_MAX = _cfg("ORACLE_BASIS_MAX")
+LEVERAGE = _cfg("LEVERAGE")
+MARGIN_MODE = str(_cfg("MARGIN_MODE") or "isolated").lower()
+DYNAMIC_ALLOCATION = bool(_cfg("DYNAMIC_ALLOCATION"))
+ALLOCATION_PCT = _cfg("ALLOCATION_PCT")
+
+
+def _dyn_alloc_on() -> bool:
+    """The dynamic caps are in force: switched on AND an allocation % set
+    (the switch keeps a % on file without it applying)."""
+    return bool(DYNAMIC_ALLOCATION) and ALLOCATION_PCT is not None
+
+
+#: the fixed caps names, both spellings
+FIXED_CAP_NAMES = ("MAX_POSITION_UNITS", "MAX_SHORT_UNITS", "MAX_POSITION_OZ", "MAX_SHORT_OZ")
+
+
+def _type_name() -> str:
+    try:
+        from atjte.runtime import strategy_type_of
+        return strategy_type_of(STRATEGY_DIR)
+    except Exception:
+        return STRATEGY_DIR.name
+
+
+# With dynamic allocation in force the dynamic caps REPLACE the fixed ones
+# (the panel greys the fixed ones out): they are cleared on the strategy's
+# settings module HERE, before its type reads them — every type imports this
+# engine first. Bollinger is the exception: its ladder is sized off the fixed
+# caps (fractions of them), so there they stay, the dynamic cap on top.
+FIXED_CAPS_KEPT = "bollinger" in _type_name()
+FIXED_CAPS_DROPPED = _dyn_alloc_on() and not FIXED_CAPS_KEPT
+if FIXED_CAPS_DROPPED:
+    for _cap in FIXED_CAP_NAMES:
+        if hasattr(_settings, _cap):
+            setattr(_settings, _cap, None)
+
+
+#: the fixed caps names, both spellings
+FIXED_CAP_NAMES = ("MAX_POSITION_UNITS", "MAX_SHORT_UNITS", "MAX_POSITION_OZ", "MAX_SHORT_OZ")
+
+
+def _type_name() -> str:
+    try:
+        from atjte.runtime import strategy_type_of
+        return strategy_type_of(STRATEGY_DIR)
+    except Exception:
+        return STRATEGY_DIR.name
+
+
+# With dynamic allocation in force the dynamic caps REPLACE the fixed ones
+# (the panel greys the fixed ones out): they are cleared on the strategy's
+# settings module HERE, before its type reads them — every type imports this
+# engine first. Bollinger is the exception: its ladder is sized off the fixed
+# caps (fractions of them), so there they stay, the dynamic cap on top.
+FIXED_CAPS_KEPT = "bollinger" in _type_name()
+FIXED_CAPS_DROPPED = _dyn_alloc_on() and not FIXED_CAPS_KEPT
+if FIXED_CAPS_DROPPED:
+    for _cap in FIXED_CAP_NAMES:
+        if hasattr(_settings, _cap):
+            setattr(_settings, _cap, None)
+ALLOCATION_REFRESH_S = float(_cfg("ALLOCATION_REFRESH_S") or 60.0)
+#: how often the MT5 symbol's swap terms are re-read (brokers revise them)
+SWAP_REFRESH_S = 900.0
 
 POS_EPS = 1e-6                      # units below which an amount counts as zero
 RISK_FLAT_KEY = "risk-flatten"      # the de-risk exit order's stable key (see
@@ -585,6 +820,41 @@ def _price_nd(*prices) -> int:
     return 5 if ref > 0 else 2
 
 
+#: how many broker min lots a hedge gate (HEDGE_THRESHOLD_UNITS,
+#: RECONCILE_TOLERANCE_UNITS) may be worth before the bot refuses to start
+HEDGE_GATE_MAX_LOTS = 2.0
+
+
+def hedge_gate_verdict(name: str, value: float, min_lot_units: float,
+                       unit_value: Optional[float] = None, unit_label: str = "units",
+                       quote_ccy: str = "") -> Optional[str]:
+    """The refusal message when a hedge gate is worth more than
+    HEDGE_GATE_MAX_LOTS broker min lots, else None.
+
+    Both gates are in VENUE units, and their default (1 unit) is gold-sized:
+    1 oz there is one XAUUSD min lot. On a market where one venue unit is
+    worth many lots it silently leaves that much unhedged — measured
+    2026-09-28 on xyz:JP225: 1 unit = one index contract (~$65k), one JP225
+    lot hedges 0.00635 units, so a 1-unit gate was 157 lots and a +0.0184
+    fill (~$1.2k) was never hedged: the fill hedger logged "under one lot",
+    the reconciler "drift cleared". ``unit_value`` (venue-currency value of
+    one unit) only makes the message concrete; the verdict never needs it."""
+    try:
+        v, lot = float(value), float(min_lot_units)
+    except (TypeError, ValueError):
+        return None
+    if not (lot > 0) or not (v > HEDGE_GATE_MAX_LOTS * lot):
+        return None
+    lots = v / lot
+    worth = (f" (~{v * unit_value:,.0f} {quote_ccy or 'in venue currency'})"
+             if unit_value else "")
+    suggest = 0.8 * lot
+    return (f"{name} = {value:g} {unit_label} is worth {lots:,.0f} broker min lots"
+            f"{worth}: exposure up to that size would never be hedged. One min lot "
+            f"hedges {lot:.6g} {unit_label} here — set {name} just under it "
+            f"(e.g. {suggest:.3g}) in the project's project_settings.py")
+
+
 def _classify_order_error(exc: Exception) -> str:
     """Classify a venue order-op failure: ``'gone'`` |
     ``'post_only'`` | ``'other'``.
@@ -674,10 +944,16 @@ class ArbBot:
     @property
     def hedge_comment(self) -> str:
         """What the hedge writes in the MT5 order's comment field:
-        ``MT5_COMMENT`` where the strategy sets one, else ``hedge <key>``.
-        Truncated to what MT5 accepts — a longer string is rejected by some
-        brokers rather than shortened."""
-        return (MT5_COMMENT or f"hedge {self.STRATEGY_KEY}")[:MT5_COMMENT_MAX]
+        ``MT5_COMMENT`` where the strategy sets one, else ``hedge <market>
+        <key>`` — the venue symbol's base (``XYZ-EUR``, ``XAUT``) and the
+        strategy type, so the terminal tells two projects' hedges apart:
+        before, every grid wrote ``hedge grid`` (2026-09-28: xyz:EUR, xyz:JPY
+        and xyz:JP225 on one terminal). Truncated to what MT5 accepts — a
+        longer string is rejected by some brokers rather than shortened.
+        The magic, not this, is how the bot knows its own book."""
+        market = str(SYMBOL_VENUE or "").split("/", 1)[0].strip()
+        default = f"hedge {market} {self.STRATEGY_KEY}" if market else f"hedge {self.STRATEGY_KEY}"
+        return (MT5_COMMENT or default)[:MT5_COMMENT_MAX]
     # 1 s spread history the engine keeps and persists (s). A strategy that
     # computes on the samples (the Bollinger bands) overrides this to cover
     # its own window + grace.
@@ -758,6 +1034,13 @@ class ArbBot:
         # perp extras from the ticker feed
         self.mark_px: Optional[float] = None
         self.index_px: Optional[float] = None
+        self.oracle_px: Optional[float] = None           # the venue's oracle price
+        # (t, oracle basis) samples over BASIS_WINDOW_S (the oracle filter)
+        self._oracle_samples: "deque[tuple[float, float]]" = deque()
+        # the dynamic cap (ALLOCATION_PCT): base units per side, None = not yet
+        self.dyn_cap_units: Optional[float] = None
+        self._dyn_cap_t = 0.0
+        self.dyn_cap_detail: dict = {}
         self.funding_rate: Optional[float] = None        # relative, per funding period
         self.funding_rate_pred: Optional[float] = None
         self.next_funding_ms: Optional[int] = None
@@ -786,6 +1069,11 @@ class ArbBot:
         # pass, time-evicted; the averages gate order submission and
         # _basis_armed keeps per-order hysteresis state across passes
         self._basis_samples: deque[tuple[float, float, float]] = deque()
+        # the window is also fed by the basis filler thread while the loop is
+        # stuck in a blocking venue call (_basis_fill_once): one lock for both
+        self._basis_lock = threading.Lock()
+        self._basis_loop_t = 0.0       # the loop's last basis sample
+        self._basis_filler_stop = threading.Event()
         self._basis_armed: dict[str, bool] = {}
         self.basis_avg_bid: Optional[float] = None
         self.basis_avg_ask: Optional[float] = None
@@ -903,6 +1191,9 @@ class ArbBot:
         # the first live MT5 tick (deal / ticket timestamps are server time)
         self.reporter: Optional[_reporting.Reporter] = None
         self._srv_offset_s: Optional[float] = None
+        self._history_backfilled = False
+        self._funding_poll_t = 0.0
+        self._funding_since: Optional[float] = None
         self._report_deals_t = 0.0
         self._report_deals_dirty = True
         self._last_msgs: dict[str, str] = {}
@@ -961,8 +1252,12 @@ class ArbBot:
         if OPTIMIZE_LIMIT_OFFSET is not None:
             _log(f"limit optimisation: an order (entry or exit) the {BASIS_WINDOW_S:g} s "
                  f"basis average is already through is priced "
-                 f"{float(OPTIMIZE_LIMIT_OFFSET):g} USD inside the average instead "
-                 f"of at its level (never past the level)")
+                 f"{float(OPTIMIZE_LIMIT_OFFSET):g} "
+                 f"{'bp' if SPREAD_UNIT == 'bps' else 'USD'} inside the average instead "
+                 f"of at its level (never past the level)"
+                 + ("" if OPTIMIZE_LIMIT_TAKER or not (ALLOW_TAKER_ENTRY or ALLOW_TAKER_EXIT)
+                    else " — MAKER orders only: a taker order is priced at its level "
+                         "(OPTIMIZE_LIMIT_TAKER = False)"))
         _log(f"{EXCHANGE_ID}: through its gateway ({VENUE_CLIENT.rsplit('.', 1)[-1]}"
              f"{', account ' + str(VENUE_CLIENT_OPTIONS['account']) if VENUE_CLIENT_OPTIONS.get('account') else ''}"
              f") — no venue key and no venue connection in this process")
@@ -1027,6 +1322,7 @@ class ArbBot:
         # atjte.engines.ccxt.venue
         self.venue.connect()
         self.mt5.connect()
+        self._apply_leverage()      # LEVERAGE / MARGIN_MODE, once, never fatal
         # the terminal must be able to take a hedge BEFORE anything can fill:
         # Algo Trading off (say) would otherwise surface as a refused hedge on
         # the first fill, with the venue position already open
@@ -1057,6 +1353,9 @@ class ArbBot:
 
         specs = self.mt5.get_symbol_specs(SYMBOL_MT5)
         self._setup_fx(specs)
+        # the hedge's overnight swap terms, for the report (the panel shows
+        # them annualized beside the perp's funding)
+        self.mt5_swap = _reporting.swap_terms(specs.get("raw") or {})
         # every size in the engine is in VENUE units; one MT5 lot hedges
         # contract / (k x fx) of them (k = HEDGE_RATIO MT5 units per venue
         # unit, fx = MT5 currency per venue currency: 1 on same-currency legs)
@@ -1064,6 +1363,10 @@ class ArbBot:
         self.contract_size = self._broker_contract / (HEDGE_RATIO * self.fx_rate)
         self.volume_min = specs["volume_min"]
         self.volume_step = specs["volume_step"]
+        self._resolve_hedge_threshold()      # before the hedger starts
+        # a hedge gate worth many MT5 lots leaves that much unhedged, with no
+        # error anywhere: refuse it before the hedger thread starts
+        self._check_hedge_thresholds(self.volume_min * self.contract_size)
         _log(self.venue.market_line() + f" | {SYMBOL_MT5}: "
              + (f"contract={self.contract_size:g} {UNIT_LABEL}/lot, "
                 if HEDGE_RATIO == 1.0 and self.fx_rate == 1.0 else
@@ -1252,7 +1555,8 @@ class ArbBot:
         _log(f"FILL {rec.key} {rec.side} {delta:g} units @ ~{rec.price} [{source}] "
              f"-> pos {self.pos_units:+.4f} units")
         self._persist_position()
-        self._report_fill(rec, delta, source, trade)
+        if trade is None:           # a venue trade is reported by the ws handler,
+            self._report_fill(rec, delta, source)   # at its OWN size, not this delta
         if source != "ws":          # ws fills are marked per trade by the caller
             self._mark_fill(rec.side, delta, rec.price, rec.key, "", rec.order_id, source,
                             purpose=rec.purpose, level=rec.level)
@@ -1368,8 +1672,12 @@ class ArbBot:
                 # ignore silently when it's a pre-start trade (the fills
                 # snapshot replays recent fills on every ws (re)connect) or
                 # one of our own just-settled orders
-                if (tr.order_id not in self._retired and tr.timestamp is not None
-                        and tr.timestamp >= self._started_utc):
+                if tr.order_id in self._retired:
+                    # settled already (often by inference, when the cancel
+                    # found it gone): the position took it then, but the
+                    # report still needs the venue's trade itself
+                    self._report_fill(None, self.venue.to_units(tr.amount), "ws", tr)
+                elif tr.timestamp is not None and tr.timestamp >= self._started_utc:
                     self._log_once(f"untracked_{tr.order_id}",
                                    f"note: ws fill for untracked order {tr.order_id} "
                                    f"({tr.side.value} {tr.amount:g}) — ignored")
@@ -1380,6 +1688,7 @@ class ArbBot:
             # the feed reports the venue's own amount unit (contracts on a
             # contract market); every figure the engine keeps is base units
             fill_units = self.venue.to_units(tr.amount)
+            self._report_fill(rec, fill_units, "ws", tr)
             rec.ws_cum = min(rec.amount, rec.ws_cum + fill_units)
             rec.last_fill_t = time.time()
             self._book(rec, source="ws", trade=tr)
@@ -1549,6 +1858,37 @@ class ArbBot:
             seen = self._panel_seen_t = beat
         self.panel_heartbeat_age_s = now - seen
         return self.panel_heartbeat_age_s if self.panel_heartbeat_age_s > PANEL_LEASE_S else None
+
+    # -- hedge gates vs the MT5 lot -------------------------------------------
+    def _resolve_hedge_threshold(self) -> None:
+        """HEDGE_THRESHOLD_UNITS None: one MT5 min lot in venue units (the
+        lot specs are loaded) — the smallest hedge the broker takes. A value
+        in the settings is used as written."""
+        global HEDGE_THRESHOLD_UNITS
+        if HEDGE_THRESHOLD_UNITS is not None:
+            return
+        HEDGE_THRESHOLD_UNITS = round(self.volume_min * self.contract_size, 10)
+        self.hedge_threshold_from = "mt5_min_lot"
+        _log(f"hedge threshold: one {SYMBOL_MT5} min lot ({self.volume_min:g} lot) = "
+             f"{HEDGE_THRESHOLD_UNITS:g} {UNIT_LABEL} (HEDGE_THRESHOLD_UNITS None)")
+
+    def _check_hedge_thresholds(self, min_lot_units: float) -> None:
+        """Refuse to start when HEDGE_THRESHOLD_UNITS or
+        RECONCILE_TOLERANCE_UNITS is worth more than HEDGE_GATE_MAX_LOTS
+        broker min lots (see :func:`hedge_gate_verdict`)."""
+        unit_value = None
+        try:
+            t = self.mt5.get_ticker(SYMBOL_MT5)
+            if t is not None and t.bid and t.ask:
+                unit_value = HEDGE_RATIO * (t.bid + t.ask) / 2.0
+        except Exception:                                   # noqa: BLE001
+            pass                                            # the refusal stands without it
+        for name, value in (("HEDGE_THRESHOLD_UNITS", HEDGE_THRESHOLD_UNITS),
+                            ("RECONCILE_TOLERANCE_UNITS", RECONCILE_TOLERANCE_UNITS)):
+            err = hedge_gate_verdict(name, value, min_lot_units, unit_value,
+                                     UNIT_LABEL, self.venue.quote or "")
+            if err:
+                raise RuntimeError(err + " -- refusing to start")
 
     # -- quote-currency conversion (FX_CONVERSION_SYMBOL) --------------------
     def _setup_fx(self, specs: dict) -> None:
@@ -1866,8 +2206,12 @@ class ArbBot:
             if units <= 0 or px <= 0:
                 return
             self._roll_day()
-            self.day.realized_mt5_usd += self.mt5_ledger.apply(side.value, units, px)
-            self.day.mt5_volume_usd += units * px
+            # px is in the CFD's currency (JPY on USDJPY / JP225); the day's
+            # realized PnL and volume are in the venue's (USD): convert both
+            # through the hedge's FX rate (1 on a USD-quoted CFD)
+            fx = getattr(self, "fx_rate", 1.0) or 1.0
+            self.day.realized_mt5_usd += self.mt5_ledger.apply(side.value, units, px) / fx
+            self.day.mt5_volume_usd += units * px / fx
         except Exception as e:      # accounting must never break the hedge path
             self._log_once("book_hedge", f"warning: hedge not booked into the "
                                          f"risk ledger: {type(e).__name__}: {e}")
@@ -1947,6 +2291,7 @@ class ArbBot:
         self.venue_total_unrealized = self.venue.total_unrealized
         self.venue_pnl = self.venue.pnl
         self._venue_margin_t = time.time()
+        self._recompute_dyn_cap(self._venue_margin_t)
 
     def _position_units(self) -> float:
         """The SIGNED position the strategies quote around and MT5 hedges:
@@ -2031,12 +2376,17 @@ class ArbBot:
             mm = self.mt5.get_margin()
             self.mt5_margin_level = mm.level
             self.mt5_free_margin = mm.free
+            # MT5 equity = margin used + free margin (account currency)
+            self.mt5_equity_ccy = (None if mm.used is None or mm.free is None
+                                   else float(mm.used) + float(mm.free))
+            mt5_free_min = pct_limit(MIN_MT5_FREE_MARGIN_OPEN, self.mt5_equity_ccy)
             if (MIN_MARGIN_LEVEL_MT5 > 0 and mm.level is not None
                     and mm.level < MIN_MARGIN_LEVEL_MT5):
                 reasons.append(f"MT5 margin level {mm.level:.0f}% < {MIN_MARGIN_LEVEL_MT5:g}%")
-            if (MIN_MT5_FREE_MARGIN_OPEN > 0 and mm.free is not None
-                    and mm.free < MIN_MT5_FREE_MARGIN_OPEN):
-                reasons.append(f"MT5 free margin {mm.free:.0f} < {MIN_MT5_FREE_MARGIN_OPEN:g}")
+            if (mt5_free_min and mm.free is not None and mm.free < mt5_free_min):
+                reasons.append(f"MT5 free margin {mm.free:.0f} < {mt5_free_min:.0f}"
+                               + (f" ({float(MIN_MT5_FREE_MARGIN_OPEN):g}% of equity)"
+                                  if RISK_PCT else ""))
         except Exception as e:
             reasons.append(f"MT5 margin read failed ({e})")
         try:
@@ -2046,11 +2396,13 @@ class ArbBot:
         try:
             self._read_venue_margin()
             am = self.venue_available_margin
-            if (self.is_perp and MIN_VENUE_AVAILABLE_MARGIN_USD > 0
-                    and am is not None and am < MIN_VENUE_AVAILABLE_MARGIN_USD):
+            am_min = pct_limit(MIN_VENUE_AVAILABLE_MARGIN_USD,
+                               getattr(self, "venue_margin_equity", None))
+            if (self.is_perp and am_min and am is not None and am < am_min):
                 reasons.append(f"{EXCHANGE_ID} available margin {am:.0f} "
-                               f"{self.venue.quote} < "
-                               f"{MIN_VENUE_AVAILABLE_MARGIN_USD:g}")
+                               f"{self.venue.quote} < {am_min:.0f}"
+                               + (f" ({float(MIN_VENUE_AVAILABLE_MARGIN_USD):g}% of equity)"
+                                  if RISK_PCT else ""))
             # spot, cash mode: the free quote balance is the margin
             fq = self.venue.free_quote
             if (not self.is_perp and not VENUE_LEVERAGE and MIN_QUOTE_FREE_OPEN > 0
@@ -2091,19 +2443,43 @@ class ArbBot:
         self.close_only_reasons = reasons
 
     # ── risk controls (daily limits + margin de-risk; see atjte.engines.common.risk) ──
+    def _capital_usd(self) -> Optional[float]:
+        """The strategy's capital: venue margin equity + MT5 equity in USD
+        (None while either is unknown)."""
+        v, m = self.venue_margin_equity, self._mt5_equity_usd()
+        return None if v is None or m is None else float(v) + float(m)
+
+    def _max_daily_loss(self) -> Optional[float]:
+        """MAX_DAILY_LOSS_USD in USD: as written, or (RISK_UNIT pct) that % of
+        the capital taken once per risk day, at the day's first reading."""
+        if not RISK_PCT:
+            return pct_limit(MAX_DAILY_LOSS_USD, None)
+        base = getattr(self, "_loss_base", None)
+        if base is None or base[0] != self.day.date:
+            cap = self._capital_usd()
+            if cap is None:
+                return None
+            self._loss_base = base = (self.day.date, cap)
+            if MAX_DAILY_LOSS_USD:
+                _log(f"daily loss limit: {float(MAX_DAILY_LOSS_USD):g}% of capital "
+                     f"{cap:,.2f} USD = {pct_limit(MAX_DAILY_LOSS_USD, cap):,.2f} USD "
+                     f"for {self.day.date}")
+        return pct_limit(MAX_DAILY_LOSS_USD, base[1])
+
     def _risk_banner(self) -> None:
         """Startup lines for the risk controls — what is armed, what is off,
         and where today's book stands after the state was recovered."""
         limits = []
         if MAX_DAILY_LOSS_USD:
-            limits.append(f"max daily loss {float(MAX_DAILY_LOSS_USD):g} USD")
+            limits.append(f"max daily loss {float(MAX_DAILY_LOSS_USD):g}"
+                          + ("% of capital" if RISK_PCT else " USD"))
         if MAX_DAILY_VENUE_VOLUME_USD:
             limits.append(f"max daily crypto-venue volume "
                           f"{float(MAX_DAILY_VENUE_VOLUME_USD):,.0f} USD")
         if MAX_DAILY_MT5_VOLUME_USD:
             limits.append(f"max daily MT5 volume "
                           f"{float(MAX_DAILY_MT5_VOLUME_USD):,.0f} USD")
-        day_label = "UTC day" if RISK_DAY_UTC else "local day"
+        day_label = f"day in {RISK_TZ_LABEL}"
         if limits:
             _log(f"daily limits ({day_label} {self.day.date}): {', '.join(limits)} — "
                  f"a breach latches CLOSE-ONLY until the day rolls; PnL is "
@@ -2116,27 +2492,31 @@ class ArbBot:
                  f"MAX_DAILY_VENUE_VOLUME_USD / MAX_DAILY_MT5_VOLUME_USD all None)")
         derisk = []
         if DERISK_VENUE_AVAILABLE_MARGIN_USD:
-            derisk.append(f"KF available margin < "
-                          f"{float(DERISK_VENUE_AVAILABLE_MARGIN_USD):g} USD")
+            derisk.append(f"venue available margin < "
+                          f"{float(DERISK_VENUE_AVAILABLE_MARGIN_USD):g}"
+                          + ("% of equity" if RISK_PCT else " USD"))
         if DERISK_VENUE_LIQ_DISTANCE_PCT:
-            derisk.append(f"liquidation distance < {float(DERISK_VENUE_LIQ_DISTANCE_PCT):g}%")
+            derisk.append(f"liquidation distance < {float(DERISK_VENUE_LIQ_DISTANCE_PCT):g}%"
+                          + (" of the entry -> liquidation cushion"
+                             if LIQ_DISTANCE_BASE == "entry" else " of mark"))
         if DERISK_MT5_MARGIN_LEVEL:
             derisk.append(f"MT5 margin level < {float(DERISK_MT5_MARGIN_LEVEL):g}%")
         if DERISK_MT5_FREE_MARGIN:
-            derisk.append(f"MT5 free margin < {float(DERISK_MT5_FREE_MARGIN):g}")
+            derisk.append(f"MT5 free margin < {float(DERISK_MT5_FREE_MARGIN):g}"
+                          + ("% of equity" if RISK_PCT else ""))
         _log(f"margin de-risk: {'; '.join(derisk)} -> exit the position with "
              f"reduce-only maker orders at the touch, then CLOSE-ONLY sticky "
              f"until this bot is restarted"
              if derisk else "margin de-risk: off (DERISK_* all None)")
 
     def _roll_day(self) -> None:
-        """Roll the day's risk book at the day boundary (local midnight, or
-        UTC with ``RISK_DAY_UTC``): the counters AND the sticky limit latches
+        """Roll the day's risk book at the day boundary (midnight in the ACP
+        timezone, :func:`_risk_zone`): the counters AND the sticky limit latches
         reset — a new day starts with a clean book. The de-risk latch is not
         one of them: that one survives the roll (it survives everything but a
         restart)."""
-        if self.day.roll(day_key(utc=RISK_DAY_UTC)):
-            _log(f"new {'UTC' if RISK_DAY_UTC else 'local'} day {self.day.date} — "
+        if self.day.roll(_day()):
+            _log(f"new day {self.day.date} ({RISK_TZ_LABEL}) — "
                  f"daily risk counters and limit latches reset")
 
     def _seed_ledgers(self) -> None:
@@ -2206,6 +2586,72 @@ class ArbBot:
         if self.venue_ufunding is not None:
             self._ufunding_last = self.venue_ufunding
 
+    def _poll_funding_history(self, now: float) -> None:
+        """Book the venue's funding PAYMENTS from its own history, on a venue
+        that pays funding as cash and shows no accrual on the position to
+        watch (``_accrue_funding`` needs Kraken Futures' ``unrealizedFunding``
+        — Hyperliquid has none, so its hourly funding was never booked and
+        read +0.00 on every page). Every ``FUNDING_POLL_S`` the history since
+        the last read, less an overlap, is read through the gateway; each
+        payment is recorded once (keyed by symbol + time) in the report, and
+        today's go into the day's risk book. Perpetual only; a venue whose
+        gateway serves no such history is left to the accrual path."""
+        if not self.is_perp or self.venue_ufunding is not None:
+            return
+        ex = self.venue.exchange
+        if not (getattr(ex, "has", {}) or {}).get("fetchFundingHistory"):
+            return
+        if now - self._funding_poll_t < FUNDING_POLL_S:
+            return
+        self._funding_poll_t = now
+        since = (self._funding_since - FUNDING_OVERLAP_S
+                 if self._funding_since is not None else now - FUNDING_FIRST_LOOKBACK_S)
+        try:
+            rows = ex.fetch_funding_history(SYMBOL_VENUE, since=int(since * 1000))
+        except Exception as e:
+            self._log_once("funding_history", f"warning: funding history not read "
+                                              f"({type(e).__name__}: {e})")
+            return
+        self._last_msgs.pop("funding_history", None)
+        self._funding_since = now
+        rep = getattr(self, "reporter", None)
+        today = _day()
+        for r in rows or ():
+            ts_ms, amount = r.get("timestamp"), r.get("amount")
+            if ts_ms is None or amount is None or (r.get("symbol") or SYMBOL_VENUE) != SYMBOL_VENUE:
+                continue
+            ts, usd = float(ts_ms) / 1000.0, float(amount)
+            new = rep is None or rep.record_funding(_reporting.funding_record(
+                EXCHANGE_ID, ts=ts, usd=usd, symbol=SYMBOL_VENUE,
+                id=f"funding:{SYMBOL_VENUE}:{int(ts_ms)}"))
+            if new and _day(ts) == today:
+                self._roll_day()
+                self.day.funding_usd += usd
+                _log(f"funding paid by {EXCHANGE_ID}: {usd:+.4f} USD "
+                     f"(day total {self.day.funding_usd:+.4f})")
+
+    def _refresh_swap(self, now: float) -> None:
+        """Re-read the MT5 symbol's swap terms every :data:`SWAP_REFRESH_S`:
+        brokers revise swaps, and the report should show today's. A failed
+        read keeps the last terms (logged once)."""
+        if now - getattr(self, "_swap_t", now) < SWAP_REFRESH_S:
+            if not hasattr(self, "_swap_t"):
+                self._swap_t = now                 # read at start already
+            return
+        self._swap_t = now
+        try:
+            terms = _reporting.swap_terms(
+                self.mt5.get_symbol_specs(SYMBOL_MT5).get("raw") or {})
+        except Exception as e:
+            self._log_once("swap_terms", f"warning: MT5 swap terms not re-read "
+                                         f"({type(e).__name__}: {e})")
+            return
+        self._last_msgs.pop("swap_terms", None)
+        if terms and terms != getattr(self, "mt5_swap", None):
+            if getattr(self, "mt5_swap", None):
+                _log(f"MT5 swap terms changed: {self.mt5_swap} -> {terms}")
+            self.mt5_swap = terms
+
     def _refresh_risk(self, now: float) -> None:
         """Re-measure the day's PnL and volumes, apply the daily limits and
         the margin de-risk trigger. Runs on the slow tick; the figures are
@@ -2213,6 +2659,8 @@ class ArbBot:
         30 s ``get_daily_pnl_usd`` poll this costs no venue round-trip."""
         self._roll_day()
         self._accrue_funding()
+        self._poll_funding_history(now)
+        self._refresh_swap(now)
         mark = self.mark_px or (self.venue_ticker.mid if self.venue_ticker else None)
         # a leg holding a position with no basis (the venue reported no entry
         # price when it was seeded) would mis-book the realized PnL of its
@@ -2228,7 +2676,7 @@ class ArbBot:
             self.venue_ledger, mark, self.mt5_ledger, self.ref_mid, self.venue_ufunding)
         self.risk_pnl_usd = self.day.pnl()
         reasons = daily_limit_reasons(self.day, self.risk_pnl_usd,
-                                      MAX_DAILY_LOSS_USD,
+                                      self._max_daily_loss(),
                                       MAX_DAILY_VENUE_VOLUME_USD,
                                       MAX_DAILY_MT5_VOLUME_USD)
         if reasons != self.risk_reasons:
@@ -2255,13 +2703,20 @@ class ArbBot:
         the bot re-open into the risk it just escaped. Clearing it is a
         human's decision — look at the account, then restart the bot."""
         pos = self._position_units()
-        self.liq_distance_pct = liq_distance_pct(pos, self.mark_px, self.venue_liq_px)
+        self.liq_distance_pct = liq_distance_pct(
+            pos, self.mark_px, self.venue_liq_px,
+            entry=self.venue_entry_px if LIQ_DISTANCE_BASE == "entry" else None)
+        if LIQ_DISTANCE_BASE == "entry" and not self.venue_entry_px:
+            self.liq_distance_pct = None    # no entry price: the measure cannot arm
         reasons = derisk_reasons(
             pos, venue_available=self.venue_available_margin,
-            venue_available_min=DERISK_VENUE_AVAILABLE_MARGIN_USD,
+            venue_available_min=pct_limit(DERISK_VENUE_AVAILABLE_MARGIN_USD,
+                                          getattr(self, "venue_margin_equity", None)),
             liq_pct=self.liq_distance_pct, liq_pct_min=DERISK_VENUE_LIQ_DISTANCE_PCT,
             mt5_level=self.mt5_margin_level, mt5_level_min=DERISK_MT5_MARGIN_LEVEL,
-            mt5_free=self.mt5_free_margin, mt5_free_min=DERISK_MT5_FREE_MARGIN)
+            mt5_free=self.mt5_free_margin,
+            mt5_free_min=pct_limit(DERISK_MT5_FREE_MARGIN,
+                                   getattr(self, "mt5_equity_ccy", None)))
         if reasons and not self.derisk_active:
             self.derisk_active = True
             self.derisk_since = _utcnow()
@@ -2315,9 +2770,27 @@ class ArbBot:
                  + _blackout.describe(DAILY_SPECS, EVENT_SPECS, BLACKOUT_ZONE)
                  + " — quotes come down inside a window; hedging, reconcile "
                    "and the margin gates keep running")
-        elif not REOPEN_BLACKOUT_S:
+        elif not REOPEN_BLACKOUT_S and not HOLIDAY_SPECS \
+                and not _blackout.sessions_limited(SESSIONS):
             _log("trading blackouts: off (SESSION_REOPEN_BLACKOUT_MIN 0, "
-                 "DAILY_BLACKOUTS / MACRO_EVENTS empty)")
+                 "DAILY_BLACKOUTS / MACRO_EVENTS / HOLIDAYS empty, no sessions)")
+        if _blackout.sessions_limited(SESSIONS):
+            _log(f"trading sessions ({BLACKOUT_TZ}): "
+                 + _blackout.describe_sessions(SESSIONS)
+                 + " — no quotes outside them")
+        if OPEN_SPECS:
+            _log("market-open breaks: no quotes "
+                 + ", ".join(f"{s.label} ±{s.before_s / 60:g} min" for s in OPEN_SPECS)
+                 + " (Mon-Fri, each in its own clock)")
+        if CALENDAR:
+            soon = [e for e in CALENDAR if e.end > time.time()]
+            _log(f"events calendar ({' '.join(BREAK_MARKETS) or 'no markets'}"
+                 f"{', ' + BREAK_ASSET_CLASS if BREAK_ASSET_CLASS else ''}): "
+                 f"{len(soon)} upcoming" + (f", next {soon[0].label}" if soon else ""))
+        if HOLIDAY_SPECS:
+            upcoming = [h for h in HOLIDAY_SPECS if h.end > time.time()]
+            _log(f"market holidays ({BLACKOUT_TZ}): {len(upcoming)} upcoming"
+                 + (f", next {upcoming[0].label}" if upcoming else ""))
 
     def _reopen_guard_until(self, now: Optional[float] = None) -> Optional[float]:
         """When the session-reopen guard lapses (None = not guarding). Takes
@@ -2333,9 +2806,11 @@ class ArbBot:
         published in the heartbeat, so a bot that is deliberately quiet never
         looks like a dead one."""
         self.blackout = _blackout.active_window(now, DAILY_SPECS, EVENT_SPECS,
-                                                BLACKOUT_ZONE)
+                                                BLACKOUT_ZONE, sessions=SESSIONS,
+                                                holidays=HOLIDAY_SPECS, opens=OPEN_SPECS)
         self.blackout_next = _blackout.next_window(now, DAILY_SPECS, EVENT_SPECS,
-                                                   BLACKOUT_ZONE)
+                                                   BLACKOUT_ZONE, sessions=SESSIONS,
+                                                   holidays=HOLIDAY_SPECS, opens=OPEN_SPECS)
 
     def _blackout_reason(self, now: float) -> Optional[str]:
         """Why quoting is suspended right now — None when it is not.
@@ -2455,7 +2930,7 @@ class ArbBot:
             p = px(p + self.price_tick)
         return p if p > 0 else None
 
-    def _quote_level(self, d: DesiredOrder) -> float:
+    def _quote_level(self, d: DesiredOrder, taker: bool = False) -> float:
         """The spread level an order is PRICED at: its own level — except one
         (entry or exit alike) whose side's rolling basis average is already
         through that level by more than ``OPTIMIZE_LIMIT_OFFSET``, which is
@@ -2467,8 +2942,12 @@ class ArbBot:
         always at/better than the strategy's level. None = off; no fresh
         average = the level. The de-risk exit is exempt: its level IS the
         touch, recomputed every pass — nudging it towards a 5 s average
-        would only move it away from the book it is trying to hit."""
+        would only move it away from the book it is trying to hit. So is a
+        ``taker`` order when OPTIMIZE_LIMIT_TAKER is False: it is priced at
+        its level, to cross and fill there rather than wait at the average."""
         if OPTIMIZE_LIMIT_OFFSET is None or d.key == RISK_FLAT_KEY:
+            return d.level
+        if taker and not OPTIMIZE_LIMIT_TAKER:
             return d.level
         off = float(OPTIMIZE_LIMIT_OFFSET)
         if d.side == "buy":
@@ -2485,7 +2964,54 @@ class ArbBot:
         return ("" if g is None or abs(g - t["level"]) < 1e-9
                 else f", level {g:+g} priced off the basis avg")
 
+    # ── spread unit: basis points, anchored ─────────────────────────────────
+    def _bps_ref(self) -> Optional[float]:
+        """The quoting mid the bps are taken of (HEDGE_RATIO x MT5 mid while
+        the venue has none)."""
+        mid = self.venue_ticker.mid if getattr(self, "venue_ticker", None) else None
+        if not mid and getattr(self, "xau_mid", None):
+            mid = float(HEDGE_RATIO) * float(self.xau_mid)
+        return float(mid) if mid and mid > 0 else None
+
+    def _bps_tick(self, now: float) -> bool:
+        """SPREAD_UNIT = "bps": anchor once a price exists, then re-anchor
+        once a day (after the risk day rolls, at the first break in quoting
+        within BPS_REANCHOR_WAIT_S, else then) and on BPS_REANCHOR_DRIFT_PCT.
+        False while no anchor exists yet (nothing may be quoted)."""
+        if SPREAD_UNIT != "bps":
+            return True
+        ref = self._bps_ref()
+        anchor = getattr(self, "bps_anchor", None)
+        reason = None
+        if anchor is None:
+            reason = "start"
+        else:
+            day = _day(now)
+            if day != anchor["day"]:
+                since = getattr(self, "_bps_pending_since", None)
+                if since is None:
+                    self._bps_pending_since = since = now
+                if self._blackout_reason(now) is not None:
+                    reason = "daily (in a break)"
+                elif now - since >= BPS_REANCHOR_WAIT_S:
+                    reason = "daily"
+            if reason is None and BPS_REANCHOR_DRIFT_PCT and ref:
+                if abs(ref / anchor["ref"] - 1.0) * 100.0 >= float(BPS_REANCHOR_DRIFT_PCT):
+                    reason = f"price moved >= {float(BPS_REANCHOR_DRIFT_PCT):g}%"
+        if reason is not None and ref:
+            pts = apply_bps(ref)
+            self.bps_anchor = {"ref": ref, "t": now, "day": _day(now), "points": pts,
+                               "per_bp": bps_to_points(1, ref)}
+            self._bps_pending_since = None
+            _log(f"spread unit bps: anchored at {ref:.10g} ({reason}) — 1 bp = "
+                 f"{self.bps_anchor['per_bp']:.6g}; "
+                 + ", ".join(f"{n} {BPS_ORIG[n]:g} bp = {p:.6g}" for n, p in pts.items()))
+        return getattr(self, "bps_anchor", None) is not None
+
     def _desired_orders(self) -> list[DesiredOrder]:
+        # spread unit bps: nothing is quoted before the first anchor
+        if not self._bps_tick(time.time()) and not self.derisk_active:
+            return []
         # margin de-risk: the strategy is off the book entirely — one
         # reduce-only maker order at the touch until flat. It bypasses every
         # gate below on purpose: those exist to hold entries back, and the
@@ -2501,6 +3027,8 @@ class ArbBot:
             desired = [d for d in desired if d.purpose == "exit"]
         desired = self._spread_gate(desired)    # absolute spread window (both sides)
         desired = self._funding_gate(desired)   # the paying side, when capped
+        desired = self._oracle_gate(desired)    # against the oracle's fair spread
+        desired = self._exposure_gate(desired)  # the dynamic cap (ALLOCATION_PCT)
         # user rule: at most 1 buy + 1 sell order resting on the venue —
         # quote only the level nearest the market per side; the next level
         # goes up in the quote pass that follows the fill (at once, unthrottled)
@@ -2590,6 +3118,152 @@ class ArbBot:
             out.append(d)
         return out
 
+    @property
+    def oracle_basis(self) -> Optional[float]:
+        """The venue's oracle price − the reference price (k × the MT5 mid),
+        in spread points; None without both."""
+        ref = self.ref_mid
+        oracle = getattr(self, "oracle_px", None)
+        if oracle is None or ref is None:
+            return None
+        return oracle - ref
+
+    def _sample_oracle(self, now: float) -> None:
+        """Keep the oracle basis samples of the last BASIS_WINDOW_S."""
+        b = self.oracle_basis
+        q = getattr(self, "_oracle_samples", None)
+        if q is None:
+            q = self._oracle_samples = deque()
+        if b is not None:
+            q.append((now, b))
+        window = float(BASIS_WINDOW_S or 5.0)
+        while q and now - q[0][0] > window:
+            q.popleft()
+
+    @property
+    def oracle_basis_avg(self) -> Optional[float]:
+        """The oracle basis averaged over BASIS_WINDOW_S; None without a
+        sample in the window."""
+        q = getattr(self, "_oracle_samples", None)
+        if not q:
+            return None
+        return sum(b for _t, b in q) / len(q)
+
+    def _oracle_gate_open(self) -> Optional[bool]:
+        """The filter's state for the heartbeat: None = off; False = entries
+        held on both sides (no oracle basis known, or beyond
+        ORACLE_BASIS_MAX); True = entries judged per side."""
+        if not ORACLE_BASIS_FILTER:
+            return None
+        avg = self.oracle_basis_avg
+        if avg is None:
+            return False
+        if ORACLE_BASIS_MAX is not None and abs(avg) > abs(float(ORACLE_BASIS_MAX)):
+            return False
+        return True
+
+    def _oracle_gate(self, desired: list[DesiredOrder]) -> list[DesiredOrder]:
+        """``ORACLE_BASIS_FILTER`` (the atj-hyperliquid-arbitrage rule): the
+        oracle basis averaged over BASIS_WINDOW_S is where the venue's own
+        oracle puts the fair spread — a BUY entry rests only at a level at or
+        below it, a SELL entry only at or above it. ``ORACLE_BASIS_MAX``
+        (optional): no entries at all while |average| exceeds it. No oracle
+        basis known: entries held (fail-safe). Exits always survive.
+        Transitions of the both-sides hold are logged."""
+        if not ORACLE_BASIS_FILTER:
+            return desired
+        open_ = self._oracle_gate_open()
+        if getattr(self, "_oracle_gate_was", None) is not open_:
+            self._oracle_gate_was = open_
+            avg = self.oracle_basis_avg
+            why = ("no oracle price" if avg is None else
+                   f"average oracle basis {avg:+.6g} beyond max {ORACLE_BASIS_MAX}"
+                   if not open_ else f"average oracle basis {avg:+.6g}")
+            _log(f"oracle basis filter {'judging entries per side' if open_ else 'HOLDING entries'}"
+                 f": {why}")
+        if not open_:
+            return [d for d in desired if d.purpose != "entry"]
+        avg = self.oracle_basis_avg
+        out = []
+        for d in desired:
+            if d.purpose == "entry":
+                if d.side == "buy" and d.level > avg:
+                    continue            # would buy above the oracle's fair spread
+                if d.side == "sell" and d.level < avg:
+                    continue            # would sell below it
+            out.append(d)
+        return out
+
+    # ── exposure: the dynamic cap (ALLOCATION_PCT) ──────────────────────────
+    def _mt5_equity_usd(self) -> Optional[float]:
+        """The MT5 account's equity in USD (the reporter's account block)."""
+        try:
+            acct = self.reporter.mt5_account(self.mt5) or {}
+        except Exception:                                   # noqa: BLE001
+            return None
+        eq, rate = acct.get("equity"), acct.get("usd_rate")
+        return None if eq is None or not rate else float(eq) * float(rate)
+
+    def _recompute_dyn_cap(self, now: float, force: bool = False) -> None:
+        """``ALLOCATION_PCT``: the cap per side, in base units =
+        min(quoting equity, hedging equity USD) × ALLOCATION_PCT/100 ×
+        LEVERAGE / quoting mid; every ALLOCATION_REFRESH_S. A figure missing
+        leaves the last cap (None before the first: no entries). Only with
+        DYNAMIC_ALLOCATION on (:func:`_dyn_alloc_on`)."""
+        if not _dyn_alloc_on():
+            return
+        if not force and now - getattr(self, "_dyn_cap_t", 0.0) < ALLOCATION_REFRESH_S:
+            return
+        q_eq = self.venue_margin_equity
+        h_eq = self._mt5_equity_usd()
+        mid = self.venue_ticker.mid if self.venue_ticker is not None else None
+        lev = float(LEVERAGE) if LEVERAGE else 1.0
+        if q_eq is None or h_eq is None or not mid:
+            return
+        self._dyn_cap_t = now
+        capital = max(0.0, min(float(q_eq), h_eq)) * float(ALLOCATION_PCT) / 100.0
+        self.dyn_cap_units = capital * lev / float(mid)
+        self.dyn_cap_detail = {"quoting_equity": q_eq, "hedging_equity_usd": h_eq,
+                               "capital": capital, "leverage": lev, "mid": mid}
+
+    def _exposure_gate(self, desired: list[DesiredOrder]) -> list[DesiredOrder]:
+        """The dynamic cap (ALLOCATION_PCT): an entry that would take the
+        position beyond ±``dyn_cap_units`` is dropped; exits always survive.
+        Off (no-op) unless DYNAMIC_ALLOCATION is on with an ALLOCATION_PCT;
+        no cap computed yet: entries held."""
+        if not _dyn_alloc_on():
+            return desired
+        cap = getattr(self, "dyn_cap_units", None)
+        pos = self._position_units()
+        out = []
+        for d in desired:
+            if d.purpose == "entry":
+                if cap is None:
+                    continue
+                if d.side == "buy" and pos + d.size > cap + POS_EPS:
+                    continue
+                if d.side == "sell" and pos - d.size < -cap - POS_EPS:
+                    continue
+            out.append(d)
+        return out
+
+    def _apply_leverage(self) -> None:
+        """LEVERAGE / MARGIN_MODE on the venue, once at start (perpetuals),
+        through the gateway. Never fatal: a refusal (a mode switch with a
+        position open, a venue without the operation) is logged."""
+        if LEVERAGE is None or not self.is_perp:
+            return
+        fn = getattr(self.venue.client, "set_leverage", None)
+        if fn is None:
+            _log(f"LEVERAGE {LEVERAGE} not applied: this venue connector cannot set it")
+            return
+        try:
+            fn(int(LEVERAGE), MARGIN_MODE)
+            _log(f"leverage set: {int(LEVERAGE)}x {MARGIN_MODE} on {SYMBOL_VENUE}")
+        except Exception as e:                              # noqa: BLE001
+            _log(f"WARNING: leverage {int(LEVERAGE)}x {MARGIN_MODE} not applied "
+                 f"({type(e).__name__}: {e}) — the account's own stays in force")
+
     def _take_ops(self, n: float = 1.0) -> bool:
         """Token bucket for order API calls (place/cancel/amend each cost 1):
         allow bursts of ORDER_OPS_BURST, refill ORDER_OPS_PER_S. When the
@@ -2613,8 +3287,8 @@ class ArbBot:
         targets: dict[str, dict] = {}
         for d in sorted(self._desired_orders(),
                         key=lambda d: (0 if d.purpose == "exit" else 1, d.level_index)):
-            level = self._quote_level(d)
             taker = self._taker_allowed(d)
+            level = self._quote_level(d, taker)
             price = (self._taker_price(d.side, level) if taker
                      else self._maker_price(d.side, level))
             if price is None:
@@ -2641,6 +3315,19 @@ class ArbBot:
                 same_size = abs(rec.remaining - t["amount"]) < size_tol
                 if abs(rec.price - t["price"]) < min_move and same_size:
                     continue
+                # a resting TAKER order that crosses the top of book is about
+                # to fill: pulling it to re-price throws that fill away
+                # (measured 2026-09-28, xyz:EUR: a sell at the 1.1368 bid,
+                # replaced at 1.1369 three seconds later, unfilled). Price
+                # drift alone does not move it; a SIZE change still does (a
+                # cap or a fill must never be overrun), and a signal that
+                # goes off still cancels it (above).
+                if rec.taker and same_size and self._crosses_tob(rec.side, rec.price):
+                    self._log_once(f"hold_{key}",
+                                   f"hold {key} {rec.side} @ {rec.price}: crosses the top "
+                                   f"of book — not re-priced while it does")
+                    continue
+                self._last_msgs.pop(f"hold_{key}", None)
                 # price-only drift -> amend in place where the venue can
                 # (1 call, the order id survives); otherwise fall through to
                 # cancel/replace, which every venue can do. A TAKER-allowed
@@ -2661,6 +3348,17 @@ class ArbBot:
             if rec is None and not self._take_ops(1):
                 continue
             self._place(key, t)
+
+    def _crosses_tob(self, side: str, price: float) -> bool:
+        """True when a ``side`` limit at ``price`` is marketable against the
+        bot's latest venue top of book (``venue_ticker``, refreshed from the
+        feed in the same fast pass): a sell at or below the best bid, a buy
+        at or above the best ask. No book: False (re-pricing goes on)."""
+        k = self.venue_ticker
+        bid, ask = getattr(k, "bid", None), getattr(k, "ask", None)
+        if bid is None or ask is None:
+            return False
+        return price <= bid if side == "sell" else price >= ask
 
     def _requote_min_move(self) -> float:
         """How far the target must drift before a resting quote is moved.
@@ -3048,6 +3746,8 @@ class ArbBot:
             ex = self.feed.get_extra()
             if ex:
                 self.mark_px, self.index_px = ex.get("mark"), ex.get("index")
+                self.oracle_px = ex.get("oracle")
+                self._sample_oracle(now)
                 self.funding_rate = ex.get("funding_rate")
                 self.funding_rate_pred = ex.get("funding_rate_prediction")
                 self.next_funding_ms = ex.get("next_funding_time_ms")
@@ -3069,9 +3769,22 @@ class ArbBot:
         post-reopen tick must not fire an entry — and go back to None
         whenever sampling stops, which fails safe for the gate."""
         k = self.venue_ticker
-        self._basis_samples.append((now, k.bid - self.ref_bid,
-                                    k.ask - self.ref_ask))
+        self._basis_loop_t = now
+        self._push_basis(now, k.bid - self.ref_bid, k.ask - self.ref_ask)
+
+    def _push_basis(self, now: float, bid_basis: float, ask_basis: float) -> None:
+        """Append one basis sample and republish the averages (the loop's
+        :meth:`_sample_basis` and the filler's :meth:`_basis_fill_once`)."""
+        with self._basis_lock:
+            self._push_basis_locked(now, bid_basis, ask_basis)
+
+    def _push_basis_locked(self, now: float, bid_basis: float, ask_basis: float) -> None:
         q = self._basis_samples
+        if q and now < q[-1][0]:
+            # a pass's `now` is taken at its start: a filler sample may have
+            # landed since — the window stays time-ordered
+            now = q[-1][0]
+        q.append((now, bid_basis, ask_basis))
         # Keep ONE anchor sample at/before the window's start: without it a
         # stall of just over a second anywhere in the loop — a Hyperliquid
         # websocket order op blocks it ~1 s — reaches the window's old edge
@@ -3097,12 +3810,63 @@ class ArbBot:
         else:
             self.basis_avg_bid = self.basis_avg_ask = None
 
+    # ── the basis filler: the window keeps being fed while the loop blocks ──
+    # The anchor above absorbs a ~1 s stall; a slower venue does not stop at
+    # that. Measured 2026-09-28 on a Hyperliquid HIP-3 sub-account: the
+    # pre-place margin read took ~1.7 s, the order op on top ~3 s in all —
+    # past half the 5 s window, so every placement blanked the average, the
+    # gate pulled the order it had just placed, and the place/cancel loop
+    # came back (28 placed, 28 cancelled). The stall is the LOOP's, not the
+    # market's: both prices keep arriving (the feed's ticker cache, the MT5
+    # gateway's pushed tick), so while the loop is silent this thread samples
+    # them itself. It only CONTINUES a window the loop started, and never
+    # while the loop's last verdict was "ws down" or "session closed".
+    BASIS_FILL_AFTER_S = 0.5     # loop silent this long -> the filler samples
+    BASIS_FILL_EVERY_S = 0.25
+
+    def _basis_fill_once(self, now: float) -> bool:
+        """One filler sample when the loop has not sampled for
+        BASIS_FILL_AFTER_S and both prices are live. Returns True when it
+        sampled. Reads only caches: never a venue or terminal round trip."""
+        if now - self._basis_loop_t < self.BASIS_FILL_AFTER_S:
+            return False
+        if not self._basis_samples or not getattr(self, "ws_ok", False) \
+                or not self.session_open:
+            return False
+        tk = self.feed.get_ticker()
+        if tk is None or self.feed.ticker_age_s > VENUE_TICKER_STALE_S:
+            return False
+        if not getattr(self.mt5, "via_gateway", False):
+            return False        # a direct terminal client would be IPC off-thread
+        try:
+            x = self.mt5.get_ticker(SYMBOL_MT5)
+        except Exception:                                   # noqa: BLE001
+            return False
+        if x is None or x.bid is None or x.ask is None:
+            return False
+        sig = (x.bid, x.ask, (x.raw or {}).get("time_msc"))
+        if sig == self._mt5_sig and now - self._mt5_change_t > MT5_STALE_S:
+            return False        # the MT5 quote went quiet: the loop's rule
+        with self._basis_lock:
+            if not self._basis_samples:
+                return False    # the loop cleared the window meanwhile
+            self._push_basis_locked(now, tk.bid - HEDGE_RATIO * x.bid,
+                                    tk.ask - HEDGE_RATIO * x.ask)
+        return True
+
+    def _basis_filler(self) -> None:
+        while not self._basis_filler_stop.wait(self.BASIS_FILL_EVERY_S):
+            try:
+                self._basis_fill_once(time.time())
+            except Exception:                               # noqa: BLE001
+                pass            # a filler bug never touches the loop
+
     def _basis_gate(self, desired: list[DesiredOrder]) -> list[DesiredOrder]:
         """BASIS_TRIGGER submission filter: keep an order only while the
         rolling basis average is at/through its spread level — buys while
         avg(perp_bid − k·xau_bid) <= level, sells while avg(perp_ask − k·xau_ask)
         >= level. An order that armed stays live until the average retreats
-        BASIS_RELEASE_USD back inside (hysteresis). No average (warm-up,
+        BASIS_RELEASE back inside (hysteresis). No average (warm-up,
         stale feed) drops everything — fail safe."""
         if not BASIS_TRIGGER:
             return desired
@@ -3113,9 +3877,9 @@ class ArbBot:
             if avg is None:
                 live = False
             elif d.side == "buy":
-                live = avg <= d.level + (BASIS_RELEASE_USD if armed else 0.0)
+                live = avg <= d.level + (BASIS_RELEASE if armed else 0.0)
             else:
-                live = avg >= d.level - (BASIS_RELEASE_USD if armed else 0.0)
+                live = avg >= d.level - (BASIS_RELEASE if armed else 0.0)
             if live != armed:
                 _log(f"basis trigger {'ARMED' if live else 'released'} "
                      f"{d.key}: avg_{'bid' if d.side == 'buy' else 'ask'} "
@@ -3219,9 +3983,11 @@ class ArbBot:
             self._retire_all_quotes(f"crypto venue ws down: {reason}")
             self.venue_source = "none"
             self.spread_now = None
-            # a gap in the basis window must not span the sleep
-            self._basis_samples.clear()
-            self.basis_avg_bid = self.basis_avg_ask = None
+            # a gap in the basis window must not span the sleep (ws_ok is
+            # already False: the filler stops adding; the lock: mid-append)
+            with self._basis_lock:
+                self._basis_samples.clear()
+                self.basis_avg_bid = self.basis_avg_ask = None
         else:
             if self._last_msgs.pop("ws_sleep", None):
                 _log("crypto venue ws up — quoting resumes")
@@ -3288,19 +4054,24 @@ class ArbBot:
 
 
     # ── reporting (atjte.reporting): what a dashboard reads INSTEAD of the venues ──
-    def _report_fill(self, rec: OrderRec, delta: float, source: str,
+    def _report_fill(self, rec: Optional[OrderRec], delta: float, source: str,
                      trade: Optional[Trade] = None) -> None:
-        """Record one BOOKED fill in the report history — from ``_book``, the
-        single funnel, so a fill is written exactly once whichever source
-        (ws push, REST poll, settle) reported it. The ws trade carries the
-        venue's id, price and fee; a poll delta is keyed by order + booked
-        total. Best-effort: never in the hedge's way."""
+        """Record one fill in the report history. A venue ``trade`` (the ws
+        handler) is recorded at its OWN size, also for an order already
+        settled (``rec`` None); a booking with no trade behind it (``_book``:
+        REST poll, settle) is the INFERRED ``delta``, keyed by order + booked
+        total. The replay skips inferred records and keeps the venue's, so the
+        venue's trade must never be trimmed by what was inferred before it —
+        that lost 89 of USDJPY's units and booked phantom PnL. Best-effort:
+        never in the hedge's way."""
         if getattr(self, "reporter", None) is None:
             return
         try:
             base, quote = _reporting.symbol_parts(SYMBOL_VENUE)
             price = (float(trade.price) if trade is not None and trade.price
                      else float(rec.price))
+            side = rec.side if rec is not None else trade.side.value
+            order_id = rec.order_id if rec is not None else trade.order_id
             if trade is not None:
                 tid = trade.trade_id
                 ts = trade.timestamp.timestamp() if trade.timestamp else time.time()
@@ -3309,9 +4080,10 @@ class ArbBot:
                 tid = f"{rec.order_id}:{source}:{rec.booked:.8f}"
                 ts, fee = time.time(), None
             self.reporter.record_fill(_reporting.fill_record(
-                EXCHANGE_ID, trade_id=tid, ts=ts, side=rec.side, amount=delta,
-                price=price, symbol=SYMBOL_VENUE, fee_usd=fee, order_id=rec.order_id,
-                source=source, key=rec.key, purpose=rec.purpose,
+                EXCHANGE_ID, trade_id=tid, ts=ts, side=side, amount=delta,
+                price=price, symbol=SYMBOL_VENUE, fee_usd=fee, order_id=order_id,
+                source=source, key=rec.key if rec is not None else "",
+                purpose=rec.purpose if rec is not None else "",
                 realized_usd=(trade.realized_pnl if trade is not None else None),
                 inferred=trade is None,
                 taker_or_maker=(getattr(trade, "taker_or_maker", "") or ""
@@ -3357,9 +4129,89 @@ class ArbBot:
         ok = bool(getattr(self.mt5, "is_connected", False))
         return _reporting.mt5_block(
             symbol=SYMBOL_MT5, magic=MT5_MAGIC, ok=ok, contract=self.mt5_contract_size,
-            hedge_ratio=HEDGE_RATIO,
+            hedge_ratio=HEDGE_RATIO, swap=getattr(self, "mt5_swap", None),
             srv_offset_s=off, account=rep.mt5_account(self.mt5) if ok else None,
             top=top, positions=rep.mt5_positions(self.mt5, SYMBOL_MT5, off) if ok else None)
+
+    # ── history, through the gateways ────────────────────────────────────────
+    def _mt5_utc_offset_s(self) -> float:
+        """The broker server's UTC offset: the live one once a moving tick has
+        set it, else measured now — MT5 stamps are epoch numbers in the
+        server's timezone; a fresh tick's, snapped to 30 min, gives it. The
+        tick is trusted only if it ADVANCES over a re-read (a quote frozen by
+        a session break would mis-key the history); else the usual UTC+3."""
+        if getattr(self, "_srv_offset_s", None) is not None:
+            return self._srv_offset_s
+        off = DEFAULT_SRV_OFFSET_S
+        try:
+            t1 = (self.mt5.get_ticker(SYMBOL_MT5).raw or {}).get("time")
+            for _ in range(3):
+                time.sleep(1.0)
+                t2 = (self.mt5.get_ticker(SYMBOL_MT5).raw or {}).get("time")
+                if t1 and t2 and float(t2) > float(t1):
+                    cand = float(t2) - time.time()
+                    snapped = round(cand / 1800.0) * 1800.0
+                    if abs(cand - snapped) < 120.0:
+                        off = snapped
+                    break
+        except Exception:
+            pass
+        return off
+
+    def history_closes(self, since: float, now: float) -> tuple[dict, dict]:
+        """``(venue, mt5)`` 1 m closes between ``since`` and ``now``, each
+        ``{minute UTC: close}`` as quoted: the exchange's candles through its
+        gateway (``fetch_ohlcv``: the CCXT, Hyperliquid and Lighter gateways
+        serve it) and the MT5 rates through the MT5 gateway. A leg whose
+        gateway serves no history comes back empty, said in the log — never
+        a direct venue or terminal call from the bot."""
+        venue: dict = {}
+        mt5: dict = {}
+        try:
+            cursor, end_ms = int(since * 1000), int(now * 1000)
+            for _ in range(HISTORY_PAGES):
+                rows = self.venue.exchange.fetch_ohlcv(SYMBOL_VENUE, "1m", since=cursor,
+                                                       limit=HISTORY_PAGE)
+                if not rows:
+                    break
+                for row in rows:
+                    venue[int(float(row[0]) // 1000)] = float(row[4])
+                nxt = int(rows[-1][0]) + 60_000
+                if nxt <= cursor or nxt > end_ms:
+                    break
+                cursor = nxt
+        except Exception as e:
+            _log(f"history: no {SYMBOL_VENUE} candles through the gateway "
+                 f"({type(e).__name__}: {e}) — the exchange leg starts at this run")
+        try:
+            off = self._mt5_utc_offset_s()
+            rows = self.mt5.rates(SYMBOL_MT5,
+                                  datetime.fromtimestamp(since + off, tz=timezone.utc),
+                                  datetime.fromtimestamp(now + off + 300.0, tz=timezone.utc),
+                                  "M1")
+            mt5 = {int(r["time"]) - int(off): float(r["close"]) for r in rows or ()}
+        except Exception as e:
+            _log(f"history: no {SYMBOL_MT5} rates through the MT5 gateway "
+                 f"({type(e).__name__}: {e}) — the MT5 leg starts at this run")
+        return venue, mt5
+
+    def _backfill_report_bars(self, now: float) -> None:
+        """Once per run, as soon as a live MT5 tick has set the server clock's
+        offset: fill the report's 1 m bars for the last REPORT_HISTORY_S that
+        it does not hold yet (a first start, or the time the bot was down)
+        from :meth:`history_closes`, so the control panel's charts reach back
+        without the panel opening a connection of its own. Best-effort."""
+        if getattr(self, "_history_backfilled", True) or self._srv_offset_s is None:
+            return
+        self._history_backfilled = True
+        try:
+            venue, mt5 = self.history_closes(now - REPORT_HISTORY_S, now)
+            n = self.reporter.backfill_bars(venue, mt5, now)
+            if n:
+                _log(f"report: {n} one-minute bars filled from the gateways' history "
+                     f"({len(venue)} {SYMBOL_VENUE} / {len(mt5)} {SYMBOL_MT5} closes)")
+        except Exception as e:
+            _log(f"report: history backfill failed ({type(e).__name__}: {e})")
 
     def _report(self, now: float, final: bool = False) -> None:
         """The reporting phase of the slow tick (runs while the session is
@@ -3372,6 +4224,8 @@ class ArbBot:
             return
         if not rep.seed_file.exists():
             self._report_seed()
+        if not final:
+            self._backfill_report_bars(now)
         if (final or self._report_deals_dirty
                 or now - self._report_deals_t >= REPORT_DEALS_S):
             self._report_deals_t = now
@@ -3484,6 +4338,15 @@ class ArbBot:
             # hedge_ratio MT5 units per venue unit (mt5_net_units is in VENUE
             # units, mt5_net_units_mt5 in the MT5 symbol's own)
             "hedge_ratio": HEDGE_RATIO,
+            # the venue market as the bot reads it (the panel's Save checks)
+            "market": {"price_tick": getattr(self.venue, "price_tick", None),
+                       "amount_min": getattr(self.venue, "amount_min", None),
+                       "amount_step": getattr(self.venue, "amount_step", None),
+                       "maker_fee": getattr(self.venue, "maker_fee", None),
+                       "taker_fee": getattr(self.venue, "taker_fee", None),
+                       "hedge_threshold_units": HEDGE_THRESHOLD_UNITS,
+                       "hedge_threshold_from": getattr(self, "hedge_threshold_from",
+                                                       "setting")},
             # legs in different currencies: the pair and this hour's rate
             # (MT5 currency per venue currency) the hedge is sized at
             "panel_lease": {"watching": PANEL_HEARTBEAT_FILE is not None
@@ -3524,6 +4387,12 @@ class ArbBot:
                      "unrealized_funding": self.venue_ufunding,
                      "liquidation_price": self.venue_liq_px,
                      "mark": self.mark_px, "index": self.index_px,
+                     "oracle": getattr(self, "oracle_px", None),
+                     "oracle_basis": self.oracle_basis,
+                     "oracle_basis_avg": self.oracle_basis_avg,
+                     "oracle_gate": self._oracle_gate_open(),
+                     "dyn_cap_units": getattr(self, "dyn_cap_units", None),
+                     "dyn_cap": getattr(self, "dyn_cap_detail", None) or None,
                      "funding_rate": self.funding_rate,          # relative, per period
                      "funding_rate_prediction": self.funding_rate_pred,
                      "next_funding_time_ms": self.next_funding_ms,
@@ -3570,8 +4439,12 @@ class ArbBot:
             "mt5_free_margin": self.mt5_free_margin,
             # the risk controls: what the daily limits are measured on, and
             # the margin de-risk latch (atjte.engines.common.risk)
+            # the spread unit (bps: the anchor every price gap is taken at)
+            "spread_unit": {"unit": SPREAD_UNIT,
+                            "anchor": getattr(self, "bps_anchor", None)},
             "risk": {
-                "day": self.day.date, "day_utc": RISK_DAY_UTC,
+                "day": self.day.date, "day_utc": RISK_TZ_NAME == "UTC",
+                "day_tz": RISK_TZ_LABEL,
                 # the gated figure: REALIZED only (closing fills + settled
                 # funding), the sample_project convention
                 "pnl_usd": None if self.risk_pnl_usd is None
@@ -3586,6 +4459,10 @@ class ArbBot:
                 "unrealized_usd": None if self.risk_unrealized_usd is None
                 else round(self.risk_unrealized_usd, 4),
                 "max_daily_loss_usd": MAX_DAILY_LOSS_USD,
+                # RISK_UNIT pct: the loss limit / floors as the gates use them
+                "unit": "pct" if RISK_PCT else "abs",
+                "max_daily_loss_effective_usd": (self._max_daily_loss()
+                                                 if MAX_DAILY_LOSS_USD else None),
                 "loss_latched": self.day.loss_latched,
                 "venue_volume_usd": round(self.day.venue_volume_usd, 2),
                 "mt5_volume_usd": round(self.day.mt5_volume_usd, 2),
@@ -3613,8 +4490,9 @@ class ArbBot:
             # whether they also gate submission
             "basis_trigger": {
                 "enabled": BASIS_TRIGGER, "window_s": BASIS_WINDOW_S,
-                "release_usd": BASIS_RELEASE_USD,
+                "release_usd": BASIS_RELEASE,
                 "optimize_limit_offset": OPTIMIZE_LIMIT_OFFSET,
+                "optimize_limit_taker": OPTIMIZE_LIMIT_TAKER,
                 "avg_bid": None if self.basis_avg_bid is None
                 else round(self.basis_avg_bid, 4),
                 "avg_ask": None if self.basis_avg_ask is None
@@ -3707,6 +4585,8 @@ class ArbBot:
     def run(self) -> None:
         try:
             self.startup()
+            threading.Thread(target=self._basis_filler, name="basis-filler",
+                             daemon=True).start()
             consecutive_errors = 0
             _log(f"event loop: fills hedged the moment they arrive; quotes re-priced "
                  f"on every perp BBO push and MT5 tick (polled every "
@@ -3757,6 +4637,7 @@ class ArbBot:
         except KeyboardInterrupt:
             _log("stopping (Ctrl+C)")
         finally:
+            self._basis_filler_stop.set()
             self.teardown()
 
     def teardown(self) -> None:

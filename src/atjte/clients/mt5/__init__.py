@@ -488,6 +488,29 @@ class MT5Client(UniversalClient):
         px = float(rates[0]["open"])
         return px if px > 0 else None
 
+    @_serialised
+    def rates(self, symbol: str, frm: datetime, to: datetime,
+              timeframe: str = "M1") -> list[dict]:
+        """The ``timeframe`` bars between ``frm`` and ``to`` as ``{"time",
+        "open", "high", "low", "close"}`` dicts, oldest first — the history a
+        chart or a warming-up indicator needs. Like :meth:`history_deals`, the
+        bounds and each bar's ``time`` are in the BROKER's clock (labelled
+        UTC): the caller shifts both (:func:`atjte.reporting.server_offset_s`)."""
+        tf = getattr(mt5, f"TIMEFRAME_{timeframe.upper()}", None)
+        if tf is None:
+            raise ValueError(f"unknown MT5 timeframe {timeframe!r}")
+        mt5.symbol_select(symbol, True)
+        rows = mt5.copy_rates_range(symbol, tf, frm, to)
+        return [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
+                 "low": float(r["low"]), "close": float(r["close"])}
+                for r in (rows if rows is not None else ())]
+
+    @_serialised
+    def symbol_names(self) -> list[str]:
+        """Every symbol the terminal lists, sorted — what the control panel's
+        new-strategy dialog offers (the MT5 gateway writes it to its folder)."""
+        return sorted(s.name for s in (mt5.symbols_get() or ()))
+
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _account_info(self):

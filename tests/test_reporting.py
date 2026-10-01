@@ -112,6 +112,52 @@ class ReporterTest(unittest.TestCase):
         self.assertEqual(seed["venue"], {"pos": 1.5, "avg_price": 2400.0})
         self.assertEqual(seed["mt5"]["lots"], -0.02)
 
+    def test_an_account_quoted_the_other_way_round_is_inverted(self):
+        """A JPY account: brokers list USDJPY, never JPYUSD. The rate used to
+        come back None and the panel showed the yen as dollars."""
+        mt5 = _FakeMt5(ccy="JPY")
+        asked = []
+
+        def ticker(symbol):
+            asked.append(symbol)
+            if symbol != "USDJPY.a":
+                raise RuntimeError("no such symbol")
+            return Ticker(exchange="mt5", symbol=symbol, bid=157.9, ask=158.1)
+        mt5.get_ticker = ticker
+        acct = self.rep.mt5_account(mt5)
+        self.assertEqual(acct["ccy"], "JPY")
+        self.assertAlmostEqual(acct["usd_rate"], 1 / 158.0)
+        self.assertLess(asked.index("JPYUSD"), asked.index("USDJPY"))   # direct pair first
+        asked.clear()
+        self.assertAlmostEqual(self.rep.mt5_account(mt5)["usd_rate"], 1 / 158.0)
+        self.assertEqual(asked, ["USDJPY.a"])                          # cached, with its way round
+
+    def test_history_fills_only_the_minutes_the_bars_do_not_hold(self):
+        now = 1_800_000_000.0 + 30              # 30 s into a minute
+        m = R.minute(now)
+        with self.rep.bars_file.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": m - 120, "venue": 1.0, "mt5": 2.0}) + "\n")
+        venue = {m - 180: 10.0, m - 120: 11.0, m - 60: 12.0, m: 13.0}
+        mt5 = {m - 180: 20.0, m - 60: 22.0, m - 30 * 86400: 5.0}
+        self.assertEqual(self.rep.backfill_bars(venue, mt5, now), 2)
+        rows = {r["ts"]: r for r in R.read_jsonl(self.rep.bars_file)}
+        self.assertEqual(rows[m - 120]["venue"], 1.0)            # the bot's own bar kept
+        self.assertEqual((rows[m - 180]["venue"], rows[m - 180]["mt5"]), (10.0, 20.0))
+        self.assertEqual(rows[m - 60]["src"], "history")
+        self.assertNotIn(m, rows)                                # the forming minute
+        self.assertNotIn(m - 30 * 86400, rows)                   # past the retention
+        self.assertEqual(self.rep.backfill_bars(venue, mt5, now), 0)   # idempotent
+
+    def test_a_funding_payment_read_twice_is_booked_once(self):
+        rec = R.funding_record("hyperliquid", ts=1.0, usd=-0.42, symbol="X",
+                               id="funding:X:1000")
+        self.assertTrue(self.rep.record_funding(rec))
+        self.assertFalse(self.rep.record_funding(dict(rec)))
+        self.assertTrue(self.rep.record_funding(               # the accrual path: no id
+            R.funding_record("krakenfutures", ts=2.0, usd=0.1)))
+        usd = [r["usd"] for r in R.read_jsonl(self.rep.trades_file) if r["kind"] == "funding"]
+        self.assertEqual(usd, [-0.42, 0.1])
+
     def test_snapshot_and_mt5_blocks(self):
         mt5 = _FakeMt5()
         acct = self.rep.mt5_account(mt5)
@@ -127,10 +173,17 @@ class ReporterTest(unittest.TestCase):
                               unit_label="oz", top=R.top_block(2400.0, 2400.5),
                               position=R.position_block(1.0, 2390.0, 10.0),
                               open_orders=[R.order_row("o1", "buy", 2399.0, 1.0, 1.0)])
+        swap = R.swap_terms({"swap_mode": 1, "swap_long": -55.3, "swap_short": 21.1,
+                             "point": 0.01, "swap_rollover3days": 3})
+        self.assertEqual(swap, {"mode": 1, "long": -55.3, "short": 21.1, "point": 0.01,
+                                "rollover3days": 3})
+        self.assertIsNone(R.swap_terms({}))
         blk = R.mt5_block(symbol="XAUUSD", magic=77006, ok=True, contract=100.0,
-                          srv_offset_s=10800.0, account=acct, top=None, positions=pos)
+                          srv_offset_s=10800.0, account=acct, top=None, positions=pos,
+                          swap=swap)
         self.assertTrue(self.rep.snapshot(venue, blk, live_trading=False))
         doc = json.loads(self.rep.snapshot_file.read_text())
+        self.assertEqual(doc["mt5"]["swap"]["long"], -55.3)
         self.assertEqual(doc["schema"], R.SCHEMA)
         self.assertEqual(doc["strategy"], "grid")
         self.assertEqual(doc["venue"]["top"]["mid"], 2400.25)
@@ -317,6 +370,25 @@ class RolledUpFillTest(unittest.TestCase):
         again = R.Reporter(rep.dir.parent, {"strategy": "grid", "strategy_dir": "grid_bot",
                                             "project": "paxg_spot", "engine": "ccxt"})
         self.assertFalse(again.record_fill(self._fill("T4WEVH", 0.500, 100.0, "backfill")))
+
+    def test_an_inferred_fill_never_hides_the_venue_fill(self):
+        """The engine booked the order as filled when it left the book; the
+        venue's real fill for the same order and quantity must still land,
+        because the replay skips the inferred one. Hyperliquid's JP225 lost
+        398 of 532 fills this way and booked a phantom +$262 in a day."""
+        def guess(order):
+            return R.fill_record("kraken", trade_id=f"{order}:place:0.02000000", ts=100.0,
+                                 side="sell", amount=0.02, price=4292.33, symbol="PAXG/USD",
+                                 order_id=order, source="place", inferred=True)
+        rep = self._reporter()
+        self.assertTrue(rep.record_fill(guess("OOEUCK")))
+        self.assertTrue(rep.record_fill(self._fill("T4WEVH", 0.02, 100.5, "backfill")))
+        # ... and in a backfill's own process, the index rebuilt from the file
+        self.assertTrue(rep.record_fill(guess("OQ7ZPL")))
+        again = R.Reporter(rep.dir.parent, {"strategy": "grid", "strategy_dir": "grid_bot",
+                                            "project": "paxg_spot", "engine": "ccxt"})
+        self.assertTrue(again.record_fill(self._fill("T5XQ2A", 0.02, 100.5, "backfill",
+                                                     order="OQ7ZPL")))
 
     def test_genuinely_missing_fills_still_land(self):
         """The narrow case only. Backfill carrying fills the socket never saw

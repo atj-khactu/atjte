@@ -1,0 +1,32 @@
+date,type,event,time_from,time_to,timezone,markets,asset_class
+2026-10-02,Event,US Nonfarm Payrolls (NFP),08:25,08:45,America/New_York,US,
+2026-10-14,Event,US CPI,08:25,08:45,America/New_York,US,
+2026-10-28,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2026-11-06,Event,US Nonfarm Payrolls (NFP),08:25,08:45,America/New_York,US,
+2026-11-10,Event,US CPI,08:25,08:45,America/New_York,US,
+2026-11-26,Holiday,NYSE closed: Thanksgiving Day,,,America/New_York,US,Indices
+2026-11-27,Holiday,NYSE early close 13:00 ET (day after Thanksgiving),13:00,24:00,America/New_York,US,Indices
+2026-12-04,Event,US Nonfarm Payrolls (NFP),08:25,08:45,America/New_York,US,
+2026-12-09,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2026-12-10,Event,US CPI,08:25,08:45,America/New_York,US,
+2026-12-24,Holiday,NYSE early close 13:00 ET (Christmas Eve),13:00,24:00,America/New_York,US,Indices
+2026-12-25,Holiday,NYSE closed: Christmas Day,,,America/New_York,US,Indices
+2027-01-01,Holiday,NYSE closed: New Year's Day,,,America/New_York,US,Indices
+2027-01-18,Holiday,NYSE closed: Martin Luther King Jr. Day,,,America/New_York,US,Indices
+2027-01-27,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-02-15,Holiday,NYSE closed: Washington's Birthday,,,America/New_York,US,Indices
+2027-03-17,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-03-26,Holiday,NYSE closed: Good Friday,,,America/New_York,US,Indices
+2027-04-28,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-05-31,Holiday,NYSE closed: Memorial Day,,,America/New_York,US,Indices
+2027-06-09,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-06-18,Holiday,NYSE closed: Juneteenth (observed),,,America/New_York,US,Indices
+2027-07-05,Holiday,NYSE closed: Independence Day (observed),,,America/New_York,US,Indices
+2027-07-28,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-09-06,Holiday,NYSE closed: Labor Day,,,America/New_York,US,Indices
+2027-09-15,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-10-27,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-11-25,Holiday,NYSE closed: Thanksgiving Day,,,America/New_York,US,Indices
+2027-11-26,Holiday,NYSE early close 13:00 ET (day after Thanksgiving),13:00,24:00,America/New_York,US,Indices
+2027-12-08,Event,FOMC rate decision + press conference,13:55,15:30,America/New_York,US,
+2027-12-24,Holiday,NYSE closed: Christmas Day (observed),,,America/New_York,US,Indices

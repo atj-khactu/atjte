@@ -61,7 +61,10 @@ Snapshot schema (``schema`` 1)::
 
 Fill record: ``{"kind": "fill", "venue": exchange id, "id", "symbol", "ts",
 "side", "amount", "price", "fee_usd", "order", "source", "key",
-"purpose"}``. Funding record: ``{"kind": "funding", "venue", "symbol",
+"purpose"}``, plus ``"mark_venue"`` / ``"mark_mt5"`` — both legs' mids at the
+moment the bot booked the fill (:data:`MARK_AT_FILL_MAX_S`), for a fill booked
+live; absent on one recovered later (a backfill), whose mark is the reader's
+to take from the bars. Funding record: ``{"kind": "funding", "venue", "symbol",
 "ts", "usd"}`` — one per settlement, negative paid. Deal record: ``{"kind": "deal", "venue": "mt5", "id" (the
 ticket as text), "ticket", "symbol", "ts" (true UTC), "side", "lots",
 "price", "profit", "costs" (commission + fee + swap), "commission", "fee",
@@ -95,12 +98,20 @@ REPORT_SNAPSHOT_S = 5.0        # default snapshot cadence (engine setting)
 REPORT_DEALS_S = 30.0          # default MT5 deal poll cadence (engine setting)
 BARS_KEEP_S = 14 * 86400.0     # 1 m bars retention
 BARS_PRUNE_EVERY_S = 3600.0
+#: a fill is stamped with the legs' current mids (``mark_venue`` /
+#: ``mark_mt5``) only when both the fill and the last mid are this recent: a
+#: fill recovered later, or a mid gone quiet, carries no mark rather than a
+#: wrong one
+MARK_AT_FILL_MAX_S = 10.0
 DEALS_OVERLAP_S = 3600.0       # re-read this much before the last deal: a
                                # deal booked late (a close-by, a swap) lands
                                # with an older timestamp than the newest one
 DEALS_FIRST_LOOKBACK_S = 30 * 86400.0   # first read with an empty history
 STABLE_USD = ("USD", "USDT", "USDC", "ZUSD")
 FX_VARIANTS = ("{ccy}USD", "{ccy}USD.a", "{ccy}USD.r", "{ccy}USD.raw")
+#: the same pairs quoted the other way round — brokers list USDJPY, USDCHF,
+#: USDCAD, never JPYUSD: the account currency per USD, used as 1 / mid
+FX_INVERSE_VARIANTS = ("USD{ccy}", "USD{ccy}.a", "USD{ccy}.r", "USD{ccy}.raw")
 
 Log = Optional[Callable[[str], None]]
 
@@ -211,6 +222,19 @@ def fee_usd(fee: Optional[float], fee_ccy: Optional[str], price: float,
     return None
 
 
+def venue_realized_pnl(info) -> Optional[float]:
+    """The realized PnL a venue reports on one fill, before fees, or None:
+    Kraken Futures' ``realized_pnl``, Hyperliquid's ``closedPnl`` (0 on an
+    opening fill; over JP225's whole history it summed to the average-cost
+    replay of the same fills to the cent)."""
+    info = info or {}
+    for k in ("realized_pnl", "closedPnl"):
+        v = _f(info.get(k))
+        if v is not None:
+            return v
+    return None
+
+
 def fill_record(venue: str, *, trade_id: str, ts: float, side: str,
                 amount: float, price: float, symbol: str = "",
                 fee_usd: Optional[float] = None, order_id: Optional[str] = None,
@@ -289,7 +313,7 @@ def is_aggregate_of(record: dict, prior: list[dict]) -> bool:
 
 
 def funding_record(venue: str, *, ts: float, usd: float,
-                   symbol: str = "") -> dict:
+                   symbol: str = "", id: str = "") -> dict:  # noqa: A002
     """One FUNDING settlement on a perpetual — negative paid, positive
     received, in USD.
 
@@ -297,9 +321,14 @@ def funding_record(venue: str, *, ts: float, usd: float,
     charged, but it arrives on a schedule of the venue's own and never as a
     fill, so it needs its own record to be bucketed by date like one. The
     engine writes it the moment the accrual stops being reversible
-    (``_accrue_funding``)."""
-    return {"kind": "funding", "venue": venue, "symbol": symbol,
-            "ts": float(ts), "usd": float(usd)}
+    (``_accrue_funding``), or — on a venue that pays funding as cash with no
+    accrual to watch (Hyperliquid) — from the venue's own payment history,
+    each payment carrying an ``id`` so a re-read never books it twice."""
+    rec = {"kind": "funding", "venue": venue, "symbol": symbol,
+           "ts": float(ts), "usd": float(usd)}
+    if id:
+        rec["id"] = str(id)
+    return rec
 
 
 def deal_record(raw: dict, srv_offset_s: float) -> Optional[dict]:
@@ -397,15 +426,30 @@ def order_row(order_id: str, side: str, price: float, amount: float,
 def mt5_block(*, symbol: str, magic: int, ok: bool, contract: float,
               srv_offset_s: Optional[float], account: Optional[dict],
               top: Optional[dict], positions: Optional[list],
-              hedge_ratio: float = 1.0) -> dict:
+              hedge_ratio: float = 1.0, swap: Optional[dict] = None) -> dict:
     """``contract`` is the broker's MT5 units per lot and ``top`` the MT5
     quote as quoted; ``hedge_ratio`` is k in spread = venue − k × MT5 (the
-    engine's ``HEDGE_RATIO``: MT5 units hedged per venue unit)."""
+    engine's ``HEDGE_RATIO``: MT5 units hedged per venue unit); ``swap`` the
+    symbol's swap terms (:func:`swap_terms`)."""
     return {"symbol": symbol, "magic": int(magic), "ok": bool(ok),
             "contract": float(contract), "hedge_ratio": float(hedge_ratio),
             "srv_offset_s": srv_offset_s,
             "ts": time.time(), "account": account, "top": top,
-            "positions": positions}
+            "positions": positions, "swap": swap}
+
+
+def swap_terms(info: dict) -> Optional[dict]:
+    """The overnight swap terms of an MT5 symbol from its ``symbol_info``:
+    ``{mode, long, short, point, rollover3days}`` — ``long`` / ``short`` per
+    lot per day as the terminal states them (positive = the position is
+    PAID), in the unit ``mode`` names (MT5's SYMBOL_SWAP_MODE: 1 points,
+    2 base currency, 3 margin currency, 4 deposit currency, 5 / 6 annual
+    interest %). None without them."""
+    if not isinstance(info, dict) or info.get("swap_mode") is None:
+        return None
+    return {"mode": int(info["swap_mode"]), "long": _f(info.get("swap_long")),
+            "short": _f(info.get("swap_short")), "point": _f(info.get("point")),
+            "rollover3days": info.get("swap_rollover3days")}
 
 
 def symbol_parts(symbol: str) -> tuple[str, str]:
@@ -446,9 +490,13 @@ class Reporter:
         self._bar_minute: Optional[int] = None
         self._bar_venue: Optional[float] = None
         self._bar_mt5: Optional[float] = None
+        #: when each leg's mid was last fed (:meth:`mark`), for the fill stamp
+        self._mark_venue_t: Optional[float] = None
+        self._mark_mt5_t: Optional[float] = None
         self._bars_pruned_t = 0.0
         self._warned: set[str] = set()
         self._fx_symbol: Optional[str] = None
+        self._fx_inverse = False       # _fx_symbol quotes USD in the account ccy
         self.ok = True
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -496,9 +544,16 @@ class Reporter:
         self.records_loaded = n
 
     def _note_order_fill(self, rec: dict) -> None:
-        """Index one fill under its order, for the aggregate check."""
+        """Index one fill under its order, for the aggregate check.
+
+        A fill the engine INFERRED is not indexed: it is a guess, and the
+        replay skips it (:func:`atjte.accounting.avg_cost`) on the promise
+        that the venue's real fill will be on file. Matching the venue's fill
+        against the guess would drop that real fill as a "rolled-up row" —
+        both copies gone, the position adrift, every later reduction booking
+        realized PnL against a stale average."""
         order = rec.get("order")
-        if not order:
+        if not order or accounting.inferred_fill(rec):
             return
         self._order_fills.setdefault(
             (str(rec.get("venue")), str(order)), []).append(
@@ -551,6 +606,7 @@ class Reporter:
                         f"{order} — counting it would double the quantity")
                     self._seen.add(k)   # do not re-test it on every pass
                     return False
+            self._stamp_marks(record)
             if self._append([record]):
                 self._seen.add(k)
                 self._note_order_fill(record)
@@ -558,11 +614,17 @@ class Reporter:
             return False
 
     def record_funding(self, record: dict) -> bool:
-        """Append one funding settlement (:func:`funding_record`). Unlike a
-        fill these carry no venue id to dedupe on — the engine writes one
-        only when a period has demonstrably rolled, so each is already
-        unique."""
+        """Append one funding settlement (:func:`funding_record`); True when
+        it was new. One read from the venue's payment history carries an
+        ``id`` and is skipped when already on file (the history is re-read
+        with an overlap); one recognised from the accrual has none — the
+        engine writes it only when a period has demonstrably rolled."""
         with self._lock:
+            if record.get("id"):
+                key = (str(record.get("venue")), str(record["id"]))
+                if key in self._seen:
+                    return False
+                self._seen.add(key)
             return bool(self._append([record]))
 
     def record_deals(self, records: Iterable[dict]) -> int:
@@ -643,9 +705,25 @@ class Reporter:
         self._bar_minute = m
         if venue_mid is not None:
             self._bar_venue = float(venue_mid)
+            self._mark_venue_t = now
         if mt5_mid is not None:
             self._bar_mt5 = float(mt5_mid)
+            self._mark_mt5_t = now
         self._prune_bars(now)
+
+    def _stamp_marks(self, record: dict, now: Optional[float] = None) -> None:
+        """Both legs' mids on a fill booked live (:data:`MARK_AT_FILL_MAX_S`):
+        what the market was when it filled — the fill's slippage and the
+        mark-to-market an accountant asks for. A leg without a recent mid is
+        left out, never guessed."""
+        now = time.time() if now is None else now
+        ts = _f(record.get("ts"))
+        if ts is None or abs(now - ts) > MARK_AT_FILL_MAX_S:
+            return
+        for key, mid, t in (("mark_venue", self._bar_venue, self._mark_venue_t),
+                            ("mark_mt5", self._bar_mt5, self._mark_mt5_t)):
+            if key not in record and mid is not None and t is not None                     and now - t <= MARK_AT_FILL_MAX_S:
+                record[key] = float(mid)
 
     def _flush_bar(self) -> None:
         if self._bar_minute is None or not self.ok:
@@ -661,6 +739,45 @@ class Reporter:
         # a bar carries the LAST mark of its minute; a leg that did not
         # tick in the next minute keeps its last value (a closed session)
         self._bar_minute = None
+
+    def backfill_bars(self, venue: dict, mt5: dict, now: Optional[float] = None) -> int:
+        """History for the minutes ``bars.jsonl`` does not hold yet: ``venue``
+        / ``mt5`` are ``{minute UTC: close}`` (either may be empty — a leg
+        whose gateway serves no history). Only COMPLETE minutes inside the
+        retention and not already on file are written, appended with
+        ``"src": "history"`` (the reader sorts by time); the forming minute
+        is left to :meth:`mark`. Returns how many bars were added.
+
+        This is what lets a chart reach back before the bot's first bar: the
+        bot reads the history through its gateways at startup, so the
+        control panel needs no terminal or venue connection of its own."""
+        if not self.ok:
+            return 0
+        now = time.time() if now is None else now
+        floor, current = now - self.bars_keep_s, minute(now)
+        have = {minute(float(r["ts"])) for r in read_jsonl(self.bars_file)
+                if _f(r.get("ts")) is not None}
+        if self._bar_minute is not None:
+            have.add(self._bar_minute)
+        rows = []
+        for ts in sorted(set(venue) | set(mt5)):
+            m = minute(float(ts))
+            if m in have or m >= current or m < floor:
+                continue
+            v, x = _f(venue.get(ts)), _f(mt5.get(ts))
+            if v is None and x is None:
+                continue
+            rows.append({"ts": m, "venue": v, "mt5": x, "src": "history"})
+            have.add(m)
+        if not rows:
+            return 0
+        try:
+            with self.bars_file.open("a", encoding="utf-8") as fh:
+                fh.write("".join(json.dumps(r) + "\n" for r in rows))
+        except OSError as e:
+            self._warn("bars_io", f"cannot append {self.bars_file.name}: {e}")
+            return 0
+        return len(rows)
 
     def _prune_bars(self, now: float, force: bool = False) -> None:
         if not force and now - self._bars_pruned_t < BARS_PRUNE_EVERY_S:
@@ -713,18 +830,29 @@ class Reporter:
                 "ts": time.time()}
 
     def _fx_rate(self, client, ccy: str) -> Optional[float]:
-        candidates = ([self._fx_symbol] if self._fx_symbol
-                      else [v.format(ccy=ccy) for v in FX_VARIANTS])
-        for sym in candidates:
+        """USD per unit of the account currency: the mid of ``<CCY>USD``
+        (EURUSD, GBPUSD) or, where the broker quotes the pair the other way
+        round, 1 / the mid of ``USD<CCY>`` (USDJPY, USDCHF) — a JPY account
+        used to find no JPYUSD, and its figures went out as if in USD. The
+        symbol that answered is cached, with which way it is quoted."""
+        if self._fx_symbol:
+            candidates = [(self._fx_symbol, self._fx_inverse)]
+        else:
+            candidates = ([(v.format(ccy=ccy), False) for v in FX_VARIANTS]
+                          + [(v.format(ccy=ccy), True) for v in FX_INVERSE_VARIANTS])
+        for sym, inverse in candidates:
             try:
                 t = client.get_ticker(sym)
             except Exception:
                 continue
             if t and t.bid and t.ask:
-                self._fx_symbol = sym
-                return (float(t.bid) + float(t.ask)) / 2.0
-        self._warn("mt5_fx", f"no {ccy}USD quote on the terminal — MT5 figures "
-                             f"stay in {ccy}")
+                mid = (float(t.bid) + float(t.ask)) / 2.0
+                if mid <= 0:
+                    continue
+                self._fx_symbol, self._fx_inverse = sym, inverse
+                return 1.0 / mid if inverse else mid
+        self._warn("mt5_fx", f"no {ccy}USD or USD{ccy} quote on the terminal — MT5 "
+                             f"figures stay in {ccy}")
         return None
 
     @staticmethod
@@ -882,7 +1010,8 @@ class Report:
         seed = (self.seed() or {}).get("venue") or {}
         since = None
         if days:
-            day0 = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+            from . import clock
+            day0 = clock.now().replace(hour=0, minute=0, second=0, microsecond=0)
             since = (day0 - timedelta(days=days - 1)).timestamp()
         return accounting.daily_pnl(self.fills(), self.deals(), magic,
                                     funding=self.funding(), since_ts=since,

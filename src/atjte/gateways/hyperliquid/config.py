@@ -5,6 +5,10 @@
         gateway.env        the signing key and addresses — never anywhere else
         slots.json         client -> slot (the owners the client ids carry)
         gateway_state.json the heartbeat the panel reads (while running)
+        dexes.json         the HIP-3 dexes the venue lists, at the last start (the
+                           panel's gateway form offers them)
+        markets.json       the markets loaded at the last start, its HIP-3 dexes'
+                           included (the panel's New strategy dialog lists them)
         stop.signal        written by the panel to stop it cleanly
         logs/
 
@@ -38,6 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from atjte.gateways import accounts as _A
+
 from atjte.credentials import parse_env_text
 
 CONFIG_NAME = "gateway.json"
@@ -45,6 +51,8 @@ ENV_NAME = "gateway.env"
 STATE_NAME = "gateway_state.json"
 STOP_NAME = "stop.signal"
 SLOTS_NAME = "slots.json"
+DEXES_NAME = "dexes.json"
+MARKETS_NAME = "markets.json"
 LOG_DIR_NAME = "logs"
 DEFAULT_LISTEN_PORT = 5610
 #: a testnet gateway listens beside the mainnet one by default
@@ -55,6 +63,7 @@ NETWORKS = ("mainnet", "testnet")
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "accounts", "dexes",
           "msgs_per_min", "max_inflight", "account_dms_s", "clients", "_comment"}
+_KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 
 
 class ConfigError(ValueError):
@@ -75,6 +84,9 @@ class GatewayConfig:
     max_inflight: int = 90
     account_dms_s: float = 60.0
     clients: list = field(default_factory=list)
+    #: account_state.json (:mod:`atjte.gateways.accounts`)
+    publish_accounts: bool = True
+    accounts_every_s: float = _A.EVERY_S
     private_key: str = ""
     wallet_address: str = ""
     sub_accounts: dict = field(default_factory=dict)     # account -> address
@@ -171,6 +183,7 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         max_inflight=int(raw.get("max_inflight") or 90),
         account_dms_s=float(raw.get("account_dms_s", 60.0)),
         clients=[str(c) for c in (raw.get("clients") or [])])
+    cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
         env = {k.lower(): v for k, v in parse_env_text(envp.read_text(encoding="utf-8")).items()}
@@ -205,3 +218,62 @@ def scaffold(name: str, network: str = "mainnet") -> Path:
         raw["dexes"] = []
     p.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
     return d
+
+
+# ── the operator's "Buy requests" (reserveRequestWeight) ─────────────────────
+#: the request file the panel drops and the RUNNING daemon picks up — the
+#: daemon is the only process that signs (one nonce stream per key), so the
+#: panel never signs anything itself
+RESERVE_NAME = "reserve.request"
+#: a request older than this is discarded unread: a click made while the
+#: gateway was down must not spend money whenever it next starts
+RESERVE_MAX_AGE_S = 60.0
+
+
+def write_reserve_request(folder: Path, account: str, weight: int, req_id: str, *,
+                          confirmed: bool, cost_usdc: float,
+                          now: Optional[float] = None) -> Path:
+    """Ask the running gateway in ``folder`` to buy ``weight`` requests for
+    ``account`` — ONLY from the operator's confirmation of the cost pop-up
+    (``confirmed`` and the ``cost_usdc`` they were shown). No bot, no timer
+    and no automatic top-up ever writes this; the gateway re-checks all of it
+    before it spends."""
+    if not confirmed:
+        raise ValueError("a request purchase needs the operator's confirmation")
+    import time as _time
+    p = Path(folder) / RESERVE_NAME
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"id": str(req_id), "account": str(account),
+                               "weight": int(weight), "confirmed": True,
+                               "cost_usdc": float(cost_usdc),
+                               "t": _time.time() if now is None else now}),
+                   encoding="utf-8")
+    tmp.replace(p)
+    return p
+
+
+def take_reserve_request(folder: Path, now: Optional[float] = None) -> Optional[dict]:
+    """The pending request, consumed (the file removed first, so one click
+    is one purchase), or None. A stale or malformed one is dropped and
+    returned with ``stale`` / ``error`` set, so the daemon can say so."""
+    import time as _time
+    p = Path(folder) / RESERVE_NAME
+    if not p.exists():
+        return None
+    try:
+        text = p.read_text(encoding="utf-8")
+        p.unlink()
+    except OSError:
+        return None                         # being written: next second
+    try:
+        req = json.loads(text)
+        req = {"id": str(req.get("id") or ""), "account": str(req.get("account") or ""),
+               "weight": int(req.get("weight")), "t": float(req.get("t")),
+               "confirmed": req.get("confirmed") is True,
+               "cost_usdc": float(req.get("cost_usdc"))}
+    except (ValueError, TypeError, AttributeError):
+        return {"id": "", "error": "malformed request file"}
+    age = (_time.time() if now is None else now) - req["t"]
+    if age > RESERVE_MAX_AGE_S:
+        req["stale"] = age
+    return req

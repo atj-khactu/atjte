@@ -63,10 +63,10 @@ def by_key(orders):
 
 
 class GridWiringTest(unittest.TestCase):
-    GEOMETRY = {"GRID_STEP_USD": 1.0, "GRID_LEVELS": 3, "GRID_LEVEL_UNITS": 1.0,
-                "GRID_CENTER_USD": 0.0, "GRID_SHORT": True,
+    GEOMETRY = {"GRID_STEP": 1.0, "GRID_LEVELS": 3, "GRID_LEVEL_UNITS": 1.0,
+                "GRID_CENTER": 0.0, "GRID_SHORT": True,
                 "MAX_POSITION_UNITS": 3.0, "MAX_SHORT_EFFECTIVE": 3.0,
-                "GRID_TAKE_PROFIT_USD": None, "TAKE_PROFIT_EFFECTIVE": 1.0,
+                "GRID_TAKE_PROFIT": None, "TAKE_PROFIT_EFFECTIVE": 1.0,
                 "ORDER_VOLUME_EFFECTIVE": 1.0}
 
     def setUp(self):
@@ -155,9 +155,9 @@ class GridWiringTest(unittest.TestCase):
         self.assertEqual(make_bot(0.0)._clip_units(), 2.0)
 
     def test_take_profit_setting_moves_every_exit(self):
-        # GRID_TAKE_PROFIT_USD = 2 with a 1 USD step: unit #k of the long,
+        # GRID_TAKE_PROFIT = 2 with a 1 USD step: unit #k of the long,
         # bought at −k, sells at −k + 2; the short mirror covers at +k − 2
-        grid_bot.GRID_TAKE_PROFIT_USD = grid_bot.TAKE_PROFIT_EFFECTIVE = 2.0
+        grid_bot.GRID_TAKE_PROFIT = grid_bot.TAKE_PROFIT_EFFECTIVE = 2.0
         d = by_key(make_bot(2.0)._desired_orders())
         self.assertEqual(set(d), {"grid-exit-L2", "grid-entry-L3"})
         self.assertAlmostEqual(d["grid-exit-L2"].level, 0.0)    # bought at −2

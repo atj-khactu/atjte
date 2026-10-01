@@ -75,6 +75,7 @@ import ccxt.pro as ccxtpro
 
 from atjte import venues as _venues
 from atjte.clients.base import OrderSide, Ticker, Trade, ms_to_dt
+from atjte.reporting import venue_realized_pnl
 
 RECONNECT_DELAY_S = 2.0
 PRIVATE_RETRY_MAX_S = 60.0   # private failures back off (a key without the ws
@@ -139,6 +140,9 @@ _NEXT_FUNDING_KEYS = ("next_funding_rate_time", "nextFundingTime",
                       "fundingTimestamp", "nextFundingTimestamp")
 _MARK_KEYS = ("markPrice", "mark_price", "markPx")
 _INDEX_KEYS = ("index", "indexPrice", "index_price", "idxPx")
+#: the venue's ORACLE price (Hyperliquid's ``oraclePx``, measured 2026-09-30 on
+#: the websocket ticker of xyz:EUR) — the ORACLE_BASIS_FILTER's input
+_ORACLE_KEYS = ("oraclePx", "oracle_price", "oraclePrice")
 #: best bid / ask under the venue's own names, where CCXT's unified ticker
 #: leaves them empty — Lighter's ``market_stats`` (measured 2026-09-15:
 #: ``best_bid_price`` / ``best_ask_price``, unified ``bid``/``ask`` None)
@@ -149,6 +153,10 @@ _ASK_KEYS = ("ask", "best_ask_price")
 #: ``fetch_funding_rate`` reports as 9.6e-05 per 8 h) — scaled to the
 #: relative fraction every other venue gives
 _FUNDING_IN_PERCENT = {"lighter"}
+#: funding keys only one venue uses, too generic to try on every venue:
+#: Hyperliquid's asset context (the ticker's ``info``) carries the current
+#: rate as ``funding`` — RELATIVE, per hour (e.g. "0.0000125" = 0.00125 %/h)
+_VENUE_FUNDING_KEYS = {"hyperliquid": ("funding",)}
 #: own-fill channels on venues that frame messages as
 #: ``{"type": "subscribed/<channel>" | "update/<channel>", "channel": ...}``
 #: (Lighter, measured 2026-09-15)
@@ -173,6 +181,8 @@ def _funding(exchange_id: str, info: dict) -> dict:
     rate where it has one. A venue stating the relative rate in percent
     (:data:`_FUNDING_IN_PERCENT`) is scaled here."""
     rate, pred = _pick(info, _FUNDING_KEYS), _pick(info, _FUNDING_PRED_KEYS)
+    if rate is None and exchange_id in _VENUE_FUNDING_KEYS:
+        rate = _pick(info, _VENUE_FUNDING_KEYS[exchange_id])
     if exchange_id in _FUNDING_IN_PERCENT:
         return {"funding_rate": None if rate is None else rate / 100.0,
                 "funding_rate_prediction": None if pred is None else pred / 100.0,
@@ -1068,6 +1078,7 @@ def ticker_from_ccxt(exchange_id: str, symbol: str, t: dict):
     extra = {
         "mark": _pick(info, _MARK_KEYS),
         "index": _pick(info, _INDEX_KEYS),
+        "oracle": _pick(info, _ORACLE_KEYS),
         **_funding(exchange_id, info),
         "next_funding_time_ms": _pick_raw(info, _NEXT_FUNDING_KEYS),
         "bid_size": _f(t.get("bidVolume") or info.get("bid_size")),
@@ -1099,10 +1110,11 @@ def trade_from_ccxt(exchange_id: str, symbol: str, t: dict) -> Optional[Trade]:
         fee=float(fee["cost"]) if fee.get("cost") is not None else None,
         fee_currency=fee.get("currency"),
         # the venue's OWN realized PnL for this fill where it streams one
-        # (Kraken Futures realized_pnl) — the figure the account was
-        # credited, so the report can use it instead of replaying an average
-        # cost whose opening basis it has to guess
-        realized_pnl=_opt_f((t.get("info") or {}).get("realized_pnl")),
+        # (Kraken Futures realized_pnl, Hyperliquid closedPnl — both before
+        # fees) — the figure the account was credited, so the report can use
+        # it instead of replaying an average cost whose opening basis it has
+        # to guess
+        realized_pnl=venue_realized_pnl(t.get("info")),
         # the venue's OWN maker/taker classification. A post-only strategy
         # cannot verify it is actually resting without this: the fee rate
         # alone moves with the volume tier too, so the two are not separable

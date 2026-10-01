@@ -96,7 +96,18 @@ def main(argv=None) -> int:
                     allowed_clients=set(cfg.clients),
                     tick_poll_s=cfg.tick_poll_ms / 1000.0, log=log)
     gw._backend("get_account")
+    try:
+        write_state(cfg.dir / C.SYMBOLS_NAME,
+                    {"t": time.time(), "symbols": gw._backend("symbol_names")})
+    except Exception as e:          # the dialog then asks for a typed symbol
+        log(f"{cfg.name}: could not write {C.SYMBOLS_NAME}: {type(e).__name__}: {e}")
+    gw.quote_request = cfg.dir / C.QUOTES_REQUEST_NAME
     gw.start()
+    from atjte.gateways.accounts import AccountPublisher
+    accounts = AccountPublisher(cfg.dir, gw.account_snapshot, name=cfg.name, venue="mt5",
+                                every_s=cfg.accounts_every_s,
+                                enabled=cfg.publish_accounts, log=log)
+    accounts.start()
     if not cfg.token:
         log("WARNING: no mt5_gateway_token — any process on this machine can attach")
     state = cfg.dir / C.STATE_NAME
@@ -107,11 +118,13 @@ def main(argv=None) -> int:
             write_state(state, {"name": cfg.name, "pid": os.getpid(), "t": time.time(),
                                 "dialect": "mt5", "venue": "mt5", "listen_port": gw.port,
                                 "clients_allowed": list(cfg.clients),
-                                "token_set": bool(cfg.token), **s})
+                                "token_set": bool(cfg.token),
+                                "publish_accounts": cfg.publish_accounts, **s})
             if stop_requested(cfg.dir):
                 log(f"{cfg.name}: stop signal — shutting down cleanly")
                 break
     finally:
+        accounts.stop()
         gw.stop()
         try:
             backend.disconnect()

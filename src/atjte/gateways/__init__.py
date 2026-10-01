@@ -9,6 +9,8 @@ the platform connection and leases it to the bots over a loopback socket:
 - :mod:`atjte.gateways.lighter` — Lighter (one signer and nonce per API key);
 - :mod:`atjte.gateways.ccxt` — any other CCXT venue (Coinbase, Binance,
   Kraken spot over REST/ws): one CCXT Pro instance per account;
+- :mod:`atjte.gateways.ibkr` — Interactive Brokers through TWS / IB Gateway
+  (one API session per login; the login itself stays in TWS);
 - :mod:`atjte.gateways.mt5` — one MetaTrader 5 terminal.
 
 The bot side of each is a connector in :mod:`atjte.clients.gateway`.
@@ -24,7 +26,7 @@ import os
 from pathlib import Path
 
 #: the gateway kinds, = the folder names under ``gateways/`` and ``templates/``
-KINDS = ("fix", "hyperliquid", "lighter", "ccxt", "mt5")
+KINDS = ("fix", "hyperliquid", "lighter", "ccxt", "ibkr", "mt5")
 
 #: overrides where the instances live (tests, a standalone gateway host)
 ENV_DIR = "ATJTE_GATEWAYS_DIR"

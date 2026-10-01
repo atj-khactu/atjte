@@ -1,0 +1,17 @@
+{
+  "_comment": "An IBKR gateway: one process per TWS / IB Gateway login owns the API session (host:port, one client_id), the orders and the market data; the bots lease it. 'network' names which login this is — paper (DU… accounts) or live — and the gateway refuses an account id of the other kind. 'contracts' are what to list: every expiry TWS returns for a spec becomes a market (MGC/USD:USD-261229). Account 'main' takes the bare ibkr_account in gateway.env, any other name ibkr_account_<name>.",
+  "name": "ib_paper",
+  "venue": "ibkr",
+  "network": "paper",
+  "listen_port": 5661,
+  "host": "127.0.0.1",
+  "port": 7497,
+  "client_id": 7,
+  "accounts": ["main"],
+  "contracts": [
+    {"symbol": "MGC", "exchange": "COMEX", "currency": "USD", "sec_type": "FUT"}
+  ],
+  "msgs_per_min": 2400,
+  "max_inflight": 20,
+  "clients": []
+}

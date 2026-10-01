@@ -34,6 +34,7 @@ import ccxt.pro as ccxtpro
 WS_URL_KEY = "public"          # Hyperliquid has ONE ws url for both
 ORDER_TIMEOUT_S = 10.0
 READ_TIMEOUT_S = 15.0
+UNIFIED_TTL_S = 3600.0          # an account's margin mode, re-asked hourly
 #: Hyperliquid's scheduleCancel must be at least this far ahead
 MIN_SCHEDULE_MS = 5_000
 
@@ -82,6 +83,9 @@ class HyperliquidUpstream:
         # which markets to load: the HIP-3 dexes the clients will trade (a
         # machine's gateway serves many symbols, so this is the configured
         # list, not one symbol's scope — see atjte.venues.market_scope_options)
+        #: the HIP-3 dexes loaded: each keeps its positions and orders in its
+        #: own clearinghouse (the account snapshot reads every one)
+        self.dexes = list(dexes or [])
         types = ["spot", "swap"] + (["hip3"] if dexes else [])
         self._options = {"fetchMarkets": {"types": types,
                                           "hip3": {"dexes": list(dexes or [])}}}
@@ -93,6 +97,8 @@ class HyperliquidUpstream:
         self._tasks: dict[str, asyncio.Task] = {}
         self._acked: dict[str, float] = {}           # address -> ack time
         self._seen_fills: dict[str, set] = {a: set() for a in accounts}
+        #: account -> (looked up at, unified?) — see :meth:`_unified_margin`
+        self._unified: dict[str, tuple[float, bool]] = {}
         self._t0_ms = int(time.time() * 1000)
         self.last_error = ""
         self.counters = {"tickers": 0, "fills": 0, "orders": 0, "errors": 0,
@@ -347,6 +353,26 @@ class HyperliquidUpstream:
                                                     self._vault(account)), ORDER_TIMEOUT_S)
         return _jsonable(out or [{"id": i, "status": "canceled"} for i in order_ids])
 
+    def set_leverage(self, account: str, symbol: str, leverage: int, mode: str) -> Any:
+        """``updateLeverage`` for ``symbol`` on ``account``: ``leverage`` x,
+        ``mode`` 'isolated' or 'cross'. Hyperliquid refuses a mode switch
+        while a position is open; the refusal is raised to the caller."""
+        self.counters["posts"] += 1
+        out = self._call(self.priv.set_leverage(
+            int(leverage), symbol, {**self._vault(account), "marginMode": mode}),
+            ORDER_TIMEOUT_S)
+        return _jsonable(out) or {"status": "ok"}
+
+    def set_leverage(self, account: str, symbol: str, leverage: int, mode: str) -> Any:
+        """``updateLeverage`` for ``symbol`` on ``account``: ``leverage`` x,
+        ``mode`` 'isolated' or 'cross'. Hyperliquid refuses a mode switch
+        while a position is open; the refusal is raised to the caller."""
+        self.counters["posts"] += 1
+        out = self._call(self.priv.set_leverage(
+            int(leverage), symbol, {**self._vault(account), "marginMode": mode}),
+            ORDER_TIMEOUT_S)
+        return _jsonable(out) or {"status": "ok"}
+
     def schedule_cancel(self, account: str, when_ms: Optional[int]) -> None:
         """Arm the account's venue-side cancel-all at ``when_ms`` (absolute),
         or disarm it (None). CCXT takes it relative, from its nonce."""
@@ -355,11 +381,89 @@ class HyperliquidUpstream:
         self._call(self.priv.cancel_all_orders_after(timeout, self._vault(account)),
                    ORDER_TIMEOUT_S)
 
+    # ── the address-based request quota ──────────────────────────────────────
+    def rate_limit(self, account: str) -> dict:
+        """The account's cumulative request quota (``userRateLimit``): 10,000
+        requests + 1 per USDC ever traded + whatever was reserved; past the
+        cap an address may send one action every 10 s. An info request: it
+        costs IP weight, not the account's quota."""
+        self.counters["reads"] += 1
+        r = self._call(self.priv.publicPostInfo(
+            {"type": "userRateLimit", "user": self.address(account)}), READ_TIMEOUT_S) or {}
+        return {"used": int(r.get("nRequestsUsed") or 0),
+                "cap": int(r.get("nRequestsCap") or 0),
+                "surplus": int(r.get("nRequestsSurplus") or 0),
+                "cum_vlm": float(r.get("cumVlm") or 0.0)}
+
+    def reserve_request_weight(self, account: str, weight: int) -> dict:
+        """Buy ``weight`` more requests for ``account`` (``reserveRequestWeight``,
+        0.0005 USDC each, paid from the SIGNER's perps balance). The action
+        takes no ``vaultAddress``: a sub-account is named as its
+        ``destination`` — the main account pays, the sub gets the requests.
+        CCXT's own ``reserve_request_weight`` has no destination, hence this."""
+        x = self.priv
+        action: dict = {"type": "reserveRequestWeight", "weight": int(weight)}
+        dest = self._vault(account).get("vaultAddress")
+        if dest:
+            action["destination"] = dest.lower()
+
+        async def go():
+            nonce = x.incrementing_nonce()
+            sig = x.sign_l1_action(action, nonce)
+            return await x.privatePostExchange({"action": action, "nonce": nonce,
+                                                "signature": sig})
+        self.counters["posts"] += 1
+        r = _jsonable(self._call(go(), ORDER_TIMEOUT_S)) or {}
+        if str(r.get("status") or "") != "ok":
+            raise RuntimeError(f"reserveRequestWeight refused: {r}")
+        return r
+
+    def market_rows(self) -> list[dict]:
+        """The markets this gateway loaded — spot, perps and its HIP-3 dexes'
+        — flat, for the gateway folder's ``markets.json`` (the panel's New
+        strategy dialog lists them: the panel holds no venue connection).
+        ``venue_name`` is the venue's own name of a HIP-3 market (``xyz:EUR``,
+        CCXT's ``XYZ-EUR/USDC:USDC``)."""
+        rows = []
+        for m in (getattr(self.pub, "markets", None) or {}).values():
+            kind = m.get("type") or ("swap" if m.get("swap") else
+                                     "spot" if m.get("spot") else "other")
+            if kind not in ("spot", "swap") or m.get("active") is False:
+                continue
+            name = str(m.get("baseName") or "")
+            rows.append({"symbol": m.get("symbol") or "", "base": m.get("base") or "",
+                         "quote": m.get("quote") or "", "kind": kind, "active": True,
+                         "contract_size": float(m.get("contractSize") or 1.0),
+                         "venue_name": name if ":" in name else ""})
+        return rows
+
     # ── reads (REST, per account) ────────────────────────────────────────────
     def markets(self, symbol: str = "") -> dict:
         """The market list, for a bot's local CCXT instance (no connection)."""
         from ..common import markets_payload
         return markets_payload(self.pub, symbol)
+
+    def _unified_margin(self, account: str) -> Optional[bool]:
+        """Whether ``account`` is a Hyperliquid unified account, looked up
+        once per UNIFIED_TTL_S. CCXT's ``fetch_balance`` asks the venue
+        (``userAbstraction``) on EVERY call that names a ``user`` — which
+        every gateway read does — unless ``enableUnifiedMargin`` is passed:
+        a second, serial round trip per balance read. Measured 2026-09-28 on
+        a HIP-3 sub-account: ~1.7 s per balance read, paid on every bot
+        startup and before every entry. None (the lookup failed) is not
+        kept: the next read asks again, and CCXT then decides as before."""
+        hit = self._unified.get(account)
+        if hit is not None and time.time() - hit[0] < UNIFIED_TTL_S:
+            return hit[1]
+        try:
+            flag, _ = self._call(self.priv.is_unified_enabled(
+                "fetchBalance", self.address(account), True, {}), READ_TIMEOUT_S)
+        except Exception:                                   # noqa: BLE001
+            return None
+        if flag is None:
+            return None
+        self._unified[account] = (time.time(), bool(flag))
+        return bool(flag)
 
     def read(self, account: str, what: str, args: dict) -> Any:
         a = dict(args or {})
@@ -367,6 +471,10 @@ class HyperliquidUpstream:
         fn = getattr(self.priv, what)
         self.counters["reads"] += 1
         if what == "fetch_balance":
+            if "enableUnifiedMargin" not in params:
+                unified = self._unified_margin(account)
+                if unified is not None:
+                    params["enableUnifiedMargin"] = unified
             coro = fn(params)
         elif what == "fetch_positions":
             coro = fn(a.get("symbols"), params)
@@ -374,6 +482,11 @@ class HyperliquidUpstream:
             coro = fn(a.get("symbol"), a.get("since"), a.get("limit"), params)
         elif what == "fetch_order":
             coro = fn(a.get("id"), a.get("symbol"), params)
+        elif what == "fetch_ohlcv":             # public: no account in it
+            coro = fn(a.get("symbol"), a.get("timeframe") or "1m", a.get("since"),
+                      a.get("limit"), {})
+        elif what == "fetch_funding_history":   # this account's payments
+            coro = fn(a.get("symbol"), a.get("since"), a.get("limit"), params)
         else:
             raise ValueError(f"unknown read {what!r}")
         return _jsonable(self._call(coro, READ_TIMEOUT_S))

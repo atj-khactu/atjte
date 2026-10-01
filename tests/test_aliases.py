@@ -44,7 +44,8 @@ class CanonicaliseTest(unittest.TestCase):
         for legacy, canon in A.LEGACY_TO_CANONICAL.items():
             self.assertNotEqual(legacy, canon)
             self.assertEqual(A.canonical(legacy), canon)
-        self.assertEqual(A.canonical("GRID_STEP_USD"), "GRID_STEP_USD")
+        self.assertEqual(A.canonical("GRID_LEVELS"), "GRID_LEVELS")       # canonical: itself
+        self.assertEqual(A.canonical("GRID_STEP_USD"), "GRID_STEP")         # the unit left the name
 
 
 class IdentityDefaultsTest(unittest.TestCase):
@@ -85,7 +86,7 @@ class RenameLinesTest(unittest.TestCase):
            "SYMBOL_KRAKEN = 'XAUT/USD:USD'   # the perp\n"
            "GRID_UNIT_OZ = 1.0\n"
            "    GRID_UNIT_OZ = 2.0  # indented: not a top-level setting\n"
-           "GRID_STEP_USD = 1.0\n")
+           "GRID_LEVELS = 3\n")
 
     def test_top_level_legacy_assignments_are_renamed_in_place(self):
         text, renamed = A.rename_lines(self.SRC)
@@ -93,7 +94,7 @@ class RenameLinesTest(unittest.TestCase):
         self.assertIn("SYMBOL_VENUE = 'XAUT/USD:USD'   # the perp\n", text)
         self.assertIn("GRID_LEVEL_UNITS = 1.0\n", text)
         self.assertIn("    GRID_UNIT_OZ = 2.0", text)       # untouched
-        self.assertIn("GRID_STEP_USD = 1.0", text)
+        self.assertIn("GRID_LEVELS = 3", text)            # canonical: untouched
 
     def test_names_can_be_limited(self):
         text, renamed = A.rename_lines(self.SRC, names=["GRID_UNIT_OZ"])

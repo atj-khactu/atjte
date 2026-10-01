@@ -14,11 +14,11 @@ from atjte.literals import read_literal, read_literals
 SRC = '''"""doc"""
 # a comment
 LIVE_TRADING = False   # master switch
-GRID_STEP_USD = 1.0
+GRID_STEP = 1.0
 NAME = 'abc'
 LEVELS = [1, 2,
           3]
-ALIAS = GRID_STEP_USD
+ALIAS = GRID_STEP
 _private = 1
 X: int = 5
 '''

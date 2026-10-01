@@ -56,8 +56,10 @@ class TestTypes(unittest.TestCase):
     def test_listing(self):
         types = T.strategy_types()
         self.assertEqual(set(types), {"grid", "bollinger", "spot_grid", "spot_bollinger",
-                                      "ccxt_grid", "ccxt_bollinger", "ccxt_fixed",
-                                      "ccxt_fixed_entry_exit"})
+                                      "ccxt_grid", "ccxt_grid_futures", "ccxt_bollinger",
+                                      "ccxt_fixed", "ccxt_fixed_entry_exit"})
+        self.assertEqual(types["ccxt_grid_futures"]["kind"], "grid_futures")
+        self.assertIn("Grid-futures", types["ccxt_grid_futures"]["label"])
         self.assertEqual(types["ccxt_fixed"]["engine"], "ccxt")
         self.assertEqual(types["ccxt_fixed"]["kind"], "fixed")
         self.assertEqual(types["ccxt_fixed_entry_exit"]["kind"], "fixed_entry_exit")
@@ -66,7 +68,8 @@ class TestTypes(unittest.TestCase):
         self.assertIn("Fixed entry / exit", types["ccxt_fixed_entry_exit"]["label"])
         self.assertIn("(ccxt)", types["ccxt_grid"]["label"])
         self.assertEqual(set(T.strategy_types(engine="ccxt")),
-                         {"ccxt_grid", "ccxt_bollinger", "ccxt_fixed", "ccxt_fixed_entry_exit"})
+                         {"ccxt_grid", "ccxt_grid_futures", "ccxt_bollinger", "ccxt_fixed",
+                          "ccxt_fixed_entry_exit"})
         self.assertEqual(types["grid"]["dir"], "grid_bot")
         self.assertEqual(types["grid"]["entry"], "grid_bot.py")
         self.assertEqual(types["grid"]["engine"], "perp")

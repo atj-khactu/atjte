@@ -23,7 +23,6 @@ A ``fill`` here is a dict with ``ts`` (epoch seconds, UTC), ``side``
 """
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Iterable, Optional
 
 EPS = 1e-9
@@ -122,9 +121,11 @@ def hedge_executions(deals: Iterable[dict], magic: Optional[int]) -> list[dict]:
 
 
 def local_date(ts: float) -> str:
-    """``YYYY-MM-DD`` of ``ts`` in the machine's local time zone — the
-    operator's day, the same boundary the control panel uses."""
-    return datetime.fromtimestamp(float(ts)).astimezone().strftime("%Y-%m-%d")
+    """``YYYY-MM-DD`` of ``ts`` in ACP's timezone (:mod:`atjte.clock`; unset =
+    the machine's) — the operator's day, the boundary the panel and the bots'
+    risk day use."""
+    from . import clock
+    return clock.day_key(float(ts))
 
 
 def inferred_fill(f: dict) -> bool:

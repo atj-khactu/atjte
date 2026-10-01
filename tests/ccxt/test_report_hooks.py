@@ -5,6 +5,7 @@ report phase writes a snapshot with the engine's real attribute names."""
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import tempfile
 import time
@@ -79,16 +80,27 @@ class ReportHooksTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
 
+    @staticmethod
+    def _ws(bot, tid, amount, fee=0.1):
+        """One ws fill through the engine's real handler (the hedge stubbed)."""
+        bot._hedge = lambda: None
+        bot.dump_state = lambda: None
+        bot.fill_q = queue.Queue()
+        bot.counters.setdefault("fill_events", 0)
+        bot.venue = types.SimpleNamespace(to_units=lambda a: a)
+        bot._started_utc = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        bot._process_fill_events(Trade(
+            exchange=pb.EXCHANGE_ID, trade_id=tid, symbol=pb.SYMBOL_VENUE,
+            side=OrderSide.SELL, amount=amount, price=4450.0, order_id="o1", fee=fee,
+            fee_currency="USD", realized_pnl=0.0,
+            timestamp=datetime(2027, 1, 1, tzinfo=timezone.utc)))
+
     def test_booked_fill_is_recorded_once(self):
         bot = bot_with_reporter(self.tmp)
         rec = T.resting(amount=1.0)
         bot.orders[rec.key] = rec
-        tr = Trade(exchange=pb.EXCHANGE_ID, trade_id="t-1", symbol=pb.SYMBOL_VENUE,
-                   side=OrderSide.SELL, amount=0.4, price=4450.0, order_id="o1", fee=0.1,
-                   fee_currency="USD",
-                   timestamp=datetime(2027, 1, 1, tzinfo=timezone.utc))
-        rec.ws_cum = 0.4
-        bot._book(rec, source="ws", trade=tr)
+        self._ws(bot, "t-1", 0.4)
+        self._ws(bot, "t-1", 0.4)              # a ws replay: not recorded twice
         rec.rest_cum = 0.4
         bot._book(rec, source="poll")          # nothing new to book: no record
         rec.rest_cum = 1.0
@@ -102,6 +114,37 @@ class ReportHooksTest(unittest.TestCase):
         self.assertEqual(rows[1]["source"], "poll")
         self.assertAlmostEqual(rows[1]["amount"], 0.6)
         self.assertEqual(rows[1]["id"], "o1:poll:1.00000000")
+
+    def test_a_venue_trade_after_an_inference_keeps_its_own_size(self):
+        """The poll inferred 0.6 of the order; the venue's trade for all 1.0
+        arrives after. The replay skips the inferred record, so the venue's
+        must be the whole 1.0 -- recorded as the 0.4 left to book, USDJPY
+        lost 89 units and booked phantom PnL."""
+        bot = bot_with_reporter(self.tmp)
+        rec = T.resting(amount=1.0)
+        bot.orders[rec.key] = rec
+        rec.rest_cum = 0.6
+        bot._book(rec, source="poll")
+        self._ws(bot, "t-9", 1.0)
+        rows = R.read_jsonl(bot.reporter.trades_file)
+        self.assertEqual([(r["id"], r["amount"], bool(r.get("inferred"))) for r in rows],
+                         [("o1:poll:0.60000000", 0.6, True), ("t-9", 1.0, False)])
+        self.assertAlmostEqual(bot.pos_units, -1.0)          # the position: once
+
+    def test_a_venue_trade_for_a_settled_order_is_recorded(self):
+        """The cancel found the order gone and settled it by inference; its
+        trade arrives after the order was retired."""
+        bot = bot_with_reporter(self.tmp)
+        rec = T.resting(amount=1.0)
+        bot.orders[rec.key] = rec
+        rec.rest_cum = 1.0
+        bot._book(rec, source="place")
+        bot._drop_rec(rec.key)
+        self._ws(bot, "t-7", 1.0)
+        rows = [r for r in R.read_jsonl(bot.reporter.trades_file) if not r.get("inferred")]
+        self.assertEqual([(r["id"], r["side"], r["amount"], r["order"]) for r in rows],
+                         [("t-7", "sell", 1.0, "o1")])
+        self.assertAlmostEqual(bot.pos_units, -1.0)          # not booked again
 
     def test_report_phase_writes_seed_deals_and_snapshot(self):
         bot = bot_with_reporter(self.tmp)

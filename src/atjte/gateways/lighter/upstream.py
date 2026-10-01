@@ -420,6 +420,9 @@ class LighterUpstream:
             coro = fn(a.get("symbols"), params)
         elif what in ("fetch_open_orders", "fetch_closed_orders", "fetch_my_trades"):
             coro = fn(a.get("symbol"), a.get("since"), a.get("limit"), params)
+        elif what == "fetch_ohlcv":             # public: no account in it
+            coro = fn(a.get("symbol"), a.get("timeframe") or "1m", a.get("since"),
+                      a.get("limit"), {})
         else:
             raise ValueError(f"unknown read {what!r}")
         out = _jsonable(self._call(coro, READ_TIMEOUT_S))

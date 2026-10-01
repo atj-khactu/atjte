@@ -36,10 +36,12 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator, Optional
 
-#: One line may not exceed this. A bot's order is a few hundred bytes; a
-#: megabyte of it is a bug or an attack, and either way the connection should
-#: die rather than the process grow.
-MAX_LINE = 1 << 20
+#: One line may not exceed this. A bot's order is a few hundred bytes, but
+#: the markets read carries a venue's whole market list (Kraken spot ~1 MB
+#: slimmed, Binance ~3.4 MB): the line still has a ceiling, so a runaway peer
+#: kills the connection rather than growing the process, but it sits above
+#: what a real market list needs.
+MAX_LINE = 8 << 20
 
 ENCODING = "utf-8"
 

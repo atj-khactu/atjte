@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from atjte.gateways import accounts as _A
+
 from atjte import credentials as _creds
 from atjte import venues as _venues
 from atjte.fix import kraken as K
@@ -93,6 +95,9 @@ class GatewayConfig:
     #: the token. An allowlist is what stops a misconfigured bot reaching the
     #: wrong ACCOUNT, which a shared token alone cannot.
     clients: list[str] = field(default_factory=list)
+    #: account_state.json (:mod:`atjte.gateways.accounts`)
+    publish_accounts: bool = True
+    accounts_every_s: float = _A.EVERY_S
     #: a TEST environment's REST endpoint for the account reads (Kraken UAT:
     #: api.uat.kraken.com) — refused on anything that does not look like one
     rest_url: str = ""
@@ -167,6 +172,7 @@ _KNOWN = {
     "symbol_default", "tls_verify", "trace", "clients", "rest_url",
     "_comment",          # the template documents itself in the file
 }
+_KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 
 
 @dataclass(frozen=True)
@@ -400,6 +406,7 @@ def load(path: Path, *, env_file: Optional[Path] = None) -> GatewayConfig:
         rest_source=creds.rest_source,
         rest_url=str(raw.get("rest_url") or "").strip(),
     )
+    cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     if cfg.rest_url:
         from urllib.parse import urlparse
         host = urlparse(cfg.rest_url if "//" in cfg.rest_url

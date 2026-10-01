@@ -425,6 +425,13 @@ class LighterTest(unittest.TestCase):
         kf = VF._funding("krakenfutures", {"relative_funding_rate": 1e-4, "funding_rate": 3.2})
         self.assertEqual((kf["funding_rate"], kf["funding_rate_abs"]), (1e-4, 3.2))
 
+    def test_hyperliquids_funding_is_read_from_its_asset_context(self):
+        ctx = {"funding": "0.0000125", "oraclePx": "1.1702", "markPx": "1.1703"}
+        got = VF._funding("hyperliquid", ctx)
+        self.assertAlmostEqual(got["funding_rate"], 1.25e-05)       # relative, per hour
+        # the generic key is Hyperliquid's alone: another venue ignores it
+        self.assertIsNone(VF._funding("krakenfutures", ctx)["funding_rate"])
+
     def test_the_private_client_is_found_once_the_watch_has_connected(self):
         f = self.lighter()
 

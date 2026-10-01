@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from atjte.gateways import accounts as _A
+
 from atjte import venues as _venues
 from atjte.credentials import key_names, parse_env_text
 
@@ -63,6 +65,7 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _KNOWN = {"name", "venue", "exchange", "listen_port", "accounts", "order_transport",
           "default_type", "msgs_per_min", "max_inflight", "account_dms_s", "clients",
           "_comment"}
+_KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 
 
 class ConfigError(ValueError):
@@ -82,6 +85,9 @@ class GatewayConfig:
     max_inflight: int = 40
     account_dms_s: float = 60.0
     clients: list = field(default_factory=list)
+    #: account_state.json (:mod:`atjte.gateways.accounts`)
+    publish_accounts: bool = True
+    accounts_every_s: float = _A.EVERY_S
     #: account -> {"apiKey", "secret", "password"} (never logged)
     keys: dict = field(default_factory=dict)
     token: str = ""
@@ -188,6 +194,7 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         max_inflight=int(raw.get("max_inflight") or 40),
         account_dms_s=float(raw.get("account_dms_s", 60.0)),
         clients=[str(c) for c in (raw.get("clients") or [])])
+    cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
         env = {k.lower(): v for k, v in parse_env_text(envp.read_text(encoding="utf-8")).items()}

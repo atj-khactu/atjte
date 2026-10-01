@@ -208,6 +208,11 @@ class MT5GatewayClient:
     def bar_open(self, symbol: str, timeframe: str = "H1"):
         return self._call("bar_open", symbol, timeframe)
 
+    def rates(self, symbol: str, frm, to, timeframe: str = "M1") -> list[dict]:
+        """The terminal's ``timeframe`` bars between ``frm`` and ``to`` (broker
+        clock), through the gateway — :meth:`atjte.clients.mt5.MT5Client.rates`."""
+        return self._call("rates", symbol, frm, to, timeframe)
+
     def place_order(self, symbol: str, side: OrderSide, amount: float,
                     order_type: OrderType = OrderType.MARKET,
                     price: Optional[float] = None, **kwargs: Any):

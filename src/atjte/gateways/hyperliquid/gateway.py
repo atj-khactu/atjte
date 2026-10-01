@@ -25,7 +25,15 @@ What it owns:
 - **the budgets**: every order op draws on one message bucket and one
   in-flight limit for the whole machine;
 - **the reads**: a bot's balance / positions / open-order reads are served
-  from a short per-account cache, invalidated by every order op on it.
+  from a short per-account cache, invalidated by every order op on it;
+- **the request quota** (Hyperliquid's address-based cap, per account): read
+  every minute; once an account is over it — the venue said "Too many
+  cumulative requests", or the read shows used >= cap — new entries are
+  refused HERE (free) instead of at the venue (where every refused retry
+  still counts and keeps the account stuck); cancels go as ever (their cap
+  is higher) and exits at most one per 10 s. Lifted when a read shows room.
+  The operator buys room with :meth:`HlGateway.reserve` (the panel's "Buy
+  requests", through a request file the daemon picks up).
 
 It never decides anything about trading: a bot asks, the gateway checks the
 ask is the bot's to make, sends it, and routes what comes back.
@@ -42,6 +50,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
+from .. import accounts as A
 from ..common import ReadCache
 from . import cloid as C
 from . import protocol as P
@@ -58,6 +67,22 @@ ACCOUNT_DMS_REARM_S = 15.0
 #: scheduled cancel time until enough volume traded", measured 2026-09-25 on
 #: a $1.4k account): such an account is asked again only this often
 ACCOUNT_DMS_RETRY_S = 3600.0
+#: the address-based request quota (Hyperliquid: 10,000 + 1 per USDC ever
+#: traded + what was reserved; past it, ONE action per 10 s): read this often,
+#: and this often while an account is over it
+QUOTA_POLL_S = 60.0
+QUOTA_POLL_OVER_S = 10.0
+#: while over the cap, an exit (reduce-only) goes at most this often per
+#: account — the venue's own trickle; new entries are held at the gateway
+OVER_CAP_EXIT_EVERY_S = 10.0
+#: the venue's words when an action is refused for the quota
+QUOTA_ERROR_TEXT = "too many cumulative requests"
+#: what the operator may buy at once (``reserveRequestWeight``), and its
+#: price as Hyperliquid documents it (paid from the perps balance)
+RESERVE_WEIGHTS = (100, 1000, 10000)
+RESERVE_USDC_PER_REQUEST = 0.0005
+#: one purchase per account per this long — a double click buys once
+RESERVE_COOLDOWN_S = 60.0
 #: what the reads are cached for, per what; order / trade reads are live
 READ_TTL_S = {"fetch_balance": 1.0, "fetch_positions": 1.0,
               "fetch_open_orders": 1.0, "fetch_order": 0.0, "fetch_my_trades": 2.0,
@@ -211,6 +236,13 @@ class HlGateway:
         self._reads = ReadCache(self.READ_TTL_S, clock)
         self._armed: dict[str, float] = {}            # account -> last arm time
         self._dms_refused: dict[str, float] = {}      # account -> when the venue said no
+        #: the request quota, where the upstream can read it (Hyperliquid)
+        self._quota: dict[str, dict] = {}             # account -> last userRateLimit
+        self._quota_t: dict[str, float] = {}          # account -> when last read
+        self._over_cap: dict[str, float] = {}         # account -> since when
+        self._exit_t: dict[str, float] = {}           # account -> last exit sent over it
+        self._reserved_t: dict[str, float] = {}       # account -> last purchase sent
+        self.last_reserve: Optional[dict] = None
 
         self._srv: Optional[socket.socket] = None
         self._stop = threading.Event()
@@ -218,7 +250,8 @@ class HlGateway:
         self.counters = {"clients": 0, "placed": 0, "amended": 0, "cancelled": 0,
                          "reads": 0, "reads_cached": 0, "fills": 0,
                          "fills_unrouted": 0, "tickers": 0, "reaped": 0,
-                         "refused": 0, "adopted": 0, "account_dms_armed": 0}
+                         "refused": 0, "adopted": 0, "account_dms_armed": 0,
+                         "held_over_cap": 0}
         self.up.set_handlers(on_ticker=self._on_ticker, on_fill=self._on_fill,
                              on_order=self._on_order, on_event=self._on_event)
 
@@ -259,8 +292,11 @@ class HlGateway:
         s.listen(64)
         s.settimeout(1.0)
         self._srv, self.port = s, s.getsockname()[1]
-        for target, name in ((self._accept_loop, f"{self.THREAD_PREFIX}-accept"),
-                             (self._reap_loop, f"{self.THREAD_PREFIX}-reap")):
+        loops = [(self._accept_loop, f"{self.THREAD_PREFIX}-accept"),
+                 (self._reap_loop, f"{self.THREAD_PREFIX}-reap")]
+        if self.has_quota:
+            loops.append((self._quota_loop, f"{self.THREAD_PREFIX}-quota"))
+        for target, name in loops:
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
@@ -283,18 +319,25 @@ class HlGateway:
         """Re-attribute what is resting from its client ids: an order this
         gateway placed before a restart is owned again, by the same client,
         and reaped after :data:`ADOPT_GRACE_S` if that client does not come
-        back. Orders without our tag are never touched."""
+        back. Orders without our tag are never touched.
+
+        Every HIP-3 dex is read as well as the main one: each keeps its
+        orders in its own clearinghouse, and a plain read never reaches them
+        — measured 2026-09-30, two xyz orders a restart left owned by nobody
+        (not managed, not reaped, their fills routed to no bot)."""
         now = self._clock()
         for account in self.up.accounts():
-            try:
-                orders = self.up.read(account, "fetch_open_orders", {})
-            except Exception as e:
-                self._log(f"{self.LABEL}: open orders of {account} unreadable at "
-                          f"start ({e}) — nothing adopted there")
-                continue
-            for o in orders or []:
+            orders = []
+            for args in [{}, *self._account_also("fetch_open_orders")]:
+                where = (args.get("params") or {}).get("dex") or "main dex"
+                try:
+                    orders += self.up.read(account, "fetch_open_orders", args) or []
+                except Exception as e:
+                    self._log(f"{self.LABEL}: open orders of {account} ({where}) "
+                              f"unreadable at start ({e}) — nothing adopted there")
+            for o in orders:
                 owner = self.slots.client_of(self._slot_of(o.get("clientOrderId")))
-                if owner is None or not o.get("id"):
+                if owner is None or not o.get("id") or str(o["id"]) in self._owned:
                     continue
                 self._owned[str(o["id"])] = _Owned(
                     owner, account, o.get("symbol") or "", o.get("clientOrderId") or "",
@@ -453,22 +496,68 @@ class HlGateway:
         try:
             if op == P.READ:
                 result = self._read(c, str(msg.get("what") or ""), msg.get("args") or {})
+            elif op == getattr(P, "SET_LEVERAGE", None):
+                result = self._set_leverage(c, msg)
             else:
                 if c.readonly:
                     raise GatewayRefusal(f"{c.name} attached read-only: it places and "
                                          f"cancels nothing", "invalid_order")
-                if not self.session_for(c)["ready"]:
+                # a stream down means quotes come DOWN: new risk (place,
+                # amend) waits for the streams, a cancel never does — it is
+                # exactly what the bot sends when a stream drops, and the
+                # venue takes it without the fills stream (2026-09-29: an XAU
+                # exit rested 15 s through six refused cancels)
+                if op not in (P.CANCEL, P.CANCEL_ALL) and not self.session_for(c)["ready"]:
                     raise GatewayRefusal(self.session_for(c)["reason"], "unavailable")
                 result = self._order_op(c, op, msg)
             self._send(c, P.reply_ok(req, result))
         except GatewayRefusal as e:
             self._send(c, P.reply_err(req, str(e), e.kind))
         except Exception as e:                      # the venue's own refusal
+            if op in (P.PLACE, P.AMEND):
+                self._quota_refused(c.account, e)
             self._send(c, P.reply_err(req, f"{type(e).__name__}: {e}",
                                       _kind_of(e)))
 
+    def _set_leverage(self, c: _Client, msg: dict) -> Any:
+        """The client's symbol's leverage and margin mode on its account
+        (Hyperliquid ``updateLeverage``). A venue whose upstream cannot set
+        it answers ``not_supported``; the bot logs that and goes on."""
+        if c.readonly:
+            raise GatewayRefusal(f"{c.name} attached read-only: it changes nothing",
+                                 "invalid_order")
+        fn = getattr(self.up, "set_leverage", None)
+        if fn is None:
+            raise GatewayRefusal(f"{self.VENUE} leverage is not set through this gateway",
+                                 "not_supported")
+        leverage = int(msg.get("leverage") or 0)
+        if leverage < 1:
+            raise GatewayRefusal(f"leverage {msg.get('leverage')!r} is not a whole "
+                                 f"number >= 1", "invalid_order")
+        mode = "cross" if str(msg.get("margin_mode") or "").lower() == "cross" else "isolated"
+        return fn(c.account, c.symbol, leverage, mode)
+
+    def _set_leverage(self, c: _Client, msg: dict) -> Any:
+        """The client's symbol's leverage and margin mode on its account
+        (Hyperliquid ``updateLeverage``). A venue whose upstream cannot set
+        it answers ``not_supported``; the bot logs that and goes on."""
+        if c.readonly:
+            raise GatewayRefusal(f"{c.name} attached read-only: it changes nothing",
+                                 "invalid_order")
+        fn = getattr(self.up, "set_leverage", None)
+        if fn is None:
+            raise GatewayRefusal(f"{self.VENUE} leverage is not set through this gateway",
+                                 "not_supported")
+        leverage = int(msg.get("leverage") or 0)
+        if leverage < 1:
+            raise GatewayRefusal(f"leverage {msg.get('leverage')!r} is not a whole "
+                                 f"number >= 1", "invalid_order")
+        mode = "cross" if str(msg.get("margin_mode") or "").lower() == "cross" else "isolated"
+        return fn(c.account, c.symbol, leverage, mode)
+
     def _order_op(self, c: _Client, op: str, msg: dict) -> Any:
         if op == P.PLACE:
+            self._quota_gate(c.account, exit_=bool(msg.get("reduce_only")))
             cid = self._ids.next(c.slot)
             with self._bucket.inflight():
                 self._bucket.take()
@@ -488,6 +577,7 @@ class HlGateway:
                                      f"gateway — cancel and place", "not_supported")
             oid = str(msg.get("order_id") or "")
             owned = self._mine(c, oid)
+            self._quota_gate(c.account, exit_=owned.reduce_only)
             cid = self._ids.next(c.slot)
             amount = (float(msg["amount"]) if msg.get("amount") is not None
                       else owned.amount)
@@ -707,6 +797,140 @@ class HlGateway:
                 continue
             self._dms_refused.pop(account, None)
 
+    # ── the request quota ────────────────────────────────────────────────────
+    @property
+    def has_quota(self) -> bool:
+        """Whether this venue has the address-based quota (Hyperliquid); the
+        subclasses' upstreams (Lighter, IBKR, CCXT) have no such read."""
+        return callable(getattr(self.up, "rate_limit", None))
+
+    def _quota_gate(self, account: str, *, exit_: bool) -> None:
+        """Refuse, here, what the venue would refuse for the quota: a new
+        entry while the account is over its cap; an exit only when one went
+        within the last :data:`OVER_CAP_EXIT_EVERY_S` (the venue lets one
+        action through per 10 s — the exits get it). The text carries the
+        venue's own words, so the engine reads it as the venue's refusal."""
+        if account not in self._over_cap:
+            return
+        q = self._quota.get(account) or {}
+        used = f" ({q['used']:,} used of {q['cap']:,})" if q.get("cap") else ""
+        now = self._clock()
+        with self._lock:
+            if exit_ and now - self._exit_t.get(account, -1e18) >= OVER_CAP_EXIT_EVERY_S:
+                self._exit_t[account] = now
+                return
+        self.counters["held_over_cap"] += 1
+        raise GatewayRefusal(
+            f"Too many cumulative requests on account {account}{used}: the gateway "
+            + ("paces exits to one per 10 s" if exit_ else "holds new orders")
+            + " until the request quota has room again — cancels still go", "error")
+
+    def _quota_refused(self, account: str, e: BaseException) -> None:
+        """The venue refused an action for the quota: hold the account now,
+        not at the next read."""
+        if not self.has_quota or QUOTA_ERROR_TEXT not in str(e).lower():
+            return
+        with self._lock:
+            fresh = account not in self._over_cap
+            self._over_cap.setdefault(account, self._clock())
+        if fresh:
+            self._log(f"{self.LABEL}: account {account} is over its request quota ({e}) — "
+                      f"new orders held at the gateway, exits paced, cancels free; "
+                      f"lifted when the quota has room (trade volume, or buy requests)")
+
+    def _quota_loop(self) -> None:
+        while not self._stop.wait(1.0):
+            try:
+                self.poll_quota()
+            except Exception as e:                  # noqa: BLE001
+                self._log(f"{self.LABEL}: quota poll error: {e}")
+
+    def poll_quota(self, *, force: bool = False) -> None:
+        """Read each account's quota when due; hold an account at or over its
+        cap, release one that has room again."""
+        now = self._clock()
+        for account in self.up.accounts():
+            every = QUOTA_POLL_OVER_S if account in self._over_cap else QUOTA_POLL_S
+            if not force and now - self._quota_t.get(account, -1e18) < every:
+                continue
+            self._quota_t[account] = now
+            try:
+                q = self.up.rate_limit(account)
+            except Exception as e:                  # noqa: BLE001
+                self._log(f"{self.LABEL}: request quota of {account} unreadable: {e}")
+                continue
+            q = {**q, "t": now}
+            self._quota[account] = q
+            over = bool(q.get("cap")) and q["used"] >= q["cap"]
+            with self._lock:
+                was = account in self._over_cap
+                if over:
+                    self._over_cap.setdefault(account, now)
+                else:
+                    self._over_cap.pop(account, None)
+            if over and not was:
+                self._log(f"{self.LABEL}: account {account} is at its request quota "
+                          f"({q['used']:,} used of {q['cap']:,}) — new orders held")
+            elif was and not over:
+                self._log(f"{self.LABEL}: account {account} has request quota again "
+                          f"({q['used']:,} used of {q['cap']:,}) — orders flow")
+
+    def reserve(self, account: str, weight: int, *, confirmed: bool,
+                cost_usdc: float) -> dict:
+        """Buy ``weight`` requests for ``account`` — ALWAYS a manual operator
+        action, confirmed by the operator against its cost (the panel's "Buy
+        requests" pop-up, through the daemon's request file). Never a bot's:
+        no loopback op reaches this, and nothing in the gateway calls it on
+        its own (being over the cap only HOLDS orders). ``weight`` must be one
+        of :data:`RESERVE_WEIGHTS` and ``cost_usdc`` the price the operator
+        confirmed for it. Returns what happened, never raises."""
+        out = {"account": account, "weight": weight, "t": self._clock(), "ok": False,
+               "cost_usdc": (round(weight * RESERVE_USDC_PER_REQUEST, 4)
+                             if weight in RESERVE_WEIGHTS else None),
+               "before": self._quota.get(account), "after": None, "text": ""}
+        try:
+            if not self.has_quota:
+                raise GatewayRefusal(f"{self.VENUE} has no request quota to buy")
+            if weight not in RESERVE_WEIGHTS:
+                raise GatewayRefusal(f"refused: {weight!r} requests — only "
+                                     f"{', '.join(f'{w:,}' for w in RESERVE_WEIGHTS)} "
+                                     f"at once")
+            if account not in self.up.accounts():
+                raise GatewayRefusal(f"refused: unknown account {account!r}")
+            if confirmed is not True:
+                raise GatewayRefusal("refused: not confirmed by the operator")
+            if abs(float(cost_usdc) - out["cost_usdc"]) > 1e-9:
+                raise GatewayRefusal(f"refused: the confirmed cost ${cost_usdc:g} is not "
+                                     f"the price of {weight:,} requests "
+                                     f"(${out['cost_usdc']:g})")
+            last = self._reserved_t.get(account)
+            if last is not None and self._clock() - last < RESERVE_COOLDOWN_S:
+                raise GatewayRefusal(f"refused: {account} bought requests "
+                                     f"{self._clock() - last:.0f}s ago — one purchase per "
+                                     f"{RESERVE_COOLDOWN_S:g}s")
+            # only at the limit, judged on a FRESH read: a stale page or a
+            # second click after the first one freed the account buys nothing
+            self.poll_quota(force=True)
+            if account not in self._over_cap:
+                q = self._quota.get(account) or {}
+                raise GatewayRefusal(f"refused: {account} is not at its request limit"
+                                     + (f" ({q['used']:,} used of {q['cap']:,})"
+                                        if q.get("cap") else " (quota unreadable)"))
+            out["before"] = self._quota.get(account)
+            self._reserved_t[account] = self._clock()
+            self.up.reserve_request_weight(account, weight)
+            out["ok"] = True
+            out["text"] = (f"bought {weight:,} requests for {account} "
+                           f"(${out['cost_usdc']:.2f} USDC)")
+            self.poll_quota(force=True)
+            out["after"] = self._quota.get(account)
+        except Exception as e:                      # noqa: BLE001
+            out["text"] = (str(e) if isinstance(e, GatewayRefusal)
+                           else f"reserve failed: {type(e).__name__}: {e}")
+        self._log(f"{self.LABEL}: reserve — {out['text']}")
+        self.last_reserve = out
+        return out
+
     # ── sending ──────────────────────────────────────────────────────────────
     def _send(self, c: _Client, msg: dict) -> None:
         try:
@@ -739,9 +963,63 @@ class HlGateway:
                                        else "armed" if a in self._armed else "idle")
                                    for a in self.up.accounts()},
                 "clients": clients, "orders": orders, "orphaned_adopted": adopted,
+                **({"quota": {a: {**(self._quota.get(a) or {}),
+                                  "over_cap": a in self._over_cap}
+                              for a in self.up.accounts()},
+                    "last_reserve": self.last_reserve} if self.has_quota else {}),
                 "counters": dict(self.counters),
                 "budget_waited_ms": round(self._bucket.waited_ms, 1),
                 "upstream": self.up.status()}
+
+    # ── the account snapshot (account_state.json, :mod:`..accounts`) ────────
+    #: how a read's arguments are spelled for this gateway's upstream
+    _account_args = staticmethod(A.keyword_args)
+
+    def _known_symbols(self, account: str) -> set:
+        """The markets this gateway knows on ``account``: its bots' and its
+        owned orders' — where a per-market read looks."""
+        with self._lock:
+            return ({c.symbol for c in self._clients.values() if c.account == account}
+                    | {o.symbol for o in self._owned.values() if o.account == account})
+
+    def _account_also(self, what: str) -> list:
+        """Further account-wide reads that make up the whole account: one per
+        HIP-3 dex the upstream loads (its own clearinghouse — a plain read
+        covers the main dex only). None on a venue without dexes."""
+        if what not in ("fetch_positions", "fetch_open_orders"):
+            return []
+        return [{"params": {"dex": d}} for d in getattr(self.up, "dexes", None) or []]
+
+    def _order_owner(self, o: dict) -> tuple[str, str]:
+        with self._lock:
+            rec = self._owned.get(str(o.get("id") or ""))
+        if rec is None:
+            # our tag, yet not owned: placed through this gateway and never
+            # adopted back — nobody manages it, the reaper included
+            slot = self._slot_of(o.get("clientOrderId"))
+            if slot is not None:
+                return "orphan", self.slots.client_of(slot) or ""
+            return "foreign", ""
+        return ("adopted" if rec.adopted_t is not None else "bot"), rec.client
+
+    def account_snapshot(self) -> dict:
+        """Every account's balances, positions and open orders, read through
+        the per-account cache the bots share."""
+        accounts = []
+        for account in self.up.accounts():
+            def read(what: str, args: dict, a: str = account) -> Any:
+                return self._reads.get(a, what, args, lambda: self.up.read(a, what, args))
+            with self._lock:
+                holders = {c.symbol: c.name for c in self._clients.values()
+                           if c.account == account and not c.readonly}
+            acc = {"account": account,
+                   **A.ccxt_account(read, args=self._account_args,
+                                    symbols=self._known_symbols(account),
+                                    owner_of=self._order_owner,
+                                    holder_of=lambda s, h=holders: h.get(s, ""),
+                                    also=self._account_also)}
+            accounts.append(acc)
+        return {"accounts": accounts, "network": self.network}
 
 
 def _kind_of(e: Exception) -> str:

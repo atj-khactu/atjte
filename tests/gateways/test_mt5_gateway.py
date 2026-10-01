@@ -73,6 +73,10 @@ class FakeTerminal:
     def bar_open(self, symbol, timeframe="H1"):
         return None if symbol == "NOBAR" else 158.125
 
+    def rates(self, symbol, frm, to, timeframe="M1"):
+        return [{"time": int(frm.timestamp()), "open": 1.0, "high": 1.0, "low": 1.0,
+                 "close": 1.14, "tf": timeframe}]
+
     def place_order(self, symbol, side, amount, order_type=OrderType.MARKET, price=None,
                     **kwargs):
         self._check()
@@ -143,6 +147,15 @@ class RemoteClientTest(Case):
         deals = c.history_deals(now - timedelta(days=1), now, "EURUSD")
         self.assertEqual(deals[0]["ticket"], 1)
         self.assertIn("T", deals[0]["frm"])                    # the datetime got there
+
+    def test_the_history_read_goes_through_the_gateway(self):
+        """M1 rates for a chart's history and an indicator's warm-up: the
+        bots read them here, and nothing else attaches to the terminal."""
+        now = datetime.now(timezone.utc)
+        rows = self.client().rates("EURUSD", now - timedelta(hours=1), now, "M1")
+        self.assertEqual(rows[0]["close"], 1.14)
+        self.assertEqual(rows[0]["time"], int((now - timedelta(hours=1)).timestamp()))
+        self.assertEqual(rows[0]["tf"], "M1")
 
     def test_positions_come_back_as_positions(self):
         self.term.positions = [Position(exchange="mt5", symbol="EURUSD", side=PositionSide.LONG,

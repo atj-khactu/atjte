@@ -35,16 +35,26 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from atjte.gateways import accounts as _A
+
 from atjte.credentials import parse_env_text
 
 CONFIG_NAME = "gateway.json"
 ENV_NAME = "gateway.env"
 STATE_NAME = "gateway_state.json"
+#: the terminal's symbol list, written at each start — the control panel's
+#: new-strategy dialog reads it (the panel opens no terminal connection)
+SYMBOLS_NAME = "symbols.json"
 STOP_NAME = "stop.signal"
+#: symbols the control panel wants quoted in account_state.json ("quotes"):
+#: ``{"symbols": [...], "t": ...}``, written by the panel, read by the gateway
+#: at each account snapshot (the panel opens no terminal connection)
+QUOTES_REQUEST_NAME = "quotes.request"
 DEFAULT_LISTEN_PORT = 5620
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _KNOWN = {"name", "venue", "listen_port", "tick_poll_ms", "clients", "_comment"}
+_KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 
 
 class ConfigError(ValueError):
@@ -58,6 +68,9 @@ class GatewayConfig:
     listen_port: int = DEFAULT_LISTEN_PORT
     tick_poll_ms: float = 10.0
     clients: list = field(default_factory=list)
+    #: account_state.json (:mod:`atjte.gateways.accounts`)
+    publish_accounts: bool = True
+    accounts_every_s: float = _A.EVERY_S
     path: str = ""
     login: Optional[int] = None
     password: str = ""
@@ -125,6 +138,7 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
                         listen_port=int(raw.get("listen_port") or DEFAULT_LISTEN_PORT),
                         tick_poll_ms=float(raw.get("tick_poll_ms") or 10.0),
                         clients=[str(c) for c in (raw.get("clients") or [])])
+    cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
         env = {k.lower(): v for k, v in parse_env_text(envp.read_text(encoding="utf-8")).items()}

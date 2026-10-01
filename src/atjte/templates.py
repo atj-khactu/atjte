@@ -54,11 +54,16 @@ _TYPE_LABELS: dict[str, tuple[str, str]] = {
              "A static two-sided inventory grid: buy every step down, take "
              "profit one step up, mirrored on the short side. Trades often in "
              "a range-bound spread."),
+    "grid_futures": ("Grid-futures",
+                   "The grid whose center follows a dated future's fair basis — "
+                   "reference price × cost of carry (%/day) × days to expiry — "
+                   "recomputed once a day; for a listed future (IBKR) against a "
+                   "spot CFD."),
     "bollinger": ("Bollinger bands",
                   "Quotes off the rolling mean ± kσ of the spread, so the bands "
                   "widen and narrow with the spread's own volatility."),
     "fixed": ("Fixed levels",
-              "One buy resting at BUY_SPREAD_USD and one sell at SELL_SPREAD_USD, "
+              "One buy resting at BUY_SPREAD and one sell at SELL_SPREAD, "
               "whatever the position — no ladder; each round trip captures the "
               "whole distance between the two levels."),
     "fixed_entry_exit": ("Fixed entry / exit",

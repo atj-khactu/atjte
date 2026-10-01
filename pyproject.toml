@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atjte"
-version = "0.1.0"
+version = "0.2.0"
 description = "ATJ trading engines: cross-venue arbitrage market making between crypto exchanges (CCXT) and CFD platforms (MetaTrader 5)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "ATJ Traders" }]
-keywords = ["trading", "arbitrage", "market-making", "ccxt", "kraken", "metatrader5", "fix"]
+keywords = ["trading", "arbitrage", "market-making", "ccxt", "kraken", "metatrader5", "fix", "ibkr"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Financial and Insurance Industry",
@@ -35,6 +35,8 @@ dependencies = [
 mt5 = ["MetaTrader5>=5.0.5735; platform_system == 'Windows'"]
 # The cTrader Open API connector (Twisted based).
 ctrader = ["ctrader-open-api>=0.9.2", "service_identity"]
+# Interactive Brokers through TWS / IB Gateway (the IBKR gateway).
+ibkr = ["ib_async>=2.0"]
 
 [project.scripts]
 atjte = "atjte.cli:main"
@@ -57,4 +59,6 @@ atjte = [
     "strategy_types/*/*/*.py",
     # what `atjte-gateway --new` copies (gateway.json, gateway.env.example, launchers)
     "gateways/templates/*/*",
+    # sample event calendars the control panel's Events page imports
+    "samples/*/*.csv",
 ]

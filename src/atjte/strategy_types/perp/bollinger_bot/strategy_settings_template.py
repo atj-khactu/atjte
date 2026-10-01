@@ -72,10 +72,10 @@ BB_EXIT_LADDER = [(1.0, 0.0)]    # 2s slice out at the mean first, 1s slice out 
 # instead of resting at the bands 24/5, an order is submitted only while the
 # rolling BASIS_WINDOW_S average of the side-aware basis (buy: perp bid −
 # MT5 bid, sell: perp ask − MT5 ask) is at/through its band level, and it
-# is pulled once the average retreats BASIS_RELEASE_USD back inside.
+# is pulled once the average retreats BASIS_RELEASE back inside.
 BASIS_TRIGGER = True
 BASIS_WINDOW_S = 5.0         # rolling basis-average window (s)
-BASIS_RELEASE_USD = 0.25     # hysteresis before a live quote is pulled (USD/oz)
+BASIS_RELEASE = 0.25     # hysteresis before a live quote is pulled (USD/oz)
 
 # --- Spread entry window (engine feature; both None = off) ---
 # NEW entries on BOTH sides (long and short) rest only while the live
@@ -104,7 +104,6 @@ FUNDING_RATE_MAX_ABS = 0.003
 # machine's LOCAL midnight (the dashboard's "today"); True = UTC midnight.
 # Scale hint: one round trip of ORDER_VOLUME oz moves ~4.4 kUSD of notional
 # through EACH venue, so the two volume caps are also a cap on churn.
-RISK_DAY_UTC = False
 MAX_DAILY_LOSS_USD = None            # e.g. 200 -> close-only below -200 USD today
 MAX_DAILY_VENUE_VOLUME_USD = None   # e.g. 500000 -> perp notional traded today
 MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded today
@@ -124,7 +123,7 @@ MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded 
 # MIN_KF_AVAILABLE_MARGIN_USD (100), which only stops new entries: this one
 # sells the position.
 DERISK_VENUE_AVAILABLE_MARGIN_USD = None   # USD, flex-account available margin
-DERISK_VENUE_LIQ_DISTANCE_PCT = None       # % of mark to the perp's liquidation price
+DERISK_VENUE_LIQ_DISTANCE_PCT = None       # % to the liquidation price (of the entry cushion or the mark: LIQ_DISTANCE_BASE)
 DERISK_MT5_MARGIN_LEVEL = None          # %, MT5 margin level (stop-out is well below)
 DERISK_MT5_FREE_MARGIN = None           # account ccy, MT5 free margin
 
@@ -155,7 +154,7 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 #                        ("13:30", "US cash open")]
 # A mis-typed entry or an unknown timezone raises AT STARTUP — a schedule
 # that silently does nothing is worse than no schedule.
-BLACKOUT_TZ = "UTC"          # IANA name; every entry below is read in it
+BLACKOUT_TZ = None          # IANA name every entry below is read in; None = the ACP timezone
 BLACKOUT_BEFORE_MIN = 2.0    # default minutes BEFORE the moment
 BLACKOUT_AFTER_MIN = 2.0     # default minutes AFTER it
 DAILY_BLACKOUTS = []

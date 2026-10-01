@@ -110,6 +110,11 @@ def main(argv=None) -> int:
                      max_inflight=cfg.max_inflight, account_dms_s=cfg.account_dms_s,
                      log=log)
     gw.start()
+    from atjte.gateways.accounts import AccountPublisher
+    accounts = AccountPublisher(cfg.dir, gw.account_snapshot, name=cfg.name, venue="ccxt",
+                                every_s=cfg.accounts_every_s,
+                                enabled=cfg.publish_accounts, log=log)
+    accounts.start()
     if not cfg.token:
         log(f"WARNING: no {C.TOKEN_NAME} — any process on this machine can attach")
     state = cfg.dir / C.STATE_NAME
@@ -123,7 +128,8 @@ def main(argv=None) -> int:
                                 "dialect": "ccxt", "venue": "ccxt",
                                 "exchange": cfg.exchange,
                                 "listen_port": gw.port, "clients_allowed": list(cfg.clients),
-                                "token_set": bool(cfg.token), "accounts": list(cfg.accounts),
+                                "token_set": bool(cfg.token),
+                                "publish_accounts": cfg.publish_accounts, "accounts": list(cfg.accounts),
                                 "session": {"ready": ready,
                                             "state": "ready" if ready else "degraded",
                                             "reason": "" if ready else "a stream is down",
@@ -133,6 +139,7 @@ def main(argv=None) -> int:
                 log(f"{cfg.name}: stop signal — shutting down cleanly")
                 break
     finally:
+        accounts.stop()
         gw.stop()
         up.stop()
         try:

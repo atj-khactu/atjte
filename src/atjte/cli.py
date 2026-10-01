@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 COMMANDS = ("bot", "migrate", "workspace", "version", "mt5-probe", "report",
-            "backfill", "fixcheck", "gateway")
+            "backfill", "fixcheck", "gateway", "reporter")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -46,6 +46,8 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("workspace", help="show how the workspace resolves")
     sub.add_parser("version", help="print the library version")
     sub.add_parser("mt5-probe", help="attach to MT5 and report the account (ATJ_MT5_* env vars)")
+    sub.add_parser("reporter", add_help=False,
+                   help="the reporting database: run | rebuild [--strategy KEY] | status")
     sub.add_parser("gateway", add_help=False,
                    help="run or create a gateway (the arguments of atjte-gateway)")
 
@@ -109,6 +111,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # its own parser, and every venue's dispatch, live in the entry point
         from .gateways.fix.gateway import main as gateway_main
         return gateway_main(argv[1:])
+    if argv[:1] == ["reporter"]:
+        # its own parser: run / rebuild / status (atjte.reportdb.daemon)
+        from .reportdb.daemon import main as reporter_main
+        return reporter_main(argv[1:])
     args = _parser().parse_args(argv)
     if args.command == "version":
         from . import __version__

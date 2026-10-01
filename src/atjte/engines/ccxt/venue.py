@@ -54,6 +54,14 @@ DEFAULT_IM_RATE = 0.02          # fallback initial-margin rate when the venue
                                 # publishes no margin tiers for the contract
 
 
+
+def _fee(v):
+    """A CCXT market's fee rate as a float, None when it states none."""
+    try:
+        return None if v is None else float(v)
+    except (TypeError, ValueError):
+        return None
+
 class Venue:
     """One CCXT venue + one symbol, with the spot/perp differences resolved.
 
@@ -218,6 +226,10 @@ class Venue:
 
         prec = m.get("precision") or {}
         self.price_tick = float(prec.get("price") or 0.01)
+        # the venue's fee rates as CCXT states them (fractions; None = unknown):
+        # reported for the panel's Save checks, never used to price an order
+        self.maker_fee = _fee(m.get("maker"))
+        self.taker_fee = _fee(m.get("taker"))
         self.contract_size = float(m.get("contractSize") or 1.0) if self.is_perp else 1.0
         # CCXT states precision/limits in the venue's own amount unit
         # (contracts on a contract market); the engine works in base units.
