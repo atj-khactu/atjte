@@ -259,7 +259,7 @@ MT5_COMMENT = ""
 # fixing hedge. Then wait a full interval before the next check.
 RECONCILE_INTERVAL_S = 900.0     # 15 minutes
 RECONCILE_RECHECK_DELAY_S = 15.0
-RECONCILE_TOLERANCE_UNITS = 1.0  # >= one broker min lot in base units
+RECONCILE_TOLERANCE_UNITS = 1.0  # >= one broker min lot in base units; None = one MT5 min lot
 
 # --- Basis trigger (ON by default; sample_project-style signal entries) ---
 # True (the default) = an order is SUBMITTED only while

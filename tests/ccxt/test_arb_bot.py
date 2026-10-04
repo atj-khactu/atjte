@@ -696,23 +696,28 @@ class HedgeGateTest(unittest.TestCase):
         self.assertIsNotNone(self.v(2.01, 1.0))
         self.assertIsNone(self.v(1.0, 0.0))                    # no lot size: not judged
 
-    def test_startup_refuses_before_the_hedger_exists(self):
+    def test_startup_warns_and_starts(self):
+        """A warning (log + the report), never a refusal: the operator decides."""
         orig = (pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS)
         try:
             bot = make_bot()
             bot.mt5 = types.SimpleNamespace(
                 get_ticker=lambda s: types.SimpleNamespace(bid=65498.0, ask=65502.0))
             pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS = 0.005, 1.0
-            with self.assertRaisesRegex(RuntimeError, "RECONCILE_TOLERANCE_UNITS.*refusing"):
-                bot._check_hedge_thresholds(self.JP225_LOT)
+            bot._check_hedge_thresholds(self.JP225_LOT)        # no raise
+            self.assertEqual(len(bot.hedge_gate_warnings), 1)
+            self.assertIn("RECONCILE_TOLERANCE_UNITS", bot.hedge_gate_warnings[0])
+            self.assertNotIn("refusing", bot.hedge_gate_warnings[0])
+            self.assertAlmostEqual(bot.mt5_min_lot_units, self.JP225_LOT)
             pb.RECONCILE_TOLERANCE_UNITS = 0.005
-            bot._check_hedge_thresholds(self.JP225_LOT)        # both fixed: starts
-            # no MT5 price: still refused, just without the dollar figure
+            bot._check_hedge_thresholds(self.JP225_LOT)        # both fixed: no warning
+            self.assertEqual(bot.hedge_gate_warnings, [])
+            # no MT5 price: still warned, just without the dollar figure
             bot.mt5 = types.SimpleNamespace(get_ticker=lambda s: (_ for _ in ()).throw(
                 ConnectionError("terminal not answering")))
             pb.HEDGE_THRESHOLD_UNITS = 1.0
-            with self.assertRaisesRegex(RuntimeError, "HEDGE_THRESHOLD_UNITS"):
-                bot._check_hedge_thresholds(self.JP225_LOT)
+            bot._check_hedge_thresholds(self.JP225_LOT)
+            self.assertIn("HEDGE_THRESHOLD_UNITS", bot.hedge_gate_warnings[0])
         finally:
             pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS = orig
 
@@ -1074,10 +1079,18 @@ class HedgeThresholdFromMt5Test(unittest.TestCase):
     in the settings wins."""
 
     def setUp(self):
-        self._orig = pb.HEDGE_THRESHOLD_UNITS
+        self._orig = (pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS)
 
     def tearDown(self):
-        pb.HEDGE_THRESHOLD_UNITS = self._orig
+        pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS = self._orig
+
+    def test_reconcile_tolerance_none_is_one_min_lot(self):
+        """None used to reach the reconciler as None (abs(drift) >= None)."""
+        pb.RECONCILE_TOLERANCE_UNITS = None
+        bot = make_bot([])
+        bot.volume_min, bot.contract_size = 0.1, 1 / 15.7548
+        bot._resolve_hedge_threshold()
+        self.assertAlmostEqual(pb.RECONCILE_TOLERANCE_UNITS, 0.1 / 15.7548)
 
     def test_none_is_one_min_lot(self):
         pb.HEDGE_THRESHOLD_UNITS = None

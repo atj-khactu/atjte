@@ -820,39 +820,9 @@ def _price_nd(*prices) -> int:
     return 5 if ref > 0 else 2
 
 
-#: how many broker min lots a hedge gate (HEDGE_THRESHOLD_UNITS,
-#: RECONCILE_TOLERANCE_UNITS) may be worth before the bot refuses to start
-HEDGE_GATE_MAX_LOTS = 2.0
-
-
-def hedge_gate_verdict(name: str, value: float, min_lot_units: float,
-                       unit_value: Optional[float] = None, unit_label: str = "units",
-                       quote_ccy: str = "") -> Optional[str]:
-    """The refusal message when a hedge gate is worth more than
-    HEDGE_GATE_MAX_LOTS broker min lots, else None.
-
-    Both gates are in VENUE units, and their default (1 unit) is gold-sized:
-    1 oz there is one XAUUSD min lot. On a market where one venue unit is
-    worth many lots it silently leaves that much unhedged — measured
-    2026-09-28 on xyz:JP225: 1 unit = one index contract (~$65k), one JP225
-    lot hedges 0.00635 units, so a 1-unit gate was 157 lots and a +0.0184
-    fill (~$1.2k) was never hedged: the fill hedger logged "under one lot",
-    the reconciler "drift cleared". ``unit_value`` (venue-currency value of
-    one unit) only makes the message concrete; the verdict never needs it."""
-    try:
-        v, lot = float(value), float(min_lot_units)
-    except (TypeError, ValueError):
-        return None
-    if not (lot > 0) or not (v > HEDGE_GATE_MAX_LOTS * lot):
-        return None
-    lots = v / lot
-    worth = (f" (~{v * unit_value:,.0f} {quote_ccy or 'in venue currency'})"
-             if unit_value else "")
-    suggest = 0.8 * lot
-    return (f"{name} = {value:g} {unit_label} is worth {lots:,.0f} broker min lots"
-            f"{worth}: exposure up to that size would never be hedged. One min lot "
-            f"hedges {lot:.6g} {unit_label} here — set {name} just under it "
-            f"(e.g. {suggest:.3g}) in the project's project_settings.py")
+# the hedge gates vs the broker's min lot: a WARNING at start (pure, shared
+# with the panel's Save check)
+from ..common.hedge_gate import HEDGE_GATE_MAX_LOTS, hedge_gate_verdict  # noqa: E402,F401
 
 
 def _classify_order_error(exc: Exception) -> str:
@@ -1365,7 +1335,7 @@ class ArbBot:
         self.volume_step = specs["volume_step"]
         self._resolve_hedge_threshold()      # before the hedger starts
         # a hedge gate worth many MT5 lots leaves that much unhedged, with no
-        # error anywhere: refuse it before the hedger thread starts
+        # error anywhere: warn about it before the hedger thread starts
         self._check_hedge_thresholds(self.volume_min * self.contract_size)
         _log(self.venue.market_line() + f" | {SYMBOL_MT5}: "
              + (f"contract={self.contract_size:g} {UNIT_LABEL}/lot, "
@@ -1861,21 +1831,27 @@ class ArbBot:
 
     # -- hedge gates vs the MT5 lot -------------------------------------------
     def _resolve_hedge_threshold(self) -> None:
-        """HEDGE_THRESHOLD_UNITS None: one MT5 min lot in venue units (the
-        lot specs are loaded) — the smallest hedge the broker takes. A value
-        in the settings is used as written."""
-        global HEDGE_THRESHOLD_UNITS
-        if HEDGE_THRESHOLD_UNITS is not None:
-            return
-        HEDGE_THRESHOLD_UNITS = round(self.volume_min * self.contract_size, 10)
-        self.hedge_threshold_from = "mt5_min_lot"
-        _log(f"hedge threshold: one {SYMBOL_MT5} min lot ({self.volume_min:g} lot) = "
-             f"{HEDGE_THRESHOLD_UNITS:g} {UNIT_LABEL} (HEDGE_THRESHOLD_UNITS None)")
+        """HEDGE_THRESHOLD_UNITS / RECONCILE_TOLERANCE_UNITS None: one MT5
+        min lot in venue units (the lot specs are loaded) — the smallest
+        hedge the broker takes. A value in the settings is used as written."""
+        global HEDGE_THRESHOLD_UNITS, RECONCILE_TOLERANCE_UNITS
+        lot_units = round(self.volume_min * self.contract_size, 10)
+        if HEDGE_THRESHOLD_UNITS is None:
+            HEDGE_THRESHOLD_UNITS = lot_units
+            self.hedge_threshold_from = "mt5_min_lot"
+            _log(f"hedge threshold: one {SYMBOL_MT5} min lot ({self.volume_min:g} lot) = "
+                 f"{HEDGE_THRESHOLD_UNITS:g} {UNIT_LABEL} (HEDGE_THRESHOLD_UNITS None)")
+        if RECONCILE_TOLERANCE_UNITS is None:
+            RECONCILE_TOLERANCE_UNITS = lot_units
+            _log(f"reconcile tolerance: one {SYMBOL_MT5} min lot = "
+                 f"{RECONCILE_TOLERANCE_UNITS:g} {UNIT_LABEL} (RECONCILE_TOLERANCE_UNITS None)")
 
     def _check_hedge_thresholds(self, min_lot_units: float) -> None:
-        """Refuse to start when HEDGE_THRESHOLD_UNITS or
-        RECONCILE_TOLERANCE_UNITS is worth more than HEDGE_GATE_MAX_LOTS
-        broker min lots (see :func:`hedge_gate_verdict`)."""
+        """WARN (log + the report's ``market.hedge_gate_warnings``) when
+        HEDGE_THRESHOLD_UNITS or RECONCILE_TOLERANCE_UNITS is worth more than
+        HEDGE_GATE_MAX_LOTS broker min lots (see :func:`hedge_gate_verdict`).
+        The bot starts either way: the operator decides — the panel's Save
+        pop-up shows the same warning."""
         unit_value = None
         try:
             t = self.mt5.get_ticker(SYMBOL_MT5)
@@ -1883,12 +1859,15 @@ class ArbBot:
                 unit_value = HEDGE_RATIO * (t.bid + t.ask) / 2.0
         except Exception:                                   # noqa: BLE001
             pass                                            # the refusal stands without it
+        self.mt5_min_lot_units = min_lot_units
+        self.hedge_gate_warnings = []
         for name, value in (("HEDGE_THRESHOLD_UNITS", HEDGE_THRESHOLD_UNITS),
                             ("RECONCILE_TOLERANCE_UNITS", RECONCILE_TOLERANCE_UNITS)):
-            err = hedge_gate_verdict(name, value, min_lot_units, unit_value,
+            msg = hedge_gate_verdict(name, value, min_lot_units, unit_value,
                                      UNIT_LABEL, self.venue.quote or "")
-            if err:
-                raise RuntimeError(err + " -- refusing to start")
+            if msg:
+                self.hedge_gate_warnings.append(msg)
+                _log("WARNING: " + msg)
 
     # -- quote-currency conversion (FX_CONVERSION_SYMBOL) --------------------
     def _setup_fx(self, specs: dict) -> None:
@@ -4346,7 +4325,11 @@ class ArbBot:
                        "taker_fee": getattr(self.venue, "taker_fee", None),
                        "hedge_threshold_units": HEDGE_THRESHOLD_UNITS,
                        "hedge_threshold_from": getattr(self, "hedge_threshold_from",
-                                                       "setting")},
+                                                       "setting"),
+                       "reconcile_tolerance_units": RECONCILE_TOLERANCE_UNITS,
+                       # one MT5 min lot in venue units: the panel's hedge-gate check
+                       "mt5_min_lot_units": getattr(self, "mt5_min_lot_units", None),
+                       "hedge_gate_warnings": getattr(self, "hedge_gate_warnings", [])},
             # legs in different currencies: the pair and this hour's rate
             # (MT5 currency per venue currency) the hedge is sized at
             "panel_lease": {"watching": PANEL_HEARTBEAT_FILE is not None
