@@ -1,15 +1,22 @@
-"""Sample strategy settings shipped with atjte — small, 1x presets to start
-testing a pair on small lots.
+"""Sample strategy settings shipped with atjte.
 
 Each sample is an ACP settings file (``format: acp-strategy-settings``, the
 control panel's Export / Import format) under ``samples/strategies/``, for
 ONE instrument pair: the sizes are in that pair's own base units, so a
 sample only fits the strategy trading the same quoting symbol and hedge
-symbol (:func:`samples_for`). What a sample sets: 1x isolated leverage, two
-small grid levels, the position caps at those two levels, a daily loss and
-volume limit — never the strategy's symbols nor the project's hedge ratio
-(the panel's Import keeps those). Loading one only fills the form; Save
-writes it, with every check against the market the bot reports.
+symbol (:func:`samples_for`). Two kinds per pair:
+
+- ``*_small_1x`` — a small test preset: 1x isolated leverage, two small grid
+  levels, the position caps at those two levels, a daily loss and volume
+  limit. Where to start.
+- ``*_atj_live`` — the full settings form of the strategy ATJ Research runs
+  on that pair (exported 2026-10-05): its real sizes and leverage, so it is
+  sized for a live account, not a test.
+
+Neither sets the strategy's symbols, the project's hedge ratio or FX pair
+(the panel's Import keeps those), nor LIVE_TRADING. Loading one only fills
+the form; Save writes it, with every check against the market the bot
+reports.
 """
 from __future__ import annotations
 

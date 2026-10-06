@@ -39,7 +39,9 @@ Snapshot schema (``schema`` 1)::
      "project", "engine", "pid", "alive", "live_trading",
      "venue": {"id", "symbol", "market_kind": "swap"|"spot", "unit_label",
                "base", "quote", "contract_size", "ts",
-               "top": {"bid", "ask", "mid", "ts"} | None,
+               "top": {"bid", "ask", "mid", "ts", "bid_size"?, "ask_size"?} | None,
+               "book": {"bids": [[price, size]], "asks": [...], "ts"} | None
+                       (absent from older bots; ts = when the gateway got it),
                "position": {"size", "entry_price", "unrealized_pnl",
                             "unrealized_funding", "liquidation_price", "mark",
                             "holdings", "base_inventory", "ts"} | None,
@@ -374,11 +376,41 @@ def minute(ts: float) -> int:
 # ── block builders (the engines fill these; the reader relies on the shape) ──
 
 def top_block(bid: Optional[float], ask: Optional[float],
-              ts: Optional[float] = None) -> Optional[dict]:
+              ts: Optional[float] = None, bid_size: Optional[float] = None,
+              ask_size: Optional[float] = None) -> Optional[dict]:
     if bid is None or ask is None:
         return None
-    return {"bid": float(bid), "ask": float(ask), "mid": (float(bid) + float(ask)) / 2.0,
-            "ts": time.time() if ts is None else float(ts)}
+    out = {"bid": float(bid), "ask": float(ask), "mid": (float(bid) + float(ask)) / 2.0,
+           "ts": time.time() if ts is None else float(ts)}
+    if bid_size is not None and ask_size is not None:
+        out["bid_size"], out["ask_size"] = float(bid_size), float(ask_size)
+    return out
+
+
+#: the levels a side the report keeps of the gateway's book
+BOOK_LEVELS = 10
+
+
+def book_block(book: Optional[dict], levels: int = BOOK_LEVELS) -> Optional[dict]:
+    """The order book the bot's gateway pushed, ``levels`` a side, best
+    first: ``{"bids": [[price, size], ...], "asks": [...], "ts"}`` (``ts`` =
+    when the gateway received it). None without both sides."""
+    if not isinstance(book, dict):
+        return None
+
+    def side(rows) -> list:
+        out = []
+        for r in list(rows or [])[:levels]:
+            try:
+                out.append([float(r[0]), float(r[1])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+    bids, asks = side(book.get("bids")), side(book.get("asks"))
+    if not bids or not asks:
+        return None
+    ts = book.get("ts")
+    return {"bids": bids, "asks": asks, "ts": float(ts) if ts is not None else time.time()}
 
 
 def venue_block(*, venue_id: str, symbol: str, market_kind: str, unit_label: str,
@@ -386,13 +418,14 @@ def venue_block(*, venue_id: str, symbol: str, market_kind: str, unit_label: str
                 top: Optional[dict] = None, position: Optional[dict] = None,
                 margin: Optional[dict] = None, balances: Optional[dict] = None,
                 funding: Optional[dict] = None,
-                open_orders: Iterable[dict] = ()) -> dict:
+                open_orders: Iterable[dict] = (),
+                book: Optional[dict] = None) -> dict:
     """The snapshot's ``venue`` block. A leg that has NOT been read is
     ``None`` (the reader shows "not read", never a flat 0)."""
     return {"id": venue_id, "symbol": symbol, "market_kind": market_kind,
             "unit_label": unit_label, "base": base, "quote": quote,
             "contract_size": float(contract_size), "ts": time.time(),
-            "top": top, "position": position, "margin": margin,
+            "top": top, "book": book, "position": position, "margin": margin,
             "balances": balances, "funding": funding,
             "open_orders": list(open_orders)}
 
@@ -741,12 +774,21 @@ class Reporter:
         self._bar_minute = None
 
     def backfill_bars(self, venue: dict, mt5: dict, now: Optional[float] = None) -> int:
-        """History for the minutes ``bars.jsonl`` does not hold yet: ``venue``
-        / ``mt5`` are ``{minute UTC: close}`` (either may be empty — a leg
-        whose gateway serves no history). Only COMPLETE minutes inside the
-        retention and not already on file are written, appended with
-        ``"src": "history"`` (the reader sorts by time); the forming minute
-        is left to :meth:`mark`. Returns how many bars were added.
+        """History for the minutes ``bars.jsonl`` does not hold yet, and for
+        the LEG a held minute is missing: ``venue`` / ``mt5`` are ``{minute
+        UTC: close}`` (either may be empty — a leg whose gateway serves no
+        history, or whose terminal has not loaded it yet). Only complete
+        minutes inside the retention are touched; the forming minute is left
+        to :meth:`mark`. A new minute is appended with ``"src": "history"``
+        (the reader sorts by time); a held minute with a missing close gets
+        that close filled in and NOTHING else changed — a value on file, the
+        bot's own bar above all, is never overwritten. Returns how many bars
+        were added or completed.
+
+        Completing matters because a run whose one leg came back empty used
+        to write a day of one-legged bars, and every later run then counted
+        those minutes as held: the spread chart stayed blank for that day
+        for good, however many restarts followed.
 
         This is what lets a chart reach back before the bot's first bar: the
         bot reads the history through its gateways at startup, so the
@@ -755,8 +797,22 @@ class Reporter:
             return 0
         now = time.time() if now is None else now
         floor, current = now - self.bars_keep_s, minute(now)
-        have = {minute(float(r["ts"])) for r in read_jsonl(self.bars_file)
-                if _f(r.get("ts")) is not None}
+        on_file = read_jsonl(self.bars_file)
+        held: dict[int, dict] = {}
+        for r in on_file:
+            if _f(r.get("ts")) is not None:
+                held[minute(float(r["ts"]))] = r       # the last row of a minute wins
+        completed = 0
+        for m, r in held.items():
+            if m >= current or m < floor or m == self._bar_minute:
+                continue
+            filled = False
+            for leg, closes in (("venue", venue), ("mt5", mt5)):
+                if _f(r.get(leg)) is None and _f(closes.get(m)) is not None:
+                    r[leg] = _f(closes[m])
+                    filled = True
+            completed += filled
+        have = set(held)
         if self._bar_minute is not None:
             have.add(self._bar_minute)
         rows = []
@@ -769,15 +825,22 @@ class Reporter:
                 continue
             rows.append({"ts": m, "venue": v, "mt5": x, "src": "history"})
             have.add(m)
-        if not rows:
+        if not rows and not completed:
             return 0
         try:
-            with self.bars_file.open("a", encoding="utf-8") as fh:
-                fh.write("".join(json.dumps(r) + "\n" for r in rows))
+            if completed:
+                # a held row changed: rewrite the file (as _prune_bars does)
+                tmp = self.bars_file.with_name(self.bars_file.name + ".tmp")
+                tmp.write_text("".join(json.dumps(r) + "\n" for r in on_file + rows),
+                               encoding="utf-8")
+                os.replace(tmp, self.bars_file)
+            else:
+                with self.bars_file.open("a", encoding="utf-8") as fh:
+                    fh.write("".join(json.dumps(r) + "\n" for r in rows))
         except OSError as e:
-            self._warn("bars_io", f"cannot append {self.bars_file.name}: {e}")
+            self._warn("bars_io", f"cannot write {self.bars_file.name}: {e}")
             return 0
-        return len(rows)
+        return len(rows) + completed
 
     def _prune_bars(self, now: float, force: bool = False) -> None:
         if not force and now - self._bars_pruned_t < BARS_PRUNE_EVERY_S:

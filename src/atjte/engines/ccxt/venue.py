@@ -542,14 +542,17 @@ class Venue:
             return None
         return max(self.free_base, 0.0)
 
-    def note_entry_placed(self, units: float, price: float) -> None:
+    def note_entry_placed(self, units: float, price: float,
+                          margin: Optional[float] = None) -> None:
         """Keep the cached head-room honest between refreshes: subtract what
         a just-placed entry consumes, so a burst of placements in one pass
-        cannot each spend the same margin/balance."""
+        cannot each spend the same margin/balance. ``margin`` = what the
+        engine's check counted for it (notional / leverage); else the
+        market's initial-margin rate."""
         if self.is_perp:
             if self.available_margin is not None:
-                self.available_margin = max(
-                    0.0, self.available_margin - units * price * self.im_rate)
+                used = margin if margin is not None else units * price * self.im_rate
+                self.available_margin = max(0.0, self.available_margin - used)
         elif self.free_quote is not None:
             self.free_quote = max(0.0, self.free_quote - units * price)
 

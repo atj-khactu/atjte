@@ -335,6 +335,46 @@ class FanOutTest(GatewayCase):
         self.assertEqual(self.up.calls.count(("subscribe", EUR)), 2)   # idempotent venue-side
 
 
+class BookTest(GatewayCase):
+    """The order book (display only — the bots' report): pushed to the
+    symbol's clients at most once a second, the latest kept for a client
+    that attaches later."""
+
+    @staticmethod
+    def book(bid):
+        return {"symbol": EUR, "bids": [[bid, 5.0]], "asks": [[1.1405, 7.0]], "ts": 1.0}
+
+    def test_books_fan_out_throttled_and_a_new_client_gets_the_last(self):
+        seen, other = [], []
+        self.client("a_grid", symbol=EUR, on_book=seen.append)
+        self.client("b_grid", symbol=BTC, on_book=other.append)
+        self.up.h["on_book"](EUR, self.book(1.1403))
+        self.assertTrue(wait_for(lambda: len(seen) == 1))
+        self.up.h["on_book"](EUR, self.book(1.1402))   # within the second: kept, not sent
+        time.sleep(0.2)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(other, [])                     # another symbol's client
+        late = []
+        self.client("c_grid", symbol=EUR, account="main", on_book=late.append)
+        self.assertTrue(wait_for(lambda: late and late[0]["bids"][0][0] == 1.1402))
+
+    def test_book_payload_trims_and_refuses_a_one_sided_book(self):
+        from atjte.gateways.common import BookThrottle, book_payload
+        ob = {"bids": [[100 - i, 1 + i] for i in range(25)],
+              "asks": [[101 + i, 2] for i in range(25)], "timestamp": None}
+        b = book_payload("X", ob)
+        self.assertEqual((len(b["bids"]), len(b["asks"])), (10, 10))
+        self.assertEqual(b["bids"][0], [100.0, 1.0])
+        self.assertIsNone(book_payload("X", {"bids": [[1, 1]], "asks": []}))
+        self.assertIsNone(book_payload("X", None))
+        t = [0.0]
+        th = BookThrottle(1.0, clock=lambda: t[0])
+        self.assertTrue(th.offer("X", b))
+        self.assertFalse(th.offer("X", b))
+        t[0] = 1.0
+        self.assertTrue(th.offer("X", b))
+
+
 class ReadCacheTest(GatewayCase):
     def test_reads_are_cached_per_account_and_invalidated_by_an_order_op(self):
         a = self.client("a_grid", symbol=EUR, account="sub1")

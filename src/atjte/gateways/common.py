@@ -91,6 +91,54 @@ def markets_payload(x, symbol: str = "") -> dict:
     return {"markets": out, "currencies": currencies}
 
 
+#: the depth a gateway relays per side, and the most often it pushes a book
+#: per symbol (the panel redraws every 2 s, the bot reports every 5 s)
+BOOK_LEVELS = 10
+BOOK_PUSH_MIN_S = 1.0
+
+
+def book_payload(symbol: str, ob: Any, levels: int = BOOK_LEVELS) -> Optional[dict]:
+    """A CCXT order book as the wire carries it: ``{"symbol", "bids": [[price,
+    size], ...], "asks": [...], "ts"}``, ``levels`` per side, best first;
+    ``ts`` = when the gateway received it (a quiet book is old, not wrong).
+    None when either side is empty."""
+    def side(rows) -> list:
+        out = []
+        for r in list(rows or [])[:levels]:
+            try:
+                out.append([float(r[0]), float(r[1])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+    if not isinstance(ob, dict):
+        return None
+    bids, asks = side(ob.get("bids")), side(ob.get("asks"))
+    if not bids or not asks:
+        return None
+    return {"symbol": symbol, "bids": bids, "asks": asks, "ts": time.time()}
+
+
+class BookThrottle:
+    """Per symbol: the latest book is always kept (a client attaching gets
+    it at once); :meth:`offer` says whether to push it now — at most once
+    per ``min_s``, as a venue's book moves many times a second."""
+
+    def __init__(self, min_s: float = BOOK_PUSH_MIN_S,
+                 clock: Callable[[], float] = time.time) -> None:
+        self.min_s = float(min_s)
+        self._clock = clock
+        self.last: dict[str, dict] = {}
+        self._t: dict[str, float] = {}
+
+    def offer(self, symbol: str, book: dict) -> bool:
+        self.last[symbol] = book
+        now = self._clock()
+        if now - self._t.get(symbol, float("-inf")) < self.min_s:
+            return False
+        self._t[symbol] = now
+        return True
+
+
 class ReadCache:
     """Reads keyed by ``(account, what, args)``, each ``what`` cached for its
     TTL (0 = live). One venue read per key at a time: a second bot asking

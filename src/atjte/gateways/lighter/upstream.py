@@ -38,6 +38,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from ..common import book_payload
+
 import ccxt.pro as ccxtpro
 
 ORDER_TIMEOUT_S = 10.0
@@ -126,9 +128,10 @@ class LighterUpstream:
                          "txs": 0, "reads": 0}
 
     # ── wiring ───────────────────────────────────────────────────────────────
-    def set_handlers(self, *, on_ticker, on_fill, on_order, on_event) -> None:
+    def set_handlers(self, *, on_ticker, on_fill, on_order, on_event,
+                     on_book=None) -> None:
         self._h = {"ticker": on_ticker, "fill": on_fill, "order": on_order,
-                   "event": on_event}
+                   "event": on_event, "book": on_book}
 
     def accounts(self) -> list[str]:
         return list(self._accounts)
@@ -283,6 +286,33 @@ class LighterUpstream:
         self._symbols.add(symbol)
         self._loop.call_soon_threadsafe(
             lambda: self._spawn(f"ticker:{symbol}", self._ticker_loop(symbol)))
+        if self._h.get("book") is not None:
+            self._loop.call_soon_threadsafe(
+                lambda: self._spawn(f"book:{symbol}", self._book_loop(symbol)))
+
+    async def _book_loop(self, symbol: str) -> None:
+        """The symbol's order book, for the bots' report (DISPLAY only), on
+        the same public socket as the ticker. Its failures are its own:
+        logged and retried, never the market-data verdict (that is the
+        ticker's)."""
+        delay = 1.0
+        while True:
+            try:
+                ob = await self.pub.watch_order_book(symbol)
+                delay = 1.0
+                b = book_payload(symbol, ob)
+                if b is not None:
+                    self.counters["books"] = self.counters.get("books", 0) + 1
+                    self._h["book"](symbol, b)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.counters["book_errors"] = self.counters.get("book_errors", 0) + 1
+                if self.counters["book_errors"] in (1, 10, 100) or self.counters["book_errors"] % 1000 == 0:
+                    self._log(f"lighter upstream: watch_order_book {symbol}: "
+                              f"{type(e).__name__}: {e}")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
 
     async def _ticker_loop(self, symbol: str) -> None:
         delay = 1.0

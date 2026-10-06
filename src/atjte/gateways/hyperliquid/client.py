@@ -40,6 +40,7 @@ class HlGatewayClient(GatewayClient):
                  dms_s: float = 60.0,
                  on_ticker: Optional[Callable[[dict], None]] = None,
                  on_fill: Optional[Callable[[dict], None]] = None,
+                 on_book: Optional[Callable[[dict], None]] = None,
                  on_state: Optional[Callable[[dict], None]] = None,
                  log: Optional[Callable[[str], None]] = None,
                  request_timeout_s: float = 10.0, connect=None,
@@ -47,7 +48,8 @@ class HlGatewayClient(GatewayClient):
         super().__init__(client, symbol, host=host, port=port, token=token,
                          dms_s=dms_s, on_state=on_state, log=log,
                          request_timeout_s=request_timeout_s, connect=connect,
-                         on_ticker=on_ticker, on_fill=on_fill, readonly=readonly)
+                         on_ticker=on_ticker, on_fill=on_fill, readonly=readonly,
+                         on_book=on_book)
         self.account = account
         self.network = network
 

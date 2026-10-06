@@ -28,7 +28,8 @@ venue gives.** Two rules carried over from this repo's spot and perp feeds:
    the subscription is ASKED for, too: on a venue that confirms with a
    snapshot of the account's fills, a symbol-filtered subscribe returns
    nothing until that very market has traded — see
-   :data:`FILLS_STREAM_ALL_SYMBOLS`.
+   :data:`FILLS_STREAM_ALL_SYMBOLS` (which also lists the venue whose CCXT
+   symbol filter loses fills outright).
 2. *Quiet is not dead.* Seconds since the last BBO change is a PRICING
    judgement (``VENUE_TICKER_STALE_S`` in the engine), never a feed failure.
    Only a heartbeat clock may call a connection dead — and only where the
@@ -128,7 +129,19 @@ _FILL_FEEDS = {"fills", "fills_snapshot", "ownTrades", "userFills"}
 #: no frame in 45 s on a market with no history, while ``watch_my_trades()``
 #: returned the account snapshot in 0.0 s. Subscribe unfiltered on these;
 #: :meth:`_my_trades_loop` already drops other symbols' fills on the way past.
-FILLS_STREAM_ALL_SYMBOLS = {"hyperliquid"}
+#:
+#: Kraken Futures is here for a different reason, and a worse one: CCXT's
+#: ``krakenfutures.watch_my_trades(symbol)`` returns the last N fills of the
+#: account-wide cache, where N counts only THIS symbol's new fills — it never
+#: filters the cache by symbol (every other CCXT venue calls
+#: ``filter_by_symbol_since_limit``). Another market's fill arriving before
+#: the watcher resumes takes our fill's place in that tail, the loop drops it
+#: as not ours, and our fill is never seen: on 2026-10-02 XAU's feed missed
+#: 47 of its 96 executions, each landing on the same account as PAXG / XAUT
+#: fills in the same gold move, and was booked seconds later as an inferred
+#: fill at the order's price, hedged late. Unfiltered, N counts every
+#: symbol's new fills, so the tail holds them all.
+FILLS_STREAM_ALL_SYMBOLS = {"hyperliquid", "krakenfutures"}
 
 #: ``info`` keys the funding rate hides behind, newest venues first. The
 #: engine falls back to a REST ``fetch_funding_rate`` when none is present.
@@ -294,14 +307,19 @@ class VenueFeed:
                  default_type: str = "", extra: Optional[dict] = None,
                  on_raw_ticker: Optional[Callable[[dict], None]] = None,
                  on_raw_fill: Optional[Callable[[dict], None]] = None,
-                 nonce: Optional[Callable[[], int]] = None) -> None:
+                 nonce: Optional[Callable[[], int]] = None,
+                 on_raw_book: Optional[Callable[[dict], None]] = None) -> None:
         """``on_raw_ticker`` / ``on_raw_fill``: the CCXT dicts as they came,
         for a GATEWAY that relays them to its bots (each bot parses them with
         :func:`ticker_from_ccxt` / :func:`trade_from_ccxt`, the same numbers
         this feed would have produced). A fill reaches ``on_raw_fill`` only
         when it is this feed's symbol. ``nonce``: installed on the private
         client, so a gateway signing with one key from several instances
-        draws every nonce from one strictly increasing stream."""
+        draws every nonce from one strictly increasing stream.
+        ``on_raw_book``: the symbol's CCXT order book on every update (a
+        gateway relaying depth for its bots' reports — display only); the
+        book is watched only when it is given, and its failures never touch
+        the market-data verdict, which stays the ticker's."""
         self.exchange_id = exchange_id.lower()
         self.name = f"{self.exchange_id}-ws"
         self.symbol = symbol
@@ -326,6 +344,8 @@ class VenueFeed:
                                        # after every BBO push is cached
         self._on_raw_ticker = on_raw_ticker
         self._on_raw_fill = on_raw_fill
+        self._on_raw_book = on_raw_book
+        self.book_error: Optional[str] = None
         self._nonce = nonce
         self._default_type = default_type
         self.subscribe_timeout_s = float(subscribe_timeout_s)
@@ -714,6 +734,8 @@ class VenueFeed:
         public = self._new_exchange(PUBLIC)
         self._started.set()
         tasks = [asyncio.create_task(self._ticker_loop(public))]
+        if self._on_raw_book is not None:
+            tasks.append(asyncio.create_task(self._book_loop(public)))
         if self._private:
             tasks.append(asyncio.create_task(self._private_supervisor()))
         await self._stop_evt.wait()
@@ -982,6 +1004,29 @@ class VenueFeed:
                 self._clients.pop(PUBLIC, None)
                 self._client_src.pop(PUBLIC, None)
                 await asyncio.sleep(RECONNECT_DELAY_S)
+
+    async def _book_loop(self, exchange) -> None:
+        """The order book on the public client, for ``on_raw_book``. Its own
+        error channel (``book_error``, ``counters["book_errors"]``) and its
+        own back-off: a venue that will not stream depth leaves the ticker,
+        the fills and the quote gate exactly as they were."""
+        delay = RECONNECT_DELAY_S
+        while not self._stop_evt.is_set():
+            try:
+                ob = await exchange.watch_order_book(self.symbol)
+                delay = RECONNECT_DELAY_S
+                self.counters["books"] = self.counters.get("books", 0) + 1
+                try:
+                    self._on_raw_book(ob)
+                except Exception:
+                    self.counters["book_errors"] = self.counters.get("book_errors", 0) + 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.counters["book_errors"] = self.counters.get("book_errors", 0) + 1
+                self.book_error = f"watch_order_book: {type(e).__name__}: {e}"
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
 
     async def _authenticate(self, exchange) -> None:
         """Explicit challenge/response where the venue has one — that is

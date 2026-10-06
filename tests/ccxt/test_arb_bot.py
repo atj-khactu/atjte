@@ -202,10 +202,10 @@ class StubVenue:
             return max(self.free_quote / (price * max(safety, 1.0)), 0.0)
         return None if self.free_base is None else max(self.free_base, 0.0)
 
-    def note_entry_placed(self, units, price):
+    def note_entry_placed(self, units, price, margin=None):
         if self.is_perp and self.available_margin is not None:
-            self.available_margin = max(0.0, self.available_margin
-                                        - units * price * self.im_rate)
+            used = margin if margin is not None else units * price * self.im_rate
+            self.available_margin = max(0.0, self.available_margin - used)
         elif not self.is_perp and self.free_quote is not None:
             self.free_quote = max(0.0, self.free_quote - units * price)
 
@@ -754,11 +754,12 @@ class HedgeCommentTest(unittest.TestCase):
 
 class PlaceTest(unittest.TestCase):
     def setUp(self):
-        self._live = pb.LIVE_TRADING
+        self._live = (pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY)
         pb.LIVE_TRADING = True     # exercise the real place path against stubs
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = None, 1.0
 
     def tearDown(self):
-        pb.LIVE_TRADING = self._live
+        pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = self._live
 
     def _t(self, purpose, side="sell", amount=1.0, price=4450.0):
         return {"side": side, "purpose": purpose, "level_index": 1, "level": 0.5,
@@ -774,27 +775,56 @@ class PlaceTest(unittest.TestCase):
         self.assertIn("boll-exit", bot.orders)
         self.assertEqual(bot.counters["quotes_placed"], 1)
 
-    def test_entry_is_post_only_not_reduce_only_and_margin_fitted(self):
+    def test_entry_is_post_only_not_reduce_only_and_placed_whole(self):
         bot = make_bot([])
         bot.venue = StubVenue(StubExchange(), available_margin=100.0)
         bot._venue_margin_t = 1e12                    # margin "fresh": no refetch
-        # required per units = 4450 * 2 % * safety 2 = 178 USD -> fits 0.561 units
+        # LEVERAGE None: the market's IM rate, 4450 x 2 % = 89 USD <= 100
         bot._place("boll-entry", self._t("entry", side="buy"))
         placed = bot.venue.placed[0]
         self.assertFalse(placed["params"].get("reduceOnly", False))
         self.assertTrue(placed["params"].get("postOnly"))
-        self.assertAlmostEqual(placed["amount"], 0.561, places=3)
-        # cached margin decremented until the next refetch
-        self.assertLess(bot.venue.available_margin, 100.0)
+        self.assertAlmostEqual(placed["amount"], 1.0)          # never shrunk
+        # cached margin decremented by what the check counted, until the refetch
+        self.assertAlmostEqual(bot.venue.available_margin, 11.0)
 
-    def test_entry_skipped_when_margin_cannot_cover_the_minimum(self):
+    def test_entry_blocked_when_notional_over_leverage_exceeds_available(self):
+        """The sample project's rule: notional / leverage > available -> the
+        whole entry is blocked (not shrunk); exits still go."""
         logs = []
         bot = make_bot(logs)
-        bot.venue = StubVenue(StubExchange(), available_margin=0.05)
+        pb.LEVERAGE = 10                               # 4450 / 10 = 445 USD needed
+        bot.venue = StubVenue(StubExchange(), available_margin=444.0)
         bot._venue_margin_t = 1e12
         bot._place("boll-entry", self._t("entry", side="buy"))
         self.assertEqual(bot.venue.placed, [])
-        self.assertTrue(any("available margin" in m for m in logs))
+        self.assertTrue(any("needs 445.00" in m and "444.00 available" in m for m in logs))
+        bot._place("boll-exit", self._t("exit"))
+        self.assertEqual(len(bot.venue.placed), 1)
+        bot.venue.available_margin = 445.0             # exactly enough: placed
+        bot._place("boll-entry", self._t("entry", side="buy"))
+        self.assertAlmostEqual(bot.venue.placed[-1]["amount"], 1.0)
+
+    def test_the_safety_factor_multiplies_the_margin_needed(self):
+        bot = make_bot([])
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = 10, 2.0  # 445 x 2 = 890 needed
+        bot.venue = StubVenue(StubExchange(), available_margin=800.0)
+        bot._venue_margin_t = 1e12
+        bot._place("boll-entry", self._t("entry", side="buy"))
+        self.assertEqual(bot.venue.placed, [])
+
+    def test_strategies_sharing_an_account_block_each_other(self):
+        """The available margin is the ACCOUNT's: what one placement uses is
+        gone for the next one in the same pass (and for the other strategies
+        at their next read)."""
+        bot = make_bot([])
+        pb.LEVERAGE = 10
+        bot.venue = StubVenue(StubExchange(), available_margin=900.0)
+        bot._venue_margin_t = 1e12
+        bot._place("e1", self._t("entry", side="buy"))
+        bot._place("e2", self._t("entry", side="buy", price=4449.0))
+        bot._place("e3", self._t("entry", side="buy", price=4448.0))
+        self.assertEqual(len(bot.venue.placed), 2)     # 445 + 444.9 used, 10.1 left
 
     def test_unknown_margin_lets_the_venue_judge(self):
         bot = make_bot([])
@@ -2071,6 +2101,34 @@ class GatewayHistoryTest(unittest.TestCase):
         bot._srv_offset_s = 0.0
         bot.mt5 = types.SimpleNamespace(rates=lambda *a: [])
         self.assertEqual(bot.history_closes(0.0, 60.0), ({}, {}))
+
+    def test_an_empty_leg_is_asked_again_and_the_retries_are_capped(self):
+        """An MT5 terminal answers copy_rates_range with nothing while it is
+        still downloading the symbol's M1 history: one empty read must not
+        leave the chart's day without its MT5 closes until the next restart."""
+        bot = self._bot(self._Exchange())
+        bot._srv_offset_s = 0.0
+        bot._history_backfilled = False
+        bot.reporter = types.SimpleNamespace(backfill_bars=lambda v, m, now: len(v))
+        reads = iter([({60: 1.0}, {}), ({60: 1.0}, {60: 2.0})])
+        asked = []
+        bot.history_closes = lambda since, now: (asked.append(now), next(reads))[1]
+        t = 1_800_000_000.0
+        bot._backfill_report_bars(t)
+        bot._backfill_report_bars(t + 10)                        # inside the retry delay
+        self.assertEqual(asked, [t])
+        bot._backfill_report_bars(t + pb.HISTORY_RETRY_S + 1)    # the MT5 leg arrives
+        bot._backfill_report_bars(t + 10 * pb.HISTORY_RETRY_S)   # done: no more reads
+        self.assertEqual(asked, [t, t + pb.HISTORY_RETRY_S + 1])
+
+        bot2 = self._bot(self._Exchange())                       # a leg that never comes
+        bot2._srv_offset_s, bot2._history_backfilled = 0.0, False
+        bot2.reporter = types.SimpleNamespace(backfill_bars=lambda v, m, now: 0)
+        n = []
+        bot2.history_closes = lambda since, now: (n.append(now), ({60: 1.0}, {}))[1]
+        for k in range(20):
+            bot2._backfill_report_bars(t + k * (pb.HISTORY_RETRY_S + 1))
+        self.assertEqual(len(n), 1 + pb.HISTORY_RETRIES)
 
 
 class BlackoutWiringTest(unittest.TestCase):

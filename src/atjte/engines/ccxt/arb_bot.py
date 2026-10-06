@@ -418,6 +418,11 @@ REPORT_HISTORY_S = 24 * 3600.0
 #: candles per venue request, and the most requests one history read makes
 HISTORY_PAGE = 720
 HISTORY_PAGES = 4
+#: a leg whose history came back EMPTY is asked again this long after, up
+#: to HISTORY_RETRIES times: an MT5 terminal answers copy_rates_range with
+#: nothing while it is still downloading the symbol's M1 history
+HISTORY_RETRY_S = 120.0
+HISTORY_RETRIES = 3
 #: the broker server's usual UTC offset, when no advancing tick can tell it
 DEFAULT_SRV_OFFSET_S = 3 * 3600.0
 #: how often a venue's funding PAYMENT history is read (a venue that pays
@@ -430,6 +435,7 @@ MIN_MARGIN_LEVEL_MT5 = _cfg("MIN_MARGIN_LEVEL_MT5")
 MIN_MT5_FREE_MARGIN_OPEN = _cfg("MIN_MT5_FREE_MARGIN_OPEN")
 MIN_VENUE_AVAILABLE_MARGIN_USD = _cfg("MIN_VENUE_AVAILABLE_MARGIN_USD")
 PLACE_MARGIN_SAFETY = float(_cfg("PLACE_MARGIN_SAFETY"))
+SPOT_FUNDS_SAFETY = float(_cfg("SPOT_FUNDS_SAFETY"))
 CLOSE_ONLY = _cfg("CLOSE_ONLY")
 RISK_DAY_UTC = bool(_cfg("RISK_DAY_UTC"))
 
@@ -3423,19 +3429,35 @@ class ArbBot:
         self._persist_position()
         return "amended"
 
-    def _placeable_amount(self, key: str, t: dict) -> Optional[float]:
-        """Pre-place funding check for ENTRIES: size the order to what the
-        account can actually carry RIGHT NOW. What "carry" means is the
-        venue's business (``Venue.entry_capacity``) and differs by market
-        kind:
+    def _entry_margin(self, units: float, price: float) -> Optional[float]:
+        """The margin a perpetual ENTRY needs: notional / leverage x
+        ``PLACE_MARGIN_SAFETY`` — the strategy's ``LEVERAGE``, else the
+        market's initial-margin rate (1 / its max leverage). None when
+        neither is known."""
+        if LEVERAGE:
+            per_notional = 1.0 / float(LEVERAGE)
+        elif getattr(self.venue, "im_rate", None):
+            per_notional = float(self.venue.im_rate)
+        else:
+            return None
+        return abs(units) * price * per_notional * PLACE_MARGIN_SAFETY
 
-        - perpetual: available margin ÷ (price × initial-margin rate ×
-          ``PLACE_MARGIN_SAFETY``) — ``availableMargin`` already nets out
-          every open position and resting order, so a fill can never land
-          the account on the margin-call line.
-        - spot: a buy is bounded by the free quote balance (÷ safety, so
-          fees and a moving price cannot make it unaffordable), a sell by
-          the free base balance — spot cannot sell coin it does not hold.
+    def _placeable_amount(self, key: str, t: dict) -> Optional[float]:
+        """Pre-place funding check for ENTRIES, against the ACCOUNT the
+        strategy shares with every other strategy on it:
+
+        - perpetual: BLOCKED (not shrunk) when notional / leverage x
+          ``PLACE_MARGIN_SAFETY`` (default 1) exceeds the account's available
+          margin — the sample project's rule. The available margin is the
+          venue's own account-wide figure, which nets out the open positions
+          (and, where the venue does, the resting orders) of every strategy
+          on the account: Kraken Futures ``availableMargin``, Hyperliquid's
+          USDC total - hold, Lighter's ``available_balance``. One strategy
+          using the margin up blocks the others' entries.
+        - spot: a buy is bounded by the free quote balance (÷
+          ``SPOT_FUNDS_SAFETY``, so fees and a moving price cannot make it
+          unaffordable), a sell by the free base balance — spot cannot sell
+          coin it does not hold; the order is shrunk to fit.
 
         Figures older than ``PLACE_MARGIN_MAX_AGE_S`` (or marked dirty by a
         fill) are refetched first. Exits need no new funding — they reduce —
@@ -3452,15 +3474,27 @@ class ArbBot:
                 self._log_once("preplace_margin", f"pre-place funding check failed: {e}")
                 return None     # cannot verify head-room -> do not place
             self._last_msgs.pop("preplace_margin", None)
-        capacity = self.venue.entry_capacity(t["side"], t["price"], PLACE_MARGIN_SAFETY)
+        if self.is_perp:
+            need = self._entry_margin(amount, t["price"])
+            avail = self.venue.available_margin
+            if need is None or avail is None:
+                return amount          # cannot judge: the venue is the judge
+            if need > avail:
+                self._log_once(f"margin_{key}",
+                               f"skip {key}: {amount:g} {UNIT_LABEL} needs {need:.2f} "
+                               f"{self.venue.quote} margin (notional / leverage"
+                               + (f" x {PLACE_MARGIN_SAFETY:g}" if PLACE_MARGIN_SAFETY != 1 else "")
+                               + f") but the account has {avail:.2f} available")
+                return None
+            self._last_msgs.pop(f"margin_{key}", None)
+            return amount
+        capacity = self.venue.entry_capacity(t["side"], t["price"], SPOT_FUNDS_SAFETY)
         fit = amount if capacity is None else max(min(amount, capacity), 0.0)
         fit = self.venue.amount_to_precision(fit)
         if fit < max(self.amount_min, POS_EPS):
-            have = (f"available margin {(self.venue_available_margin or 0.0):.0f} "
-                    f"{self.venue.quote}" if self.is_perp else
-                    (f"free {self.venue.quote} {(self.venue.free_quote or 0.0):.2f}"
-                     if t["side"] == "buy" else
-                     f"free {self.venue.base} {(self.venue.free_base or 0.0):g}"))
+            have = (f"free {self.venue.quote} {(self.venue.free_quote or 0.0):.2f}"
+                    if t["side"] == "buy" else
+                    f"free {self.venue.base} {(self.venue.free_base or 0.0):g}")
             self._log_once(f"margin_{key}",
                            f"skip {key}: wants {amount:g} {UNIT_LABEL} but {have} "
                            f"only covers {fit:g}")
@@ -3493,7 +3527,9 @@ class ArbBot:
             return
         # keep the cached head-room honest until the next refetch
         if t["purpose"] == "entry":
-            self.venue.note_entry_placed(t["amount"], t["price"])
+            self.venue.note_entry_placed(
+                t["amount"], t["price"],
+                margin=self._entry_margin(t["amount"], t["price"]) if self.is_perp else None)
             self.venue_available_margin = self.venue.available_margin
         rec = OrderRec(key=key, side=t["side"], purpose=t["purpose"],
                        level_index=t["level_index"], level=t["level"],
@@ -4182,6 +4218,8 @@ class ArbBot:
         without the panel opening a connection of its own. Best-effort."""
         if getattr(self, "_history_backfilled", True) or self._srv_offset_s is None:
             return
+        if now < getattr(self, "_history_retry_t", 0.0):
+            return
         self._history_backfilled = True
         try:
             venue, mt5 = self.history_closes(now - REPORT_HISTORY_S, now)
@@ -4189,6 +4227,17 @@ class ArbBot:
             if n:
                 _log(f"report: {n} one-minute bars filled from the gateways' history "
                      f"({len(venue)} {SYMBOL_VENUE} / {len(mt5)} {SYMBOL_MT5} closes)")
+            tries = getattr(self, "_history_tries", 0) + 1
+            self._history_tries = tries
+            if (not venue or not mt5) and tries <= HISTORY_RETRIES:
+                # one leg empty: likely still loading (an MT5 terminal returns
+                # no rates while it downloads them) — ask again shortly, and
+                # backfill_bars completes the one-legged bars written now
+                empty = SYMBOL_VENUE if not venue else SYMBOL_MT5
+                self._history_backfilled = False
+                self._history_retry_t = now + HISTORY_RETRY_S
+                _log(f"report: no {empty} history yet — asking again in "
+                     f"{HISTORY_RETRY_S:g}s (try {tries} of {HISTORY_RETRIES})")
         except Exception as e:
             _log(f"report: history backfill failed ({type(e).__name__}: {e})")
 
@@ -4225,8 +4274,20 @@ class ArbBot:
         (perp), the top of book and the resting quotes."""
         k = self.venue_ticker
         k_ts = getattr(k, "timestamp", None)
-        top = (_reporting.top_block(k.bid, k.ask, k_ts.timestamp() if k_ts else None)
+        feed = getattr(self, "feed", None)
+        try:
+            ex = (feed.get_extra() or {}) if feed is not None else {}
+        except Exception:                                   # noqa: BLE001
+            ex = {}
+        top = (_reporting.top_block(k.bid, k.ask, k_ts.timestamp() if k_ts else None,
+                                    ex.get("bid_size"), ex.get("ask_size"))
                if k else None)
+        # the gateway's order book (display only: the panel's ladder)
+        get_book = getattr(feed, "get_book", None)
+        try:
+            book = _reporting.book_block(get_book() if get_book else None)
+        except Exception:                                   # noqa: BLE001
+            book = None
         margin = balances = funding = None
         if self.is_perp and self._venue_margin_t:
             margin = {"available": self.venue_available_margin,
@@ -4266,7 +4327,7 @@ class ArbBot:
         return _reporting.venue_block(
             venue_id=EXCHANGE_ID, symbol=SYMBOL_VENUE, market_kind=self.venue.kind,
             unit_label=UNIT_LABEL, base=self.venue.base, quote=self.venue.quote,
-            contract_size=self.venue.contract_size, top=top,
+            contract_size=self.venue.contract_size, top=top, book=book,
             position=_reporting.position_block(
                 pos, entry, self.venue_upnl, self.venue_ufunding, self.venue_liq_px,
                 self.mark_px,

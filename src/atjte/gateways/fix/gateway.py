@@ -55,7 +55,7 @@ from atjte.fix.codec import Msg
 from atjte.fix.session import FixSession, SessionDown
 
 from .. import accounts as A
-from ..common import ReadCache
+from ..common import BookThrottle, ReadCache
 from . import protocol as P
 
 DEFAULT_PORT = 5599
@@ -220,11 +220,13 @@ class FixGateway:
         self._read_what = READ_WHAT
         self._reads = ReadCache(READ_TTL_S, clock)
         self._tickers: dict[str, dict] = {}
+        self._books = BookThrottle()                  # symbol -> last book
         self.up = upstream
         if upstream is not None:
             upstream.set_handlers(on_ticker=self._on_up_ticker, on_fill=self._on_up_fill,
                                   on_order=lambda *_a: None,
-                                  on_event=lambda _k: self._push_states())
+                                  on_event=lambda _k: self._push_states(),
+                                  on_book=self._on_up_book)
 
     # ── session plumbing ─────────────────────────────────────────────────────
     def attach(self, session: FixSession) -> None:
@@ -354,6 +356,16 @@ class FixGateway:
                 c.send(P.state(s))
 
     # -- the CCXT side's pushes -----------------------------------------------
+    def _on_up_book(self, symbol: str, b: dict) -> None:
+        """The CCXT side's order book, to this symbol's clients — at most
+        once a second; display only (the bots' report)."""
+        if not self._books.offer(symbol, b):
+            return
+        with self._lock:
+            clients = [c for c in self._clients.values() if c.symbol == symbol]
+        for c in clients:
+            c.send(P.book(b))
+
     def _on_up_ticker(self, symbol: str, t: dict) -> None:
         self._tickers[symbol] = t
         self.counters["tickers"] += 1
@@ -955,6 +967,9 @@ class FixGateway:
         t = self._tickers.get(client.symbol)
         if t is not None:
             client.send(P.ticker(t))
+        b = self._books.last.get(client.symbol)
+        if b is not None:
+            client.send(P.book(b))
         return True
 
     def status(self) -> dict:

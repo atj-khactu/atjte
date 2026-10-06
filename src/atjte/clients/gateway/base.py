@@ -124,7 +124,8 @@ class GatewayConnector(CCXTClient):
         builds one whose hello names none)."""
         return self.GATEWAY_CLASS(name, symbol, account, host=host, port=port, token=token,
                                   dms_s=dms_s, on_ticker=self._ticker_in,
-                                  on_fill=self._fill_in, log=self._log,
+                                  on_fill=self._fill_in, on_book=self._book_in,
+                                  log=self._log,
                                   network=self.network, readonly=self.readonly)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -258,12 +259,21 @@ class GatewayConnector(CCXTClient):
         self._feed = GatewayFeed(self, on_fill=on_fill, on_ticker=on_ticker)
         if self._last_ticker is not None:
             self._feed._ticker_in(self._last_ticker)
+        if getattr(self, "_last_book", None) is not None:
+            self._feed._book_in(self._last_book)
         return self._feed
 
     def _ticker_in(self, t: dict) -> None:
         self._last_ticker = t
         if self._feed is not None:
             self._feed._ticker_in(t)
+
+    def _book_in(self, b: dict) -> None:
+        """The gateway's order book for this symbol — DISPLAY only (the
+        report's ladder): no quote, gate or hedge reads it."""
+        self._last_book = b
+        if self._feed is not None:
+            self._feed._book_in(b)
 
     def _fill_in(self, t: dict) -> None:
         if self._feed is not None:
@@ -301,6 +311,7 @@ class GatewayFeed:
         self._ticker = None
         self._extra: dict = {}
         self._ticker_t = 0.0
+        self._book: Optional[dict] = None
         self.private_reconnect_last = None
         self.ticker_error = None
         self.counters = {"tickers": 0, "fills": 0, "errors": 0, "heartbeats": 0,
@@ -328,6 +339,13 @@ class GatewayFeed:
             except Exception:
                 self.counters["errors"] += 1
 
+    def _book_in(self, b: dict) -> None:
+        if not isinstance(b, dict) or not b.get("bids") or not b.get("asks"):
+            return
+        with self._lock:
+            self._book = b
+        self.counters["books"] = self.counters.get("books", 0) + 1
+
     def _fill_in(self, t: dict) -> None:
         try:
             fill = trade_from_ccxt(self.exchange_id, self.symbol, t)
@@ -350,6 +368,12 @@ class GatewayFeed:
     def get_extra(self) -> dict:
         with self._lock:
             return dict(self._extra)
+
+    def get_book(self) -> Optional[dict]:
+        """The last order book the gateway pushed (``{"bids", "asks", "ts"}``,
+        ``ts`` = when the gateway received it), or None."""
+        with self._lock:
+            return None if self._book is None else dict(self._book)
 
     @property
     def ticker_age_s(self) -> float:

@@ -876,6 +876,26 @@ class CcxtSideTest(unittest.TestCase):
             c.read("withdraw", a=[])
         self.assertEqual([r[1] for r in self.up.reads], ["fetch_balance"])
 
+    def test_the_book_reaches_the_client_on_that_symbol_and_a_late_one(self):
+        books = []
+        c = GatewayClient("xaut_book", "XAUT/USD:USD", host="127.0.0.1", port=self.gw.port,
+                          token=TOKEN, dms_s=60.0, request_timeout_s=3.0,
+                          log=lambda _m: None, on_book=books.append)
+        self.addCleanup(c.stop)
+        self.assertTrue(c.start(5.0))
+        deadline = time.time() + 3
+        book = {"symbol": "XAUT/USD:USD", "bids": [[4400.0, 1.0]], "asks": [[4401.0, 2.0]],
+                "ts": 1.0}
+        self.gw._on_up_book("XAUT/USD:USD", book)
+        self.gw._on_up_book("BTC/USD:USD", {**book, "symbol": "BTC/USD:USD"})
+        while not books and time.time() < deadline:
+            time.sleep(0.01)
+        # the live push may race the replay on attach: the same book twice
+        # is harmless (the bot keeps the latest); another symbol's never comes
+        self.assertTrue(books)
+        self.assertTrue(all(b == book for b in books), books)
+        self.assertEqual(self.gw._books.last["XAUT/USD:USD"], book)   # replayed on attach
+
     def test_tickers_and_fills_reach_the_client_on_that_symbol_only(self):
         self.client()
         self.client("btc_fix", "BTC/USD:USD")

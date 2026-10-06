@@ -161,9 +161,13 @@ class FillsSubscriptionScopeTest(unittest.TestCase):
         hl = VenueFeed("hyperliquid", self.OURS, "k", "s")
         self.assertIsNone(hl.fills_subscription_symbol)
         self.assertIn("hyperliquid", FILLS_STREAM_ALL_SYMBOLS)
-        # a venue that filters server-side keeps its symbol: narrowing the
+        # Kraken Futures too: CCXT's symbol filter there loses fills
+        # (KrakenFuturesFillsTest)
+        self.assertIsNone(feed().fills_subscription_symbol)
+        # a venue that filters correctly keeps its symbol: narrowing the
         # subscription is right wherever it does not cost the confirmation
-        self.assertEqual(feed().fills_subscription_symbol, "XAUT/USD:USD")
+        self.assertEqual(VenueFeed("kraken", "PAXG/USD", "k", "s").fills_subscription_symbol,
+                         "PAXG/USD")
 
     def test_a_market_the_account_never_traded_still_confirms(self):
         """The bug: nothing in the snapshot is ours, and it must STILL count
@@ -196,6 +200,93 @@ class FillsSubscriptionScopeTest(unittest.TestCase):
         self.assertEqual(got[0].amount, 1000.0)
         self.assertEqual(got[0].side.value, "buy")
         self.assertEqual(f.counters["fills"], 1)         # the other never counted
+
+
+class KrakenFuturesFillsTest(unittest.TestCase):
+    """CCXT's ``krakenfutures.watch_my_trades(symbol)`` returns the tail of
+    the ACCOUNT-wide fills cache, sized by THIS symbol's new fills: another
+    market's fill landing before the watcher resumes pushes ours out of the
+    tail. 2026-10-02: XAU's feed missed 47 of 96 executions this way, each
+    beside a PAXG / XAUT fill on the same account in the same gold move.
+
+    Driven through CCXT's own ``handle_my_trades`` and ``watch_my_trades``;
+    only the socket (``subscribe_private``) is replaced."""
+
+    OURS, THEIRS = "XAU/USD:USD", "PAXG/USD:USD"
+
+    @staticmethod
+    def _exchange(batches: list[list[tuple[str, str]]]):
+        import ccxt.pro as ccxtpro
+
+        ex = ccxtpro.krakenfutures()
+
+        def market(symbol, mid):
+            return {"id": mid, "symbol": symbol, "base": symbol.split("/")[0],
+                    "quote": "USD", "settle": "USD", "type": "swap", "spot": False,
+                    "swap": True, "contract": True, "linear": False, "inverse": False,
+                    "active": True, "precision": {}, "limits": {}}
+        ex.set_markets([market(KrakenFuturesFillsTest.OURS, "PF_XAUUSD"),
+                        market(KrakenFuturesFillsTest.THEIRS, "PF_PAXGUSD")])
+
+        class _Client:                                   # resolve: nobody waits here
+            def resolve(self, *_a):
+                pass
+        pending = list(batches)
+
+        async def subscribe_private(_name, _hash, _params=None):
+            if not pending:
+                await asyncio.Event().wait()             # no more frames, ever
+            # every frame of the batch arrives before the watcher resumes
+            for instrument, fill_id in pending.pop(0):
+                ex.handle_my_trades(_Client(), {"feed": "fills", "fills": [{
+                    "instrument": instrument, "time": 1790950000000, "price": 4200.0,
+                    "buy": True, "qty": 1.0, "order_id": "o-" + fill_id,
+                    "fill_id": fill_id, "fill_type": "maker"}]})
+            return ex.myTrades
+        ex.subscribe_private = subscribe_private
+        return ex
+
+    def _run(self, ex, *, symbol_scoped: bool = False) -> list:
+        f = VenueFeed("krakenfutures", self.OURS, "k", "s")
+        got: list = []
+        f._on_fill = got.append
+
+        async def _noop(*_a):
+            return None
+        f._authenticate = _noop
+        f._ensure_heartbeat = _noop
+
+        async def go():
+            f._stop_evt = asyncio.Event()
+            if symbol_scoped:
+                with mock.patch.object(VenueFeed, "fills_subscription_symbol", self.OURS):
+                    task = asyncio.ensure_future(f._my_trades_loop(ex))
+                    await asyncio.sleep(0.2)
+            else:
+                task = asyncio.ensure_future(f._my_trades_loop(ex))
+                await asyncio.sleep(0.2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(go())
+        return [t.trade_id for t in got]
+
+    BATCHES = [[("PF_XAUUSD", "xau-1"), ("PF_PAXGUSD", "paxg-1")],
+               [("PF_PAXGUSD", "paxg-2")],
+               [("PF_XAUUSD", "xau-2"), ("PF_XAUUSD", "xau-3"), ("PF_PAXGUSD", "paxg-3")]]
+
+    def test_a_fill_followed_by_another_markets_is_delivered(self):
+        self.assertEqual(self._run(self._exchange(self.BATCHES)),
+                         ["xau-1", "xau-2", "xau-3"])
+
+    def test_the_symbol_scoped_call_loses_it(self):
+        """The proof the old subscription could not work: the same frames,
+        asked for by symbol, deliver only what no other market overtook."""
+        got = self._run(self._exchange(self.BATCHES), symbol_scoped=True)
+        self.assertNotIn("xau-1", got)
+        self.assertLess(len(got), 3)
 
 
 class NoteErrorTest(unittest.TestCase):
@@ -453,6 +544,46 @@ class LighterTest(unittest.TestCase):
                                0.0666)
         self.assertAlmostEqual(v._read_im_rate({"info": {"marginLevels": [{"initialMargin": 0.02}]}}),
                                0.02)
+
+
+
+class BookLoopTest(unittest.TestCase):
+    """The book loop (a gateway's depth, display only) keeps its failures
+    to itself: the ticker's error channel — the market-data verdict — is
+    never set by it."""
+
+    def test_a_failing_book_stream_is_its_own_error(self):
+        import asyncio
+        from atjte.engines.ccxt import venue_feed as vf
+        got = []
+        feed = vf.VenueFeed("hyperliquid", "BTC/USDC:USDC", on_raw_book=got.append)
+
+        class X:
+            n = 0
+
+            async def watch_order_book(self, symbol):
+                X.n += 1
+                if X.n == 1:
+                    raise RuntimeError("no depth here")
+                if X.n == 2:
+                    return {"bids": [[1.0, 2.0]], "asks": [[1.1, 3.0]]}
+                feed._stop_evt.set()
+                return {"bids": [[1.0, 2.0]], "asks": [[1.1, 3.0]]}
+
+        orig = vf.RECONNECT_DELAY_S
+        vf.RECONNECT_DELAY_S = 0.01
+
+        async def run():
+            feed._stop_evt = asyncio.Event()
+            await asyncio.wait_for(feed._book_loop(X()), 5.0)
+        try:
+            asyncio.run(run())
+        finally:
+            vf.RECONNECT_DELAY_S = orig
+        self.assertEqual(len(got), 2)
+        self.assertIn("no depth here", feed.book_error)
+        self.assertIsNone(feed.ticker_error)
+        self.assertEqual(feed.counters["book_errors"], 1)
 
 
 if __name__ == "__main__":

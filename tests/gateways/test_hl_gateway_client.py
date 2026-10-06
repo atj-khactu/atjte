@@ -122,7 +122,66 @@ class ReadsTest(ClientCase):
         self.assertEqual(got["fetch_funding_history"]["since"], 2000)
 
 
+class OwnFundingTest(unittest.TestCase):
+    """Hyperliquid's funding history is the whole account, and CCXT labels
+    every payment with the REQUESTED symbol (safe_market's fallback): each
+    strategy booked every coin's funding (2026-10-06, the same figure on
+    every symbol). Only the market's own coin is kept."""
+
+    def setUp(self):
+        from atjte.clients.gateway.hyperliquid_gateway import own_funding_rows
+        self.own = own_funding_rows
+        mk = {"XYZ-SP500/USDC:USDC": {"baseName": "xyz:SP500"},
+              "XYZ-JP225/USDC:USDC": {"baseName": "xyz:JP225"}}
+        self.x = types.SimpleNamespace(market=lambda s: mk[s])
+        # what CCXT returns for fetch_funding_history('XYZ-SP500/USDC:USDC'):
+        # every payment labelled with the requested symbol
+        self.rows = [{"symbol": "XYZ-SP500/USDC:USDC", "amount": a,
+                      "info": {"delta": {"coin": c, "usdc": str(a)}}}
+                     for c, a in (("xyz:SP500", 0.20), ("xyz:JP225", 0.13), ("BTC", 0.10))]
+
+    def test_only_the_markets_own_coin_is_kept(self):
+        got = self.own(self.x, "XYZ-SP500/USDC:USDC", self.rows)
+        self.assertEqual([r["amount"] for r in got], [0.20])
+        got = self.own(self.x, "XYZ-JP225/USDC:USDC", self.rows)
+        self.assertEqual([r["amount"] for r in got], [0.13])
+
+    def test_a_payment_without_a_coin_is_left_out(self):
+        rows = self.rows + [{"symbol": "XYZ-SP500/USDC:USDC", "amount": 9.0, "info": {}}]
+        self.assertEqual(len(self.own(self.x, "XYZ-SP500/USDC:USDC", rows)), 1)
+
+    def test_no_symbol_is_the_whole_account(self):
+        self.assertEqual(len(self.own(self.x, None, self.rows)), 3)
+
+    def test_the_connector_filters_what_the_gateway_returns(self):
+        """Through the real CCXT parser, as the gateway serves it."""
+        import ccxt
+        ex = ccxt.hyperliquid()
+        def m(i, base, name):
+            return {"id": str(i), "symbol": f"{base}/USDC:USDC", "base": base,
+                    "quote": "USDC", "settle": "USDC", "baseId": base, "quoteId": "USDC",
+                    "settleId": "USDC", "baseName": name, "type": "swap", "swap": True,
+                    "spot": False, "future": False, "option": False, "contract": True,
+                    "linear": True, "active": True, "precision": {}, "limits": {},
+                    "info": {"name": name}}
+        ex.set_markets([m(110000, "XYZ-SP500", "xyz:SP500"), m(110001, "XYZ-JP225", "xyz:JP225")])
+        raw = [{"time": 1, "hash": "a", "delta": {"coin": "xyz:SP500", "usdc": "0.20"}},
+               {"time": 2, "hash": "b", "delta": {"coin": "xyz:JP225", "usdc": "0.13"}}]
+        parsed = ex.parse_incomes(raw, ex.market("XYZ-JP225/USDC:USDC"))
+        self.assertEqual(len(parsed), 2)           # CCXT keeps both, as JP225's
+        got = self.own(ex, "XYZ-JP225/USDC:USDC", parsed)
+        self.assertEqual([r["amount"] for r in got], [0.13])
+
+
 class FeedTest(ClientCase):
+    def test_a_book_push_reaches_the_feed_for_the_report(self):
+        book = {"symbol": EUR, "bids": [[1.1403, 5000.0], [1.1402, 9000.0]],
+                "asks": [[1.1405, 7000.0]], "ts": 123.0}
+        self.up.h["on_book"](EUR, book)
+        self.assertTrue(wait_for(lambda: self.feed.get_book() is not None))
+        self.assertEqual(self.feed.get_book()["bids"][1], [1.1402, 9000.0])
+        self.assertFalse(self.wakes)          # display only: never wakes the loop
+
     def test_a_ticker_push_reaches_the_engine(self):
         self.up.push_ticker(EUR, {"symbol": EUR, "bid": 1.1403, "ask": 1.1405,
                                   "info": {"markPx": "1.1404", "funding": "0.0000125"}})

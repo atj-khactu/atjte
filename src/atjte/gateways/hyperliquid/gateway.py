@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
 from .. import accounts as A
-from ..common import ReadCache
+from ..common import BookThrottle, ReadCache
 from . import cloid as C
 from . import protocol as P
 
@@ -233,6 +233,7 @@ class HlGateway:
         self._clients: dict[str, _Client] = {}
         self._owned: dict[str, _Owned] = {}           # order id -> owner
         self._tickers: dict[str, dict] = {}           # symbol -> last ticker
+        self._books = BookThrottle(clock=clock)       # symbol -> last book
         self._reads = ReadCache(self.READ_TTL_S, clock)
         self._armed: dict[str, float] = {}            # account -> last arm time
         self._dms_refused: dict[str, float] = {}      # account -> when the venue said no
@@ -253,7 +254,8 @@ class HlGateway:
                          "refused": 0, "adopted": 0, "account_dms_armed": 0,
                          "held_over_cap": 0}
         self.up.set_handlers(on_ticker=self._on_ticker, on_fill=self._on_fill,
-                             on_order=self._on_order, on_event=self._on_event)
+                             on_order=self._on_order, on_event=self._on_event,
+                             on_book=self._on_book)
 
     # ── what differs per venue (a subclass overrides) ────────────────────────
     def _make_ids(self, clock):
@@ -460,6 +462,9 @@ class HlGateway:
         t = self._tickers.get(symbol)
         if t is not None:
             self._send(c, P.ticker(t))
+        b = self._books.last.get(symbol)
+        if b is not None:
+            self._send(c, P.book(b))
         self._log(f"{self.LABEL}: {name} attached ({symbol} on {account}, "
                   f"dms {c.dms_s:g}s, {resumed} order(s) resumed)")
         return c
@@ -676,6 +681,16 @@ class HlGateway:
         for c in list(self._clients.values()):
             if c.symbol == symbol and not c.reaped:
                 self._send(c, P.ticker(t))
+
+    def _on_book(self, symbol: str, b: dict) -> None:
+        """The symbol's order book, to its clients — at most once a second
+        (:class:`BookThrottle`); display only, the bots' report."""
+        if not self._books.offer(symbol, b):
+            return
+        self.counters["books"] = self.counters.get("books", 0) + 1
+        for c in list(self._clients.values()):
+            if c.symbol == symbol and not c.reaped:
+                self._send(c, P.book(b))
 
     def _on_fill(self, account: str, trade: dict) -> None:
         """An own fill goes to the client trading that account + symbol — the

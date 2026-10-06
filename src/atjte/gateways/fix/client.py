@@ -68,7 +68,8 @@ class GatewayClient:
                  venue_symbol: str = "",
                  on_ticker: Optional[Callable[[dict], None]] = None,
                  on_fill: Optional[Callable[[dict], None]] = None,
-                 readonly: bool = False) -> None:
+                 readonly: bool = False,
+                 on_book: Optional[Callable[[dict], None]] = None) -> None:
         self.client, self.symbol = client, symbol
         #: what tag 55 carries when that is not ``symbol`` (Kraken derivatives:
         #: the market id). Mutable on purpose: the connector learns it from
@@ -84,6 +85,7 @@ class GatewayClient:
         #: account (a CCXT own trade), called from the reader thread
         self._on_ticker = on_ticker
         self._on_fill = on_fill
+        self._on_book = on_book     # the symbol's order book (P.BOOK)
         #: reads only, never an order (a backfill beside the running bot)
         self.readonly = bool(readonly)
         self._subscriptions: set[str] = set()
@@ -262,6 +264,9 @@ class GatewayClient:
         elif op == P.FILL:
             self.counters["fills"] += 1
             self._handler(self._on_fill, msg.get("trade") or {}, "fill")
+        elif op == P.BOOK:
+            self.counters["books"] = self.counters.get("books", 0) + 1
+            self._handler(self._on_book, msg.get("book") or {}, "book")
         elif op == P.ERROR:
             self.counters["errors"] += 1
             self.last_error = str(msg.get("error") or "")

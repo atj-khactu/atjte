@@ -67,7 +67,7 @@ class FixGatewayConnector(GatewayConnector):
                                   token=token, dms_s=dms_s,
                                   on_execution=self._on_execution, log=self._log,
                                   on_ticker=self._ticker_in, on_fill=self._fill_in,
-                                  readonly=self.readonly)
+                                  on_book=self._book_in, readonly=self.readonly)
 
 
 class KrakenFixClient(FixGatewayConnector, KrakenClient):

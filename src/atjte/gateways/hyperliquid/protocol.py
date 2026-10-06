@@ -37,9 +37,9 @@ from __future__ import annotations
 from typing import Optional
 
 from atjte.gateways.fix.protocol import (  # noqa: F401  (re-exported)
-    AMEND, BYE, CANCEL, CANCEL_ALL, ERROR, ERROR_TYPES, FILL, HELLO, MAX_LINE, PING,
+    AMEND, BOOK, BYE, CANCEL, CANCEL_ALL, ERROR, ERROR_TYPES, FILL, HELLO, MAX_LINE, PING,
     PLACE, PONG, READ, REPLY, STATE, TICKER, WELCOME, LineReader, ProtocolError,
-    amend, bye, cancel, cancel_all, dumps, error, fill, loads, ping, pong, place,
+    amend, book, bye, cancel, cancel_all, dumps, error, fill, loads, ping, pong, place,
     read, redact, reply_err, reply_ok, state, ticker, welcome,
 )
 

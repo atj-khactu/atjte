@@ -22,13 +22,13 @@ def _value(text):
 
 
 class SamplesTest(unittest.TestCase):
-    def test_each_sample_is_a_small_1x_settings_file(self):
+    def test_every_sample_is_a_sane_settings_file(self):
         files = S.sample_files()
         self.assertTrue(files, "atjte ships at least one sample strategy")
         for f in files:
             body = S.load(f.name)
             s = {k: _value(v) for k, v in body["settings"].items()}
-            self.assertEqual(s["LEVERAGE"], 1, f.name)
+            self.assertIs(body.get("sample"), True, f.name)
             self.assertEqual(s["MARGIN_MODE"], "isolated", f.name)
             self.assertIs(s["DYNAMIC_ALLOCATION"], False, f.name)     # the fixed caps apply
             self.assertEqual(s["SPREAD_UNIT"], "abs", f.name)         # the grid step is in points
@@ -37,6 +37,30 @@ class SamplesTest(unittest.TestCase):
             self.assertLessEqual(s["ORDER_VOLUME"], s["MAX_SHORT_UNITS"], f.name)
             self.assertGreater(s["MAX_DAILY_LOSS_USD"], 0, f.name)
             self.assertTrue(body["symbol_venue"] and body["symbol_mt5"], f.name)
+            # the instrument's own settings stay with the project: Import keeps them
+            for name in ("SYMBOL_VENUE", "SYMBOL_MT5", "HEDGE_RATIO", "FX_CONVERSION_SYMBOL",
+                         "LIVE_TRADING"):
+                self.assertNotIn(name, body["settings"], f.name)
+            self.assertFalse([k for k in body["settings"] if k.startswith("_")], f.name)
+
+    def test_the_small_presets_are_1x(self):
+        small = [f for f in S.sample_files() if f.stem.endswith("_small_1x")]
+        self.assertTrue(small)
+        for f in small:
+            s = {k: _value(v) for k, v in S.load(f.name)["settings"].items()}
+            self.assertEqual(s["LEVERAGE"], 1, f.name)
+
+    def test_the_live_samples_carry_the_whole_form(self):
+        """The ATJ live presets are a full export of a running strategy, so
+        Import sets every field, not a handful over whatever was there."""
+        live = [f for f in S.sample_files() if f.stem.endswith("_atj_live")]
+        self.assertEqual(len(live), 3)
+        for f in live:
+            body = S.load(f.name)
+            self.assertGreaterEqual(len(body["settings"]), 60, f.name)
+            # a live preset still names its pair, so it is offered for that pair only
+            self.assertIn(f.name, [m["name"] for m in
+                                   S.samples_for(body["symbol_venue"], body["symbol_mt5"])])
 
     def test_a_sample_fits_its_own_pair_only(self):
         body = S.load(S.sample_files()[0].name)

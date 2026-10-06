@@ -38,7 +38,7 @@ from typing import Any, Callable, Optional
 
 from atjte.engines.ccxt.venue_feed import VenueFeed
 
-from ..common import jsonable, markets_payload
+from ..common import book_payload, jsonable, markets_payload
 
 TICKER_KEYS = ("symbol", "bid", "ask", "last", "bidVolume", "askVolume", "timestamp",
                "info")
@@ -111,9 +111,10 @@ class CcxtUpstream:
                          "rest_calls": 0, "ws_calls": 0, "reads": 0}
 
     # ── wiring ───────────────────────────────────────────────────────────────
-    def set_handlers(self, *, on_ticker, on_fill, on_order, on_event) -> None:
+    def set_handlers(self, *, on_ticker, on_fill, on_order, on_event,
+                     on_book=None) -> None:
         self._h = {"ticker": on_ticker, "fill": on_fill, "order": on_order,
-                   "event": on_event}
+                   "event": on_event, "book": on_book}
 
     def accounts(self) -> list[str]:
         return list(self._creds)
@@ -196,7 +197,10 @@ class CcxtUpstream:
                 password=creds.get("password", ""), default_type=self.default_type,
                 on_raw_ticker=lambda t, s=symbol: self._ticker_in(s, t),
                 on_raw_fill=lambda t, a=account, s=symbol: self._fill_in(a, s, t),
-                nonce=self._nonces[account])
+                nonce=self._nonces[account],
+                **({"on_raw_book": lambda ob, s=symbol: self._book_in(s, ob)}
+                   if self._h.get("book") is not None and not self._booked(symbol)
+                   else {}))
             self._feeds[key] = feed
             self._seen_fills[key] = set()
         feed.start()
@@ -218,6 +222,17 @@ class CcxtUpstream:
         with self._feeds_lock:
             return [f for (a, s), f in self._feeds.items()
                     if (symbol is None or s == symbol) and (account is None or a == account)]
+
+    def _booked(self, symbol: str) -> bool:
+        """A feed already streams this symbol's book (one per symbol, not
+        per account: the book is public). Called under ``_feeds_lock``."""
+        return any(s == symbol for (_a, s) in self._feeds)
+
+    def _book_in(self, symbol: str, ob: dict) -> None:
+        b = book_payload(symbol, ob)
+        h = self._h.get("book")
+        if b is not None and h is not None:
+            h(symbol, b)
 
     def _ticker_in(self, symbol: str, t: dict) -> None:
         self.counters["tickers"] += 1

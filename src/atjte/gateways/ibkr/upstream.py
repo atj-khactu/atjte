@@ -162,9 +162,10 @@ class IbkrUpstream:
                          "posts": 0, "reads": 0, "reconnects": 0}
 
     # ── wiring ───────────────────────────────────────────────────────────────
-    def set_handlers(self, *, on_ticker, on_fill, on_order, on_event) -> None:
+    def set_handlers(self, *, on_ticker, on_fill, on_order, on_event,
+                     on_book=None) -> None:
         self._h = {"ticker": on_ticker, "fill": on_fill, "order": on_order,
-                   "event": on_event}
+                   "event": on_event, "book": on_book}
 
     def accounts(self) -> list[str]:
         return list(self._accounts)

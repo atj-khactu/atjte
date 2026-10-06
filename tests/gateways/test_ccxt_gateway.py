@@ -486,6 +486,33 @@ class UpstreamTest(unittest.TestCase):
         up.open_stream("main", BTC)
         return up, conns
 
+    def test_the_book_is_streamed_once_per_symbol_and_trimmed(self):
+        """Depth for the bots' reports: one feed per SYMBOL watches it (the
+        book is public), only when the gateway asked for it."""
+        books = []
+        up = U.CcxtUpstream("coinbase", {"main": {"apiKey": "k", "secret": "s"},
+                                         "sub": {"apiKey": "k2", "secret": "s2"}},
+                            feed_factory=FakeFeed,
+                            client_factory=lambda ex, creds, nonce: FakeConnector(None))
+        up.set_handlers(on_ticker=lambda *a: None, on_fill=lambda *a: None,
+                        on_order=lambda *a: None, on_event=lambda *a: None,
+                        on_book=lambda s, b: books.append((s, b)))
+        up.start()
+        self.addCleanup(up.stop)
+        up.open_stream("main", BTC)
+        up.open_stream("sub", BTC)
+        main, sub_ = up._feed("main", BTC), up._feed("sub", BTC)
+        self.assertIn("on_raw_book", main.kw)
+        self.assertNotIn("on_raw_book", sub_.kw)          # one book stream per symbol
+        main.kw["on_raw_book"]({"bids": [[100 - i, 1] for i in range(20)],
+                                "asks": [[101, 2]]})
+        self.assertEqual(books[0][0], BTC)
+        self.assertEqual(len(books[0][1]["bids"]), 10)
+
+    def test_no_book_handler_no_book_stream(self):
+        up, _ = self.make()
+        self.assertNotIn("on_raw_book", up._feed("main", BTC).kw)
+
     def test_orders_over_the_socket_where_ccxt_pro_can(self):
         up, conns = self.make()
         self.assertEqual(up.transport_for("main", BTC), "ws")

@@ -401,13 +401,17 @@ MIN_QUOTE_FREE_OPEN = 100.0
 # "cannot sell more than the base" floor are built for. A number opens the
 # venue's margin trading instead (passed as the order's leverage).
 VENUE_LEVERAGE = None
-# Pre-place sizing: an ENTRY is shrunk to what the account can actually
-# carry — on a perp, required margin = notional x the contract's
-# initial-margin rate (read from the venue at startup) x this safety factor,
-# so a fill never lands the account on the margin call line; on spot, the
-# free quote balance divided by this factor (head-room for fees and a
-# moving price), and a sell can never exceed the free base balance.
-PLACE_MARGIN_SAFETY = 2.0
+# Pre-place check, PERPETUALS: an ENTRY is BLOCKED when its margin —
+# notional / LEVERAGE (the market's initial-margin rate when LEVERAGE is
+# None) x this factor — exceeds the account's available margin. The
+# available margin is account-wide (every strategy's positions netted out),
+# so strategies sharing an account block each other's entries once it is
+# used up. 1.0 = the sample project's rule.
+PLACE_MARGIN_SAFETY = 1.0
+# Pre-place sizing, SPOT: a buy is shrunk to the free quote balance divided
+# by this factor (head-room for fees and a moving price); a sell can never
+# exceed the free base balance.
+SPOT_FUNDS_SAFETY = 2.0
 # Manual master switch: True = the bot only reduces existing exposure. Flip
 # it in a strategy's own settings file to wind that strategy down.
 CLOSE_ONLY = False

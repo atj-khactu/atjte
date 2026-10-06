@@ -148,6 +148,27 @@ class ReporterTest(unittest.TestCase):
         self.assertNotIn(m - 30 * 86400, rows)                   # past the retention
         self.assertEqual(self.rep.backfill_bars(venue, mt5, now), 0)   # idempotent
 
+    def test_a_held_bar_missing_a_leg_is_completed_never_overwritten(self):
+        """A run whose MT5 history came back empty (the terminal was still
+        loading it) wrote venue-only bars; the next read must fill their MT5
+        close in, or that stretch of the spread chart stays blank for good."""
+        now = 1_800_000_000.0 + 30
+        m = R.minute(now)
+        with self.rep.bars_file.open("w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": m - 180, "venue": 10.0, "mt5": None, "src": "history"}) + "\n")
+            fh.write(json.dumps({"ts": m - 120, "venue": 1.0, "mt5": 2.0}) + "\n")      # the bot's own
+            fh.write(json.dumps({"ts": m - 60, "venue": None, "mt5": 22.0, "src": "history"}) + "\n")
+        venue = {m - 180: 99.0, m - 120: 99.0, m - 60: 12.0}
+        mt5 = {m - 180: 20.0, m - 120: 99.0, m - 60: 99.0, m - 240: 19.0}
+        self.assertEqual(self.rep.backfill_bars(venue, mt5, now), 3)   # 2 completed + 1 new
+        rows = {r["ts"]: r for r in R.read_jsonl(self.rep.bars_file)}
+        self.assertEqual((rows[m - 180]["venue"], rows[m - 180]["mt5"]), (10.0, 20.0))
+        self.assertEqual((rows[m - 120]["venue"], rows[m - 120]["mt5"]), (1.0, 2.0))   # kept
+        self.assertEqual((rows[m - 60]["venue"], rows[m - 60]["mt5"]), (12.0, 22.0))
+        self.assertEqual((rows[m - 240]["venue"], rows[m - 240]["mt5"]), (None, 19.0))
+        self.assertEqual(len(R.read_jsonl(self.rep.bars_file)), 4)     # no duplicate minutes
+        self.assertEqual(self.rep.backfill_bars(venue, mt5, now), 0)   # idempotent
+
     def test_a_funding_payment_read_twice_is_booked_once(self):
         rec = R.funding_record("hyperliquid", ts=1.0, usd=-0.42, symbol="X",
                                id="funding:X:1000")
@@ -557,6 +578,25 @@ class AtomicWriteTest(unittest.TestCase):
                  if isinstance(n, ast.Call)}
         self.assertIn("_reporting.atomic_write_json", calls)
         self.assertNotIn("os.replace", calls)
+
+
+
+class BookBlockTest(unittest.TestCase):
+    def test_top_carries_sizes_and_the_book_is_trimmed(self):
+        from atjte import reporting as R
+        t = R.top_block(100.0, 101.0, 5.0, 2.0, 3.0)
+        self.assertEqual((t["bid_size"], t["ask_size"]), (2.0, 3.0))
+        self.assertNotIn("bid_size", R.top_block(100.0, 101.0, 5.0))
+        b = R.book_block({"bids": [[100 - i, 1] for i in range(15)],
+                          "asks": [[101, "2"]], "ts": 7.0})
+        self.assertEqual(len(b["bids"]), R.BOOK_LEVELS)
+        self.assertEqual(b["asks"], [[101.0, 2.0]])
+        self.assertEqual(b["ts"], 7.0)
+        self.assertIsNone(R.book_block({"bids": [], "asks": [[1, 1]]}))
+        self.assertIsNone(R.book_block(None))
+        v = R.venue_block(venue_id="x", symbol="S", market_kind="swap",
+                          unit_label="u", top=t, book=b)
+        self.assertIs(v["book"], b)
 
 
 if __name__ == "__main__":

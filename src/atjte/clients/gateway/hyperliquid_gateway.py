@@ -29,6 +29,35 @@ def gateway_token_from_env(name: str = TOKEN_NAME) -> str:
     return _base.gateway_token_from_env(name)
 
 
+def own_funding_rows(exchange, symbol, rows) -> list:
+    """The funding payments that are ``symbol``'s own, by the coin Hyperliquid
+    names in each payment (``info.delta.coin``).
+
+    Hyperliquid's ``userFunding`` is the whole account, and CCXT's
+    ``parse_income`` maps each payment's coin to a SYMBOL-shaped id that is
+    never one of Hyperliquid's (numeric) market ids, so ``safe_market`` falls
+    back to the REQUESTED market: every payment of every coin comes back
+    labelled ``symbol`` (ccxt 4.5.84). Each strategy on the account then
+    booked the account's whole funding as its own — the same figure on every
+    symbol (reported 2026-10-06). The coin is the market's ``baseName``, the
+    name CCXT itself sends Hyperliquid for a perp (``xyz:SP500``). A payment
+    without a coin is not attributable and is left out."""
+    if symbol is None:
+        return list(rows or [])
+    try:
+        coin = str((exchange.market(symbol) or {}).get("baseName") or "")
+    except Exception:                                       # noqa: BLE001
+        coin = ""
+    if not coin:
+        return list(rows or [])
+    out = []
+    for r in rows or []:
+        delta = ((r or {}).get("info") or {}).get("delta") or {}
+        if str(delta.get("coin") or "").lower() == coin.lower():
+            out.append(r)
+    return out
+
+
 class HyperliquidGatewayClient(GatewayConnector):
     exchange_id = "hyperliquid"
     name = "hyperliquid-gw"
@@ -79,8 +108,9 @@ class HyperliquidGatewayClient(GatewayConnector):
                            since=since, limit=limit)
 
         def fetch_funding_history(symbol=None, since=None, limit=None, params=None):
-            return gw.read("fetch_funding_history", symbol=symbol, since=since,
+            rows = gw.read("fetch_funding_history", symbol=symbol, since=since,
                            limit=limit, params=dict(params or {}))
+            return own_funding_rows(x, symbol, rows)    # the account's, by coin
 
         for fn in (fetch_balance, fetch_positions, fetch_open_orders, fetch_order,
                    fetch_my_trades, fetch_closed_orders, fetch_ohlcv,

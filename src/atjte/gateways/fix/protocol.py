@@ -81,6 +81,8 @@ MD = "md"
 #: trades) — what a bot's own sockets used to deliver
 TICKER = "ticker"
 FILL = "fill"
+#: the client's symbol's order book, a few levels a side (common.book_payload)
+BOOK = "book"
 
 #: keys whose VALUE must never reach a log
 _SECRET_KEYS = frozenset({"token"})
@@ -221,6 +223,12 @@ def market_data(book: dict) -> dict:
 
 def read(req_id: int, what: str, args: Optional[dict] = None) -> dict:
     return {"op": READ, "id": int(req_id), "what": what, "args": dict(args or {})}
+
+
+def book(b: dict) -> dict:
+    """The client's symbol's order book: ``{"symbol", "bids": [[price, size],
+    ...], "asks": [...], "ts"}``, best first (``common.book_payload``)."""
+    return {"op": BOOK, "book": b}
 
 
 def ticker(t: dict) -> dict:
