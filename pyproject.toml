@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atjte"
-version = "0.2.3"
+version = "0.2.4"
 description = "ATJ trading engines: cross-venue arbitrage market making between crypto exchanges (CCXT) and CFD platforms (MetaTrader 5)"
 readme = "README.md"
 license = "MIT"
@@ -33,10 +33,15 @@ dependencies = [
 [project.optional-dependencies]
 # The MetaTrader 5 terminal API — Windows only, needed for the MT5 hedge leg.
 mt5 = ["MetaTrader5>=5.0.5735; platform_system == 'Windows'"]
-# The cTrader Open API connector (Twisted based).
-ctrader = ["ctrader-open-api>=0.9.2", "service_identity"]
+# The cTrader gateway (atjte.gateways.ctrader): it speaks the Open API wire
+# itself over the vendored Spotware messages, so only protobuf. (The older
+# direct connector atjte.clients.ctrader still needs ctrader-open-api, whose
+# pins never resolve here: pip install ctrader-open-api --no-deps.)
+ctrader = ["protobuf>=4.21"]
 # Interactive Brokers through TWS / IB Gateway (the IBKR gateway).
 ibkr = ["ib_async>=2.0"]
+# Databento market data (the Databento gateway: historical + live bars).
+databento = ["databento>=0.87"]
 
 [project.scripts]
 atjte = "atjte.cli:main"
@@ -59,6 +64,8 @@ atjte = [
     "strategy_types/*/*/*.py",
     # what `atjte-gateway --new` copies (gateway.json, gateway.env.example, launchers)
     "gateways/templates/*/*",
+    # the MIT notice of the vendored cTrader Open API messages
+    "gateways/ctrader/messages/LICENSE.spotware",
     # samples the control panel imports: event calendars, strategy settings
     "samples/*/*.csv",
     "samples/*/*.json",

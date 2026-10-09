@@ -82,6 +82,9 @@ class _Client:
 
 
 class MT5Gateway:
+    #: the prefix of every log line (a subclass serving another platform names itself)
+    label = "mt5 gateway"
+
     def __init__(self, backend: Any, *, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
                  token: str = "", allowed_clients: Optional[set] = None,
                  tick_poll_s: float = TICK_POLL_S,
@@ -123,7 +126,7 @@ class MT5Gateway:
                              (self._reap_loop, "mt5-gw-reap"),
                              (self._tick_loop, "mt5-gw-ticks")):
             threading.Thread(target=target, name=name, daemon=True).start()
-        self._log(f"mt5 gateway: listening on {self.host}:{self.port}")
+        self._log(f"{self.label}: listening on {self.host}:{self.port}")
 
     def stop(self) -> None:
         self._stop.set()
@@ -181,16 +184,16 @@ class MT5Gateway:
             self._reconnect_t = now
             try:
                 self.backend.reconnect()
-                self._log("mt5 gateway: terminal channel re-opened")
+                self._log(f"{self.label}: terminal channel re-opened")
                 h = self._backend("health")
             except Exception as e:
-                self._log(f"mt5 gateway: reconnect failed: {e}")
+                self._log(f"{self.label}: reconnect failed: {e}")
         self._health = h
         if before and not h.get("ok"):
-            self._log(f"mt5 gateway: the terminal cannot hedge — "
+            self._log(f"{self.label}: the terminal cannot hedge — "
                       f"{'; '.join(h.get('reasons') or [])}")
         elif not before and h.get("ok"):
-            self._log("mt5 gateway: the terminal can hedge again")
+            self._log(f"{self.label}: the terminal can hedge again")
         return h
 
     def session(self) -> dict:
@@ -240,7 +243,7 @@ class MT5Gateway:
                     if client.reaped:
                         return
         except (OSError, P.ProtocolError) as e:
-            self._log(f"mt5 gateway: connection error: {e}")
+            self._log(f"{self.label}: connection error: {e}")
         finally:
             if client is not None:
                 self._reap(client, "connection closed")
@@ -252,7 +255,7 @@ class MT5Gateway:
     def _hello(self, sock: socket.socket, msg: dict) -> Optional[_Client]:
         def refuse(why: str) -> None:
             self.counters["refused"] += 1
-            self._log(f"mt5 gateway: refused a client: {why}")
+            self._log(f"{self.label}: refused a client: {why}")
             self._raw(sock, P.error(why))
 
         if msg.get("op") != P.HELLO:
@@ -291,7 +294,7 @@ class MT5Gateway:
             self.counters["clients"] += 1
         self._send(c, P.welcome(self.session(), client=name))
         c.ready_sent = self.ready
-        self._log(f"mt5 gateway: {name} attached (magic {magic})")
+        self._log(f"{self.label}: {name} attached (magic {magic})")
         return c
 
     # ── requests ─────────────────────────────────────────────────────────────
@@ -353,7 +356,7 @@ class MT5Gateway:
     def _place(self, c: _Client, args: list, kwargs: dict) -> Any:
         order_type = kwargs.get("order_type", args[3] if len(args) > 3 else OrderType.MARKET)
         if order_type is not OrderType.MARKET:
-            raise Refusal(f"the MT5 gateway sends MARKET hedges only (got "
+            raise Refusal(f"the {self.label} sends MARKET hedges only (got "
                           f"{getattr(order_type, 'value', order_type)}) — the engine never "
                           f"rests an MT5 order, and nothing here would pull one")
         self._refuse_if_unfit()
@@ -409,7 +412,7 @@ class MT5Gateway:
             try:
                 self.check_health()
             except Exception as e:
-                self._log(f"mt5 gateway: health check error: {e}")
+                self._log(f"{self.label}: health check error: {e}")
             self._push_states()
             if not self._clients:
                 # nobody polling: keep the health verdict honest anyway
@@ -425,7 +428,7 @@ class MT5Gateway:
             c.reaped, c.alive = True, False
             self._clients.pop(c.name, None)
         self.counters["reaped"] += 1
-        self._log(f"mt5 gateway: {c.name} detached ({why}); its hedges stay as they are")
+        self._log(f"{self.label}: {c.name} detached ({why}); its hedges stay as they are")
         try:
             c.sock.close()
         except OSError:

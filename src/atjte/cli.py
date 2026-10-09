@@ -11,6 +11,11 @@
                                                     ccxt, no MT5, no state files touched
     atjte report <strategy_dir> [--days N] [--json] what the bot reported (atjte.reporting): account,
                                                     position, MT5 book, realized PnL by day — no venue call
+    atjte spread-history --exchange X --symbol S --gateway-port P --mt5-symbol M
+                         --mt5-port Q --timeframe 1h --since YYYY-MM-DD --out FILE
+                                                    the historical spread of ANY venue symbol vs
+                                                    ANY MT5 symbol, through their gateways
+                                                    (read-only; atjte.spread_history)
     atjte gateway NAME | --new NAME --venue V | …   exactly ``atjte-gateway`` — here so a frozen
                                                     application can run its gateways by
                                                     relaunching itself, as it does its bots
@@ -24,7 +29,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 COMMANDS = ("bot", "migrate", "workspace", "version", "mt5-probe", "report",
-            "backfill", "fixcheck", "gateway", "reporter")
+            "backfill", "fixcheck", "gateway", "reporter", "spread-history")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -91,6 +96,41 @@ def _parser() -> argparse.ArgumentParser:
                          "backfill reaches further back than the seed)")
     bf.add_argument("--dry-run", action="store_true", help="fetch and count, write nothing")
     bf.add_argument("--json", action="store_true", help="the summary as JSON")
+
+    sh = sub.add_parser("spread-history", help="fetch the historical spread of a venue symbol "
+                                               "vs an MT5 symbol through their gateways")
+    sh.add_argument("--exchange", required=True, help="the venue's exchange id (ibkr, "
+                                                      "hyperliquid, coinbase, krakenfutures, …)")
+    sh.add_argument("--symbol", required=True, help="the venue market (CCXT symbol)")
+    sh.add_argument("--gateway-port", type=int, required=True,
+                    help="the venue gateway's listen_port")
+    sh.add_argument("--account", default="main", help="the gateway account (default main)")
+    sh.add_argument("--network", default="", help="mainnet / testnet, live / paper")
+    sh.add_argument("--fix", action="store_true", help="the gateway is a Kraken FIX gateway")
+    sh.add_argument("--mt5-symbol", required=True)
+    sh.add_argument("--mt5-port", type=int, required=True,
+                    help="the hedge gateway's listen_port (MT5 or cTrader)")
+    sh.add_argument("--mt5-kind", default=None, choices=["mt5", "ctrader"],
+                    help="the hedge gateway's kind (default: the instance on --mt5-port)")
+    sh.add_argument("--timeframe", default="1h", help="1m 5m 15m 30m 1h 4h 1d")
+    sh.add_argument("--since", required=True, metavar="YYYY-MM-DD", help="UTC")
+    sh.add_argument("--until", default=None, metavar="YYYY-MM-DD", help="UTC (default now)")
+    sh.add_argument("--mt5-offset-h", type=float, default=None,
+                    help="the broker clock's offset from UTC (needed when the MT5 market "
+                         "is closed)")
+    sh.add_argument("--label", default="", help="a name for the series (the page shows it)")
+    sh.add_argument("--price", default="trades", choices=["trades", "mid"],
+                    help="a data gateway's price basis: trade bars, or the bid/offer mid")
+    sh.add_argument("--quote-only", action="store_true",
+                    help="only ask what the fetch costs (a billed data gateway: "
+                         "Databento) and print it as a QUOTE line; fetch nothing")
+    sh.add_argument("--max-cost", type=float, default=None, metavar="USD",
+                    help="the cost the operator confirmed: a billed fetch quoted above "
+                         "it is refused (required for Databento)")
+    sh.add_argument("--append", action="store_true",
+                    help="extend the series already in --out (same pair and timeframe) "
+                         "from its last bar instead of fetching the whole window")
+    sh.add_argument("--out", type=Path, default=None, help="the JSON file to write")
     return p
 
 
@@ -181,6 +221,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             print(backfill.format_summary(summary))
         return 1 if summary.get("errors") else 0
+    if args.command == "spread-history":
+        from . import spread_history as sh
+        if args.quote_only:
+            try:
+                q = sh.quote(exchange_id=args.exchange, symbol=args.symbol,
+                             gateway_port=args.gateway_port, timeframe=args.timeframe,
+                             since_ts=sh.parse_day(args.since),
+                             until_ts=sh.parse_day(args.until), price=args.price,
+                             out=args.out, mt5_symbol=args.mt5_symbol, append=args.append,
+                             log=lambda m: print(m, flush=True))
+            except Exception as e:
+                print(f"atjte spread-history: {type(e).__name__}: {e}", file=sys.stderr,
+                      flush=True)
+                return 2
+            print("QUOTE " + json.dumps(q), flush=True)
+            return 0
+        if args.out is None:
+            print("atjte spread-history: --out is required (or --quote-only)",
+                  file=sys.stderr)
+            return 2
+        try:
+            meta = sh.run(
+                exchange_id=args.exchange, symbol=args.symbol, gateway_port=args.gateway_port,
+                account=args.account, network=args.network, fix=args.fix,
+                mt5_symbol=args.mt5_symbol, mt5_port=args.mt5_port, mt5_kind=args.mt5_kind,
+                timeframe=args.timeframe,
+                since_ts=sh.parse_day(args.since), until_ts=sh.parse_day(args.until),
+                mt5_offset_s=None if args.mt5_offset_h is None else args.mt5_offset_h * 3600.0,
+                out=args.out, label=args.label, price=args.price, max_cost=args.max_cost,
+                append=args.append,
+                log=lambda m: print(m, flush=True))
+        except Exception as e:
+            print(f"atjte spread-history: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            return 2
+        return 0 if meta.get("bars") else 1
     if args.command == "bot":
         from . import runtime
         return runtime.run_strategy(args.strategy_dir, args.type_name, check=args.check)

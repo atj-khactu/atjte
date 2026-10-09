@@ -160,6 +160,43 @@ class OrdersTest(unittest.TestCase):
         self.assertEqual(c.gateway.calls[-2:], [("cancel", "O-1"), ("cancel_all",)])
 
 
+class CancelFinalTest(unittest.TestCase):
+    """cancel_order_final: the order's final state from the cancel's own
+    ExecutionReport — only when 39 is terminal and 14 (CumQty) is there."""
+
+    def _reply(self, info):
+        gw = FakeGateway()
+        gw.cancel = lambda order_id: (gw.calls.append(("cancel", order_id)) or {
+            "id": order_id, "symbol": XAUT, "side": "sell", "type": "limit",
+            "amount": 1.0, "price": 4130.0, "filled": float(info.get("14") or 0.0),
+            "remaining": 0.0, "status": "canceled", "info": info})
+        return _client(gw)
+
+    def test_a_canceled_report_with_cum_qty_settles_the_order(self):
+        c = self._reply({"39": "4", "14": "0.3", "151": "0"})
+        o = c.cancel_order_final("O-1", XAUT)
+        self.assertIsNotNone(o)
+        self.assertAlmostEqual(o.filled, 0.3)
+        self.assertIn(("cancel", "O-1"), c.gateway.calls)
+
+    def test_filled_and_expired_are_final_too(self):
+        for status in ("2", "C"):
+            self.assertIsNotNone(self._reply({"39": status, "14": "1"})
+                                 .cancel_order_final("O-1", XAUT), status)
+
+    def test_pending_cancel_is_not_final(self):
+        # the CCXT mapping calls 39=6 "canceled"; a fill can still land after it
+        self.assertIsNone(self._reply({"39": "6", "14": "0"}).cancel_order_final("O-1", XAUT))
+
+    def test_no_cum_qty_is_not_read_as_nothing_filled(self):
+        self.assertIsNone(self._reply({"39": "4"}).cancel_order_final("O-1", XAUT))
+
+    def test_a_reply_without_the_report_is_not_final(self):
+        c = _client()                                     # FakeGateway.cancel answers {}
+        self.assertIsNone(c.cancel_order_final("O-1", XAUT))
+        self.assertIn(("cancel", "O-1"), c.gateway.calls)  # but it WAS cancelled
+
+
 class TokenTest(unittest.TestCase):
     def test_the_token_comes_from_the_environment_by_name_and_is_never_shown(self):
         with mock.patch.dict(os.environ, {"kraken_fix_gateway_token": TOKEN}):

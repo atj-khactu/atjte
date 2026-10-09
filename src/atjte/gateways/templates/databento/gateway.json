@@ -1,0 +1,10 @@
+{
+  "_comment": "A Databento gateway: one process per Databento API key serves market DATA over loopback - historical bars, the cost of a fetch before it is made, and live 1 m bars - to the Spread History page. It trades nothing. 'dataset' is Databento's (GLBX.MDP3 = CME Globex); 'symbols' are raw exchange symbols (GCZ6) or continuous ones (GC.c.0). 'live' streams 1 m bars (needs a live subscription for the dataset).",
+  "name": "db_cme",
+  "venue": "databento",
+  "listen_port": 5670,
+  "dataset": "GLBX.MDP3",
+  "symbols": ["GCZ6", "GC.c.0"],
+  "live": true,
+  "clients": []
+}

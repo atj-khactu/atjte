@@ -110,7 +110,8 @@ def _tls_connect(host: str, port: int, timeout_s: float, verify: bool = True):
     :func:`atjte.fix.session.FixSession`) refuses it on a host that does not
     look like a sandbox.
     """
-    ctx = ssl.create_default_context()
+    from atjte.tls import client_context    # the OS store + certifi's roots
+    ctx = client_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     if not verify:
         if not is_sandbox_host(host):

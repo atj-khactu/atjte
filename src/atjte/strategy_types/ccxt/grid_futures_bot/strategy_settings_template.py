@@ -50,8 +50,10 @@ CLOSE_ONLY = False
 GRID_STEP = 1.0          # distance between grid levels (spread points)
 GRID_LEVELS = 3              # levels per side (entries stop here; exits
                              # ladder as deep as the position actually goes)
-GRID_LEVEL_UNITS = 1.0           # units per grid level; >= one MT5 min lot
-                             # so every fill can be hedged
+GRID_LEVEL_UNITS = 1.0           # units per grid level ("Exposure per Grid");
+                             # >= one MT5 min lot so every fill can be hedged.
+                             # Unused with DYNAMIC_ALLOCATION on: each level is
+                             # then the dynamic cap / GRID_LEVELS
 # units per resting ORDER, entries and exits alike. The exposure a level holds
 # stays GRID_LEVEL_UNITS; a level bigger than one order fills in several orders
 # of this size, each sized to what the level still lacks (2 units level, 1 units
@@ -81,18 +83,23 @@ GRID_CENTER = 0.0
 # A dated future trades above (contango) or below (backwardation) the spot
 # CFD by its financing to expiry, and that basis melts by a day's worth
 # every day. The center of the grid is therefore
-#     center = GRID_CENTER + reference price x CARRY_DAILY_PCT / 100 x DTE
-# with DTE the (fractional) days to the contract's last trade date and the
+#     center = GRID_CENTER + reference price x CARRY_ANNUAL_PCT / 100 x DTE / 365
+# with DTE the (fractional) days to the DELIVERY date (CARRY_DELIVERY: when
+# a physically delivered future starts trading as spot) and the
 # reference the MT5 mid the engine quotes off, taken at the moment of the
 # update. It is recomputed at startup and then ONCE A DAY, at
 # CARRY_UPDATE_UTC — never tick by tick, so the levels move with the
 # calendar, not with the reference wandering. Until the first reference
 # price exists nothing is quoted.
-CARRY_DAILY_PCT = 0.012      # % of the reference price per day (0.012 ≈ 4.4 %/year);
+CARRY_ANNUAL_PCT = 4.4       # % of the reference price per YEAR (one day = this / 365);
                              # negative for backwardation; 0 = a plain grid
 CARRY_EXPIRY = None          # "YYYY-MM-DD" = the contract's last trade date;
                              # None = the venue market's own expiry (a dated
                              # CCXT future / the IBKR gateway's markets carry it)
+CARRY_DELIVERY = None        # "YYYY-MM-DD" = the day the basis reaches spot (what
+                             # the days above count to); None = the first delivery
+                             # day of the contract's delivery month (the IBKR
+                             # gateway's markets carry it), else the expiry
 CARRY_UPDATE_UTC = "00:05"   # daily update time (UTC wall clock, "HH:MM")
 # No NEW entries inside this many days of expiry (exits keep quoting until
 # flat) — a resting quote must never carry a position into the contract's

@@ -69,6 +69,27 @@ class FixGatewayConnector(GatewayConnector):
                                   on_ticker=self._ticker_in, on_fill=self._fill_in,
                                   on_book=self._book_in, readonly=self.readonly)
 
+    def cancel_order_final(self, order_id: str,
+                           symbol: Optional[str] = None) -> Optional[Order]:
+        """Cancel, and return the order's FINAL state as the venue's answer to
+        the cancel states it, so the engine needs no REST read to settle it.
+
+        The gateway answers a cancel with the ExecutionReport that replied to
+        it, mapped to a CCXT order with that report's tags in ``info``. It
+        counts as final only when 39 (OrdStatus) is terminal — 4 Canceled,
+        2 Filled, C Expired; NOT 6 PendingCancel, which the CCXT mapping
+        calls "canceled" but after which a fill can still land — and 14
+        (CumQty) is present, since the mapping reads a missing CumQty as 0
+        filled. Anything else is None: the order is cancelled, but its
+        filled amount must be read later."""
+        raw = self.gateway.cancel(order_id)
+        info = (raw or {}).get("info") if isinstance(raw, dict) else None
+        if not isinstance(info, dict):
+            return None
+        if info.get("39") not in ("4", "2", "C") or info.get("14") in (None, ""):
+            return None
+        return self._map_order(raw)
+
 
 class KrakenFixClient(FixGatewayConnector, KrakenClient):
     """Kraken spot whose order operations go over the FIX gateway."""

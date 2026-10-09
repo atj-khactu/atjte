@@ -234,7 +234,12 @@ class OrdersTest(GatewayCase):
         self.assertIn(("cancel", "main", BTC, [o["id"]]), self.up.calls)
 
         def saved():
-            return json.loads((self.dir / "owners.json").read_text(encoding="utf-8"))["orders"]
+            # the gateway replaces the file atomically; on Windows a read at
+            # that instant is refused (WinError 5/32): not yet readable
+            try:
+                return json.loads((self.dir / "owners.json").read_text(encoding="utf-8"))["orders"]
+            except PermissionError:
+                return None
         wait_for(lambda: saved() == {})
         self.assertEqual(saved(), {})
 

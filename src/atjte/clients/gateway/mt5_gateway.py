@@ -30,11 +30,12 @@ from atjte.gateways.mt5.gateway import DEFAULT_PORT
 TOKEN_NAME = "mt5_gateway_token"
 
 
-def gateway_token_from_env() -> str:
-    """``mt5_gateway_token`` from the workspace's env/.env, by name."""
+def gateway_token_from_env(name: str = TOKEN_NAME) -> str:
+    """The gateway's loopback token (``mt5_gateway_token`` unless ``name``
+    says otherwise) from the workspace's env/.env, by name."""
     from atjte import credentials as _creds
     _creds.load_env()
-    return os.environ.get(TOKEN_NAME, "")
+    return os.environ.get(name, "")
 
 
 class _Wire(GatewayClient):
@@ -81,9 +82,17 @@ class MT5GatewayClient:
     via_gateway = True
 
     name = "mt5"
+    #: the loopback token's env name and the gateway's default port (a
+    #: connector for another hedge platform names its own)
+    TOKEN_NAME = TOKEN_NAME
+    DEFAULT_GATEWAY_PORT = DEFAULT_PORT
+    GATEWAY_LABEL = "MT5 gateway"
+    #: the platform clock's offset from UTC when it is KNOWN; None = MT5's
+    #: broker clock, which the engine and backfill infer from a live tick
+    server_utc_offset_s: Optional[float] = None
 
     def __init__(self, *, magic: int = 0, gateway_host: str = "127.0.0.1",
-                 gateway_port: int = DEFAULT_PORT, gateway_token: str = "",
+                 gateway_port: Optional[int] = None, gateway_token: str = "",
                  client_name: str = "", dms_s: float = 60.0,
                  request_timeout_s: float = 10.0,
                  log: Optional[Callable[[str], None]] = None,
@@ -97,8 +106,8 @@ class MT5GatewayClient:
         self.is_connected = False
         self.wire = wire or _Wire(client_name or f"magic_{magic}", self.magic,
                                   on_tick=self._tick_in, host=gateway_host,
-                                  port=int(gateway_port),
-                                  token=gateway_token or gateway_token_from_env(),
+                                  port=int(gateway_port or self.DEFAULT_GATEWAY_PORT),
+                                  token=gateway_token or gateway_token_from_env(self.TOKEN_NAME),
                                   dms_s=float(dms_s), log=self._log,
                                   request_timeout_s=float(request_timeout_s),
                                   readonly=readonly)
@@ -106,11 +115,11 @@ class MT5GatewayClient:
     # ── lifecycle (the engine's MT5Client contract) ──────────────────────────
     def connect(self) -> None:
         if not self.wire.start():
-            raise ConnectionError(f"MT5 gateway not reachable on {self.wire.host}:"
+            raise ConnectionError(f"{self.GATEWAY_LABEL} not reachable on {self.wire.host}:"
                                   f"{self.wire.port} ({self.wire.reason}) — start it "
                                   f"from the control panel's Gateways page")
         if not self.wire.session.get("ready"):
-            self._log(f"mt5 gateway: attached, but the terminal is not answering "
+            self._log(f"{self.GATEWAY_LABEL}: attached, but the terminal is not answering "
                       f"({self.wire.session.get('reason')})")
         self.is_connected = True
 
@@ -128,7 +137,7 @@ class MT5GatewayClient:
         account) — plus this bot's own lease on the gateway."""
         if not self.wire.connected:
             return {"ok": False, "reachable": True,
-                    "reasons": [f"not attached to the MT5 gateway ({self.wire.reason})"]}
+                    "reasons": [f"not attached to the {self.GATEWAY_LABEL} ({self.wire.reason})"]}
         s = self.wire.session or {}
         return {"ok": bool(s.get("ready")), "reachable": True,
                 "reasons": list(s.get("reasons") or ([] if s.get("ready")
@@ -153,11 +162,11 @@ class MT5GatewayClient:
 
     def get_ticker(self, symbol: str):
         if not self.wire.connected:
-            raise ConnectionError(f"MT5 gateway not attached ({self.wire.reason})")
+            raise ConnectionError(f"{self.GATEWAY_LABEL} not attached ({self.wire.reason})")
         if not self.wire.ready:
             # attached, but the gateway's TERMINAL is not answering: its last
             # tick is history, not a price
-            raise ConnectionError(f"MT5 gateway: terminal not answering "
+            raise ConnectionError(f"{self.GATEWAY_LABEL}: platform not answering "
                                   f"({self.wire.session.get('reason')})")
         with self._lock:
             t = self._ticks.get(symbol)

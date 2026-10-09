@@ -54,13 +54,30 @@ class SamplesTest(unittest.TestCase):
         """The ATJ live presets are a full export of a running strategy, so
         Import sets every field, not a handful over whatever was there."""
         live = [f for f in S.sample_files() if f.stem.endswith("_atj_live")]
-        self.assertEqual(len(live), 3)
+        self.assertEqual(len(live), 5)
         for f in live:
             body = S.load(f.name)
             self.assertGreaterEqual(len(body["settings"]), 60, f.name)
             # a live preset still names its pair, so it is offered for that pair only
             self.assertIn(f.name, [m["name"] for m in
                                    S.samples_for(body["symbol_venue"], body["symbol_mt5"])])
+
+    def test_the_gold_futures_samples_are_synced(self):
+        """1OZ and MGC run the SAME strategy in contracts: every setting equal
+        but the sizes, which are one contract's ounces apart (1OZ = 1 oz,
+        MGC = 10 oz). A change to one sample that is not made to the other
+        fails here."""
+        one = S.load("ibkr_1oz-261125_vs_mt5_xauusd_atj_live.json")
+        mgc = S.load("ibkr_mgc-261229_vs_mt5_xauusd_atj_live.json")
+        self.assertEqual((one["kind"], one["symbol_mt5"]), (mgc["kind"], mgc["symbol_mt5"]))
+        a = {k: _value(v) for k, v in one["settings"].items()}
+        b = {k: _value(v) for k, v in mgc["settings"].items()}
+        self.assertEqual(set(a), set(b))
+        sizes = ("ORDER_VOLUME", "GRID_LEVEL_UNITS", "MAX_POSITION_UNITS", "MAX_SHORT_UNITS")
+        for n in sizes:
+            self.assertAlmostEqual(b[n], 10 * a[n], msg=n)
+        self.assertEqual({k: v for k, v in a.items() if k not in sizes},
+                         {k: v for k, v in b.items() if k not in sizes})
 
     def test_a_sample_fits_its_own_pair_only(self):
         body = S.load(S.sample_files()[0].name)

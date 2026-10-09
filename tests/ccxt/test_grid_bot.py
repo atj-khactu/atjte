@@ -184,6 +184,68 @@ class GridWiringTest(unittest.TestCase):
         self.assertEqual(g["short_entries"], [1.0, 2.0, 3.0])
         self.assertEqual(g["short_exits"], [-1.0, 0.0, 1.0])
 
+    def _dyn(self, cap, step=0.0, min_lot=0.0):
+        """Dynamic allocation in force with ``cap`` computed; ORDER_VOLUME None."""
+        saved = (pb.DYNAMIC_ALLOCATION, pb.ALLOCATION_PCT, grid_bot.ORDER_VOLUME)
+        self.addCleanup(lambda: setattr(pb, "DYNAMIC_ALLOCATION", saved[0]))
+        self.addCleanup(lambda: setattr(pb, "ALLOCATION_PCT", saved[1]))
+        self.addCleanup(lambda: setattr(grid_bot, "ORDER_VOLUME", saved[2]))
+        pb.DYNAMIC_ALLOCATION, pb.ALLOCATION_PCT, grid_bot.ORDER_VOLUME = True, 25, None
+        grid_bot.MAX_POSITION_UNITS = grid_bot.MAX_SHORT_EFFECTIVE = None   # dropped
+        bot = make_bot(0.0)
+        bot.venue.amount_to_precision = lambda u: u
+        bot.volume_step, bot.contract_size, bot.mt5_min_lot_units = step, 1.0, min_lot
+        bot.dyn_cap_units = cap
+        return bot
+
+    def test_dynamic_allocation_sizes_each_level_cap_over_levels(self):
+        bot = self._dyn(6.0)
+        d = by_key(bot._target_orders())
+        self.assertAlmostEqual(d["grid-entry-L1"].size, 2.0)        # 6 / 3 levels
+        self.assertAlmostEqual(d["grid-entry-S1"].size, 2.0)
+        self.assertEqual(bot._clip_units(), 2.0)                   # one level per order
+        bot.venue_pos_units = 4.0                                  # L1 + L2 full
+        d = by_key(bot._target_orders())
+        self.assertAlmostEqual(d["grid-exit-L2"].size, 2.0)
+        self.assertAlmostEqual(d["grid-entry-L3"].size, 2.0)
+        g = bot._extra_state()["grid"]
+        self.assertEqual(g["level_units"], 2.0)
+        self.assertTrue(g["level_units_dynamic"])
+        self.assertEqual(g["long_fills"], [2.0, 2.0, 0.0])
+        bot.dyn_cap_units = 9.0                                    # the cap follows equity:
+        d = by_key(bot._target_orders())                           # 3 a level, the 4 held
+        self.assertAlmostEqual(d["grid-exit-L2"].size, 1.0)        # = L1 full + 1 of L2
+        self.assertAlmostEqual(d["grid-entry-L3"].size, 3.0)
+
+    def test_dynamic_level_rounds_to_the_nearest_lot_step(self):
+        bot = self._dyn(10.0, step=1.0, min_lot=1.0)
+        self.assertEqual(bot._level_units(), 3.0)                  # 3.33 -> 3 lots
+        bot = self._dyn(1.95, step=0.1, min_lot=0.1)
+        self.assertAlmostEqual(bot._level_units(), 0.7)            # 0.65 -> 0.7
+        # the gate allows the whole rounded grid (2.1 > the 1.95 cap) ...
+        self.assertAlmostEqual(bot._exposure_cap(), 2.1)
+        bot.venue_pos_units = 1.4                                  # L1 + L2 full
+        d = by_key(bot._desired_orders())
+        self.assertAlmostEqual(d["grid-entry-L3"].size, 0.7)       # ... so L3 still rests
+        bot.venue_pos_units = 2.1                                  # the grid full
+        self.assertNotIn("grid-entry-L3", by_key(bot._desired_orders()))
+
+    def test_no_dynamic_level_holds_entries_but_keeps_exits(self):
+        bot = self._dyn(None)
+        self.assertEqual(bot._target_orders(), [])                 # flat: nothing yet
+        bot.venue_pos_units = 1.0
+        d = by_key(bot._target_orders())
+        self.assertEqual(set(d), {"grid-exit-L1"})                 # GRID_LEVEL_UNITS geometry
+        bot = self._dyn(6.0, step=0.0, min_lot=3.0)                # 2 a level < one min lot
+        self.assertIsNone(bot._level_units())
+        self.assertEqual(bot._target_orders(), [])
+
+    def test_order_volume_still_cuts_a_dynamic_level(self):
+        bot = self._dyn(6.0)
+        grid_bot.ORDER_VOLUME = 0.5
+        self.assertAlmostEqual(by_key(bot._target_orders())["grid-entry-L1"].size, 0.5)
+        self.assertEqual(bot._clip_units(), 0.5)
+
     def test_heartbeat_grid_block_shape(self):
         g = make_bot(1.4)._extra_state()["grid"]
         self.assertEqual(g["step_usd"], 1.0)

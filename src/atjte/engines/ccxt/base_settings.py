@@ -133,6 +133,8 @@ VENUE_CLIENT_OPTIONS = {}
 # terminal (its path and login check) for every bot and pushes the ticks.
 # Built with magic=MT5_MAGIC, client_name and log, plus MT5_CLIENT_OPTIONS
 # ({'gateway_port': 5620}). '' = atjte.clients.gateway.MT5GatewayClient.
+# A cTrader account instead: 'atjte.clients.gateway.CTraderGatewayClient'
+# ({'gateway_port': 5625}) — its cTrader gateway answers on the same wire.
 # PROJECT file: one hedge book.
 MT5_CLIENT = ''
 MT5_CLIENT_OPTIONS = {}
@@ -352,7 +354,10 @@ MARGIN_MODE = "isolated"         # "isolated" | "cross"
 # recomputed every ALLOCATION_REFRESH_S — the % of the smaller account that
 # may be committed as margin. The fixed caps (MAX_POSITION_UNITS /
 # MAX_SHORT_UNITS) still apply on top. No entries until the first recompute.
-# None = off (the fixed caps alone).
+# None = off (the fixed caps alone). On a GRID the cap also sizes the levels:
+# each level's exposure = the cap / GRID_LEVELS rounded to the nearest MT5
+# lot step, replacing GRID_LEVEL_UNITS (the full grid spans the allocation
+# to within half a lot step per level).
 DYNAMIC_ALLOCATION = False       # True = the dynamic caps below are in force
 ALLOCATION_PCT = None            # e.g. 25 = a quarter of the smaller account
 ALLOCATION_REFRESH_S = 60.0
@@ -412,6 +417,12 @@ PLACE_MARGIN_SAFETY = 1.0
 # by this factor (head-room for fees and a moving price); a sell can never
 # exceed the free base balance.
 SPOT_FUNDS_SAFETY = 2.0
+# When the venue rejects an ENTRY for insufficient margin, place no new
+# entries for this many seconds (exits are unaffected). The pre-place check
+# can judge an order affordable that the venue does not — strategies sharing
+# one margin account spend the same head-room — and without a pause the bot
+# re-sends the same order every pass. 0 = no pause.
+MARGIN_REJECT_PAUSE_S = 60.0
 # Manual master switch: True = the bot only reduces existing exposure. Flip
 # it in a strategy's own settings file to wind that strategy down.
 CLOSE_ONLY = False

@@ -380,7 +380,11 @@ def mt5_client(ident: dict):
 
 def broker_offset(client, symbol: str, now: Optional[float] = None) -> Optional[float]:
     """The broker clock's offset from UTC inferred from a FRESH tick, else
-    None (a closed market's last tick is hours old and would mislead)."""
+    None (a closed market's last tick is hours old and would mislead). A
+    connector that KNOWS its clock (cTrader: UTC) says so instead."""
+    known = getattr(client, "server_utc_offset_s", None)
+    if known is not None:
+        return float(known)
     now = time.time() if now is None else now
     tick = client.get_ticker(symbol)
     ms = (getattr(tick, "raw", None) or {}).get("time_msc")

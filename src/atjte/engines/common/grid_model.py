@@ -243,6 +243,23 @@ def bollinger_short_ladder_orders(short: float, mean: float, std: float,
     return out
 
 
+def dynamic_level_units(cap: Optional[float], levels: int, lot_step: float = 0.0,
+                        min_size: float = 0.0) -> Optional[float]:
+    """The grid's level size under dynamic allocation: the per-side cap
+    (base units) split evenly over ``levels``, rounded to the NEAREST
+    ``lot_step`` (one MT5 lot step in base units; a half step rounds up) so
+    every level hedges in whole lots — the full grid can then sit up to half
+    a step per level above or below the cap. None when there is no cap yet,
+    or the rounded share is below ``min_size`` (the venue minimum / one min
+    lot) — a level that small cannot be quoted or hedged."""
+    if cap is None or cap <= 0 or levels < 1:
+        return None
+    share = cap / levels
+    unit = (math.floor(share / lot_step + 0.5 + 1e-9) * lot_step if lot_step > 0
+            else share)
+    return round(unit, 9) if unit >= max(min_size, EPS) else None
+
+
 def level_fills(pos: float, levels: int, unit: float) -> tuple[list[float], list[float]]:
     """Split a signed position into per-level filled amounts (waterfall:
     level 1 fills first). Returns ``(long_fills, short_fills)``, each

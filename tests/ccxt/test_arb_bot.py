@@ -209,6 +209,12 @@ class StubVenue:
         elif not self.is_perp and self.free_quote is not None:
             self.free_quote = max(0.0, self.free_quote - units * price)
 
+    def note_entry_released(self, units, price, margin=None):
+        if self.is_perp and self.available_margin is not None:
+            self.available_margin += margin if margin is not None else units * price * self.im_rate
+        elif not self.is_perp and self.free_quote is not None:
+            self.free_quote += units * price
+
     # orders
     def place_limit(self, side, units, price, post_only=True, reduce_only=False):
         params = {"postOnly": True} if post_only else {}
@@ -229,6 +235,13 @@ class StubVenue:
         self.cancelled.append(order_id)
         return True
 
+    #: what cancel_final answers: None = the cancel did not settle it
+    cancel_final_result = None
+
+    def cancel_final(self, order_id):
+        self.cancel(order_id)
+        return self.cancel_final_result
+
     def get_order(self, order_id):
         if self._get_order_error is not None:
             raise self._get_order_error
@@ -246,6 +259,7 @@ def make_bot(logs=None):
     bot.orders = {}
     bot.intents = {}
     bot._retired = {}
+    bot._settling = {}
     bot._last_msgs = {}
     bot.counters = {"quotes_amended": 0, "quotes_cancelled": 0, "quotes_placed": 0,
                     "fills_booked_units": 0.0, "pos_resyncs": 0}
@@ -258,6 +272,9 @@ def make_bot(logs=None):
     bot._mt5_settle_prev = 0.0
     bot._bal_dirty = False
     bot._venue_margin_t = 0.0
+    bot._margin_want = False
+    bot._margin_read_error = None
+    bot._entry_pause_until = 0.0
     bot.venue_available_margin = None
     bot.phase_errors = {}
     bot.last_error = None
@@ -519,6 +536,223 @@ class SettleAfterAFailedCancelTest(unittest.TestCase):
         bot._settle(rec.key, cancel_first=True, reason="requote")
         self.assertNotIn(rec.key, bot.orders)         # nothing left to cancel
         self.assertAlmostEqual(bot.counters["fills_booked_units"], 1.0)
+
+
+class DeferredSettleReadTest(unittest.TestCase):
+    """A requote's cancel no longer waits for the order's final-state REST
+    read before the replacement goes out (2026-10-08, XAU perp: that read
+    held the loop ~2 s and the replacement was priced off a tick that old).
+    The record moves to a settling pool; ws fills still book against it and
+    the read happens on the slow tick."""
+
+    class CountingVenue(StubVenue):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.reads = 0
+
+        def get_order(self, order_id):
+            self.reads += 1
+            return super().get_order(order_id)
+
+    def _parked(self, order=None, get_order_error=None):
+        bot = make_bot([])
+        bot.venue = self.CountingVenue(StubExchange(), order=order,
+                                       get_order_error=get_order_error)
+        rec = resting(side="sell", purpose="entry", amount=1.0)
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        return bot, rec
+
+    def test_an_accepted_cancel_parks_the_record_without_a_read(self):
+        bot, rec = self._parked(order=StubOrder(0.0, status=OrderStatus.CANCELED))
+        self.assertEqual(bot.venue.cancelled, ["o1"])
+        self.assertEqual(bot.venue.reads, 0)              # nothing between cancel and place
+        self.assertNotIn(rec.key, bot.orders)              # the key is free for the replacement
+        self.assertIs(bot._settling["o1"][0], rec)
+        self.assertIs(bot._rec_by_order_id("o1"), rec)     # a late ws fill still finds it
+
+    def test_a_ws_fill_on_the_parked_order_books_and_spares_the_replacement(self):
+        bot, rec = self._parked(order=StubOrder(0.0, status=OrderStatus.CANCELED))
+        new = resting(side="sell", purpose="entry", amount=1.0)
+        new.order_id = "o2"
+        bot.orders[new.key] = new                          # the replacement, same key
+        bot.fill_q = queue.Queue()
+        bot.counters["fill_events"] = 0
+        bot._report_fill = lambda *a, **k: None
+        bot._hedge = lambda: None
+        bot.dump_state = lambda: None
+        tr = types.SimpleNamespace(symbol=None, order_id="o1", trade_id="t1", amount=1.0,
+                                   price=4450.0, timestamp=None,
+                                   side=types.SimpleNamespace(value="sell"))
+        bot._process_fill_events(tr)
+        self.assertAlmostEqual(bot.pos_units, -1.0)        # booked once
+        self.assertNotIn("o1", bot._settling)              # fully filled: retired
+        self.assertIn("o1", bot._retired)
+        self.assertIs(bot.orders.get(new.key), new)        # the replacement untouched
+
+    def test_the_slow_tick_books_a_fill_only_rest_saw_and_retires(self):
+        bot, rec = self._parked(order=StubOrder(0.4, status=OrderStatus.CANCELED))
+        bot._drain_settling(time.time())
+        self.assertEqual(bot.venue.reads, 1)
+        self.assertAlmostEqual(bot.pos_units, -0.4)
+        self.assertEqual(bot._settling, {})
+        self.assertIn("o1", bot._retired)
+
+    def test_a_transient_read_error_keeps_it_for_the_next_tick(self):
+        bot, rec = self._parked(get_order_error=Exception("apiLimitExceeded"))
+        bot._drain_settling(time.time())
+        self.assertIn("o1", bot._settling)
+
+    def test_a_gone_order_is_booked_from_what_is_known_and_retired(self):
+        bot, rec = self._parked(
+            get_order_error=Exception("notFound"))
+        self.assertEqual(_classify_order_error(bot.venue._get_order_error), "gone")
+        bot._drain_settling(time.time())
+        self.assertEqual(bot._settling, {})
+
+    def test_an_order_still_resting_after_its_cancel_is_cancelled_again(self):
+        bot, rec = self._parked(order=StubOrder(0.0, status=OrderStatus.OPEN))
+        bot._drain_settling(time.time())
+        self.assertEqual(bot.venue.cancelled, ["o1", "o1"])
+        self.assertIn("o1", bot._settling)                 # kept until it is gone
+
+    def test_a_refused_cancel_still_takes_the_synchronous_path(self):
+        bot = make_bot([])
+        bot.venue = SettleAfterAFailedCancelTest.RefusingVenue(
+            StubExchange(), order=StubOrder(filled=0.0, status=OrderStatus.OPEN))
+        rec = resting(amount=1.0)
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        self.assertIn(rec.key, bot.orders)                 # still tracked, never parked
+        self.assertEqual(bot._settling, {})
+
+
+class CancelSettlesFromItsOwnAnswerTest(unittest.TestCase):
+    """Where the cancel's answer states the final filled amount (the FIX
+    gateway's ExecutionReport), the order is settled there and then: no
+    REST read now, none deferred."""
+
+    def _bot(self, final, amount=1.0, purpose="entry", margin=None):
+        bot = make_bot([])
+        bot.venue = DeferredSettleReadTest.CountingVenue(StubExchange(),
+                                                         available_margin=margin)
+        bot.venue.cancel_final_result = final
+        rec = resting(side="sell", purpose=purpose, amount=amount)
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        return bot, rec
+
+    def test_a_final_answer_settles_with_no_read_and_nothing_parked(self):
+        bot, rec = self._bot(StubOrder(0.0, status=OrderStatus.CANCELED))
+        self.assertEqual(bot.venue.reads, 0)
+        self.assertEqual(bot._settling, {})
+        self.assertNotIn(rec.key, bot.orders)
+        self.assertIn("o1", bot._retired)                 # a late ws fill is only reported
+        self.assertEqual(bot.counters.get("cancels_final"), 1)
+
+    def test_a_fill_before_the_cancel_is_booked_from_the_answer(self):
+        bot, rec = self._bot(StubOrder(0.4, status=OrderStatus.CANCELED))
+        self.assertAlmostEqual(bot.pos_units, -0.4)
+        self.assertTrue(bot._hedge_dirty)
+
+    def test_only_the_unfilled_part_credits_margin_back(self):
+        pb_lev = pb.LEVERAGE
+        try:
+            pb.LEVERAGE = 10
+            bot, rec = self._bot(StubOrder(0.4, status=OrderStatus.CANCELED), margin=100.0)
+            self.assertAlmostEqual(bot.venue.available_margin, 100.0 + 0.6 * 4450.0 / 10)
+        finally:
+            pb.LEVERAGE = pb_lev
+
+    def test_no_final_answer_parks_it_as_before(self):
+        bot, rec = self._bot(None)
+        self.assertIn("o1", bot._settling)
+        self.assertEqual(bot.venue.reads, 0)
+
+
+class FreshTickRepriceTest(unittest.TestCase):
+    """Every order call is priced off the MT5 tick as it is at that moment,
+    not the one the pass started from (2026-10-08, XAU perp: a sell priced
+    off a 2 s old ask went out 0.06 below the live ask and filled at once)."""
+
+    def setUp(self):
+        self._orig = (pb.ALLOW_TAKER_ENTRY, pb.LIVE_TRADING, pb.HEDGE_RATIO)
+        pb.ALLOW_TAKER_ENTRY, pb.LIVE_TRADING, pb.HEDGE_RATIO = True, True, 1.0
+
+    def tearDown(self):
+        pb.ALLOW_TAKER_ENTRY, pb.LIVE_TRADING, pb.HEDGE_RATIO = self._orig
+
+    class MT5:
+        def __init__(self, bid, ask, error=None):
+            self.bid, self.ask, self.error = bid, ask, error
+
+        def get_ticker(self, symbol):
+            if self.error:
+                raise self.error
+            return types.SimpleNamespace(bid=self.bid, ask=self.ask,
+                                         mid=(self.bid + self.ask) / 2, raw={})
+
+    def _bot(self):
+        bot = make_bot([])
+        bot.xau_bid, bot.xau_ask, bot.xau_mid = 4125.5, 4125.6, 4125.55
+        bot.venue_ticker = types.SimpleNamespace(mid=4126.0, bid=4125.9, ask=4126.1)
+        bot._ops_tokens, bot._ops_refill_t = 100.0, time.time()
+        bot._clip_units = lambda: 1.0
+        bot._placeable_amount = lambda key, t: t["amount"]   # funding is not under test
+        bot._desired_orders = lambda: [DesiredOrder(key="e", side="sell", purpose="entry",
+                                                    level_index=1, level=1.0, size=1.0)]
+        return bot
+
+    def test_the_replacement_goes_out_at_the_live_ask_plus_the_level(self):
+        bot = self._bot()
+        bot.mt5 = self.MT5(4126.6, 4126.7)        # MT5 jumped while the pass worked
+        bot.orders["e"] = OrderRec(key="e", side="sell", purpose="entry", level_index=1,
+                                   level=1.0, order_id="o1", price=4130.0, amount=1.0,
+                                   taker=True)
+        bot._sync_quotes()
+        self.assertEqual(bot.venue.cancelled, ["o1"])
+        self.assertAlmostEqual(bot.venue.placed[-1]["price"], 4127.7)   # not 4126.6
+        self.assertAlmostEqual(bot.xau_ask, 4126.7)
+        self.assertEqual(bot.counters.get("requotes_refreshed"), 1)
+
+    def test_the_price_is_taken_after_the_pre_place_margin_read(self):
+        # the funding check may be a REST round trip: MT5 moves during it
+        bot = self._bot()
+        bot.mt5 = self.MT5(4125.5, 4125.6)
+
+        def slow_margin_read(key, t):
+            bot.mt5 = self.MT5(4127.0, 4127.1)
+            return t["amount"]
+        bot._placeable_amount = slow_margin_read
+        bot._sync_quotes()
+        self.assertAlmostEqual(bot.venue.placed[-1]["price"], 4128.1)
+
+    def test_a_deferred_cancel_does_not_force_a_margin_reread(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), order=StubOrder(0.0, status=OrderStatus.CANCELED))
+        rec = resting(side="sell", purpose="entry")
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        self.assertFalse(bot._bal_dirty)
+
+    def test_an_unchanged_tick_places_the_planned_price(self):
+        bot = self._bot()
+        bot.mt5 = self.MT5(4125.5, 4125.6)
+        bot._sync_quotes()
+        self.assertAlmostEqual(bot.venue.placed[-1]["price"], 4126.6)
+        self.assertNotIn("requotes_refreshed", bot.counters)
+
+    def test_no_mt5_tick_means_no_order(self):
+        bot = self._bot()
+        bot.mt5 = self.MT5(0, 0, error=ConnectionError("terminal not answering"))
+        bot._sync_quotes()
+        self.assertEqual(bot.venue.placed, [])
+
+    def test_the_derisk_exit_keeps_its_touch_price(self):
+        bot = self._bot()
+        bot.mt5 = self.MT5(4130.0, 4130.1)
+        t = {"side": "buy", "level": -0.5, "price": 4125.0, "taker": False}
+        self.assertIs(bot._fresh_target(pb.RISK_FLAT_KEY, t), t)
 
 
 class BookAdvancesVenuePositionTest(unittest.TestCase):
@@ -836,13 +1070,121 @@ class PlaceTest(unittest.TestCase):
     def test_margin_read_failure_blocks_the_entry(self):
         bot = make_bot([])
         bot.venue = StubVenue(StubExchange())
-        bot._venue_margin_t = 0.0                      # stale -> refetch attempted
+        bot._margin_want = True                        # an entry found it stale
         bot._read_venue_margin = lambda: (_ for _ in ()).throw(RuntimeError("apiLimitExceeded"))
+        bot._refresh_place_margin(time.time())         # the slow tick's re-read fails
         bot._place("boll-entry", self._t("entry", side="buy"))
         self.assertEqual(bot.venue.placed, [])
         # exits never need margin: they go through untouched
         bot._place("boll-exit", self._t("exit"))
         self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_an_insufficient_margin_rejection_pauses_entries(self):
+        """The pre-place check passed but the venue refused: no entry for
+        MARGIN_REJECT_PAUSE_S, exits untouched, entries back after it."""
+        logs = []
+        bot = make_bot(logs)
+        bot.venue = StubVenue(StubExchange(), available_margin=None)
+        bot._venue_margin_t = 1e12
+        ok_place = bot.venue.place_limit
+
+        def refuse(*a, **k):
+            raise RuntimeError("ClOrdID x : EGeneral:Other:INSUFFICIENT_MARGIN")
+        bot.venue.place_limit = refuse
+        bot._place("e1", self._t("entry", side="buy"))
+        self.assertTrue(any("entries paused 60 s" in m for m in logs))
+        bot.venue.place_limit = ok_place
+        bot._place("e1", self._t("entry", side="buy"))
+        self.assertEqual(bot.venue.placed, [])         # paused: not even sent
+        bot._place("x1", self._t("exit"))
+        self.assertEqual(len(bot.venue.placed), 1)     # exits keep going
+        bot._entry_pause_until = 0.0                   # the 60 s are over
+        bot._venue_margin_t = 1e12
+        bot._bal_dirty = False                         # (the rejection marked it stale)
+        bot._place("e1", self._t("entry", side="buy"))
+        self.assertEqual(len(bot.venue.placed), 2)
+        self.assertTrue(any("entries resumed" in m for m in logs))
+
+    def test_an_exit_rejection_does_not_pause_entries(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), available_margin=None)
+        bot._venue_margin_t = 1e12
+        bot.venue.place_limit = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("INSUFFICIENT_MARGIN"))
+        bot._place("x1", self._t("exit"))
+        self.assertEqual(bot._entry_pause_until, 0.0)
+
+
+class PlaceMarginOffThePathTest(unittest.TestCase):
+    """The pre-place margin check never reads the venue itself (a REST
+    round trip between pricing an entry and sending it); a stale figure is
+    re-read on the slow tick, and cancels credit back what placements
+    debited so the cached figure does not drift down between reads."""
+
+    def setUp(self):
+        self._live = (pb.LIVE_TRADING, pb.LEVERAGE)
+        pb.LIVE_TRADING, pb.LEVERAGE = True, 10
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb.LEVERAGE = self._live
+
+    def _t(self, price=4450.0):
+        return {"side": "buy", "purpose": "entry", "level_index": 1, "level": -0.5,
+                "price": price, "amount": 1.0}
+
+    def test_a_stale_figure_places_on_the_cache_and_asks_the_tick(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), available_margin=1000.0)
+        reads = []
+        bot._read_venue_margin = lambda: reads.append(1)
+        bot._venue_margin_t = 0.0                      # stale
+        bot._place("e1", self._t())
+        self.assertEqual(len(bot.venue.placed), 1)     # placed on the cached figure
+        self.assertEqual(reads, [])                    # no read in front of the order
+        self.assertTrue(bot._margin_want)
+        bot._refresh_place_margin(time.time())         # the slow tick reads it
+        self.assertEqual(reads, [1])
+
+    def test_a_fresh_figure_asks_for_nothing(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), available_margin=1000.0)
+        bot._bal_dirty = False
+        bot._venue_margin_t = time.time()
+        bot._place("e1", self._t())
+        self.assertFalse(bot._margin_want)
+
+    def test_a_successful_read_unblocks_entries(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), available_margin=1000.0)
+        bot._margin_read_error = "apiLimitExceeded"
+        bot._place("e1", self._t())
+        self.assertEqual(bot.venue.placed, [])
+        bot._recompute_dyn_cap = lambda t: None
+        bot.venue.maintenance_margin = None
+        bot._read_venue_margin()                       # the real one, on the stub
+        self.assertIsNone(bot._margin_read_error)
+        bot._place("e1", self._t())
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_cancel_replace_cycles_do_not_wear_the_cached_margin_down(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), available_margin=1000.0,
+                              order=StubOrder(0.0, status=OrderStatus.CANCELED))
+        bot._venue_margin_t = time.time()
+        for i in range(10):                            # 445 USD each at 10x
+            bot._place("e1", self._t(price=4450.0 + i))
+            bot._settle("e1", cancel_first=True, reason="requote", defer_read=True)
+        self.assertEqual(len(bot.venue.placed), 10)    # never blocked
+        self.assertAlmostEqual(bot.venue.available_margin, 1000.0)
+
+    def test_an_exit_cancel_credits_nothing(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(), available_margin=500.0,
+                              order=StubOrder(0.0, status=OrderStatus.CANCELED))
+        rec = resting(side="sell", purpose="exit")
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        self.assertAlmostEqual(bot.venue.available_margin, 500.0)
 
 
 class PhaseTest(unittest.TestCase):
@@ -905,6 +1247,65 @@ class PositionReconcileTest(unittest.TestCase):
         self.assertFalse(bot.position_diverged)
         self.assertEqual(bot.counters["pos_resyncs"], 0)
         self.assertTrue(any("back in sync" in m for m in logs))
+
+    def test_a_liquidation_closes_the_mt5_hedge_within_a_minute_not_fifteen(self):
+        """IBKR liquidates the long: no fill of this bot arrives (TWS sends
+        an API client only its own orders' executions), the venue position
+        simply reads 0 while MT5 still holds the short hedge. The next
+        position read arms the reconciler's re-check; the re-check finds the
+        gap still there and buys the hedge back."""
+        logs = []
+        bot = make_bot(logs)
+        bot.contract_size = 100.0
+        bot.volume_step = bot.volume_min = 0.01
+        hedge = types.SimpleNamespace(raw={"magic": pb.MT5_MAGIC}, size=0.03,
+                                      side=pb.PositionSide.SHORT, entry_price=4000.0)
+        book = [hedge]
+        sent = []
+
+        def place_order(sym, side, lots, kind, **k):
+            sent.append((side, lots))
+            book.clear()
+            return types.SimpleNamespace(order_id=9, raw={"price": 4000.0})
+        bot.mt5 = types.SimpleNamespace(get_positions=lambda sym: list(book),
+                                        place_order=place_order)
+        bot._read_venue_position = lambda: None            # the read itself: stubbed
+        # post-hedge book upkeep (tested elsewhere): the book settles at once
+        bot._settle_mt5_book = lambda now: setattr(bot, "_mt5_settle_until", 0.0)
+        bot.venue_pos_units = 0.0                          # liquidated: 3 -> 0
+        bot._recheck_at = None
+        bot._next_check_at = 10_000.0                      # the 15-min check is far away
+        for k in ("reconcile_fixes", "hedges"):
+            bot.counters.setdefault(k, 0)
+        live, pb.LIVE_TRADING = pb.LIVE_TRADING, True
+        try:
+            bot._parity_watch(1000.0)
+            self.assertEqual(bot._recheck_at, 1000.0 + pb.RECONCILE_RECHECK_DELAY_S)
+            self.assertTrue(any("outside this bot's fills" in m for m in logs), logs)
+            bot._reconcile(1000.0 + pb.RECONCILE_RECHECK_DELAY_S)
+        finally:
+            pb.LIVE_TRADING = live
+        self.assertEqual(sent, [(pb.OrderSide.BUY, 0.03)])          # the hedge bought back
+
+    def test_the_parity_watch_is_quiet_in_sync_dry_or_already_rechecking(self):
+        bot = make_bot([])
+        bot.contract_size = 100.0
+        short = types.SimpleNamespace(raw={"magic": pb.MT5_MAGIC}, size=0.03,
+                                      side=pb.PositionSide.SHORT, entry_price=4000.0)
+        bot.mt5 = types.SimpleNamespace(get_positions=lambda sym: [short])
+        bot.venue_pos_units, bot._recheck_at = 3.0, None          # hedged: in sync
+        live, pb.LIVE_TRADING = pb.LIVE_TRADING, True
+        try:
+            bot._parity_watch(1000.0)
+            self.assertIsNone(bot._recheck_at)
+            bot.venue_pos_units, bot._recheck_at = 0.0, 1005.0    # a re-check is pending
+            bot._parity_watch(1000.0)
+            self.assertEqual(bot._recheck_at, 1005.0)             # left as it was
+        finally:
+            pb.LIVE_TRADING = live
+        bot._recheck_at = None
+        bot._parity_watch(1000.0)                                  # dry run: nothing
+        self.assertIsNone(bot._recheck_at)
 
     def test_recheck_scheduled_sooner_while_diverged(self):
         bot = make_bot([])
@@ -1298,13 +1699,6 @@ class ExposureGateTest(unittest.TestCase):
         self.assertIn("MAX_POSITION_UNITS", pb.FIXED_CAP_NAMES)
         self.assertEqual(pb.FIXED_CAPS_KEPT, "bollinger" in pb._type_name())
 
-    def test_dynamic_allocation_replaces_the_fixed_caps_except_on_bollinger(self):
-        """FIXED_CAPS_DROPPED is decided at import from the switch, the % and
-        the type; the module test project runs with the switch off."""
-        self.assertFalse(pb.FIXED_CAPS_DROPPED)
-        self.assertIn("MAX_POSITION_UNITS", pb.FIXED_CAP_NAMES)
-        self.assertEqual(pb.FIXED_CAPS_KEPT, "bollinger" in pb._type_name())
-
     def test_the_switch_off_keeps_the_percent_inert(self):
         pb.ALLOCATION_PCT, pb.LEVERAGE, pb.DYNAMIC_ALLOCATION = 25, 5, False
         bot = self._bot()
@@ -1326,6 +1720,28 @@ class ExposureGateTest(unittest.TestCase):
         # a 1-unit buy entry would reach 2500.5 > cap: dropped; the sell is fine
         self.assertEqual({d.key for d in bot._exposure_gate(_orders())},
                          {"sell-e", "sell-x", "buy-x"})
+
+    def test_no_cap_yet_is_retried_from_the_fast_pass_not_after_a_balance_poll(self):
+        """The startup margin read precedes the first ticker: the cap must
+        come with the ticker, paced by DYN_CAP_RETRY_S, not 60 s later."""
+        import types
+        pb.ALLOCATION_PCT, pb.LEVERAGE = 25, 5
+        bot = self._bot()
+        bot.venue_ticker = None
+        bot._recompute_dyn_cap(100.0)               # the startup read: no mid
+        self.assertIsNone(getattr(bot, "dyn_cap_units", None))
+        mt5_reads = []
+        bot._mt5_equity_usd = lambda: mt5_reads.append(1) or None   # MT5 not readable yet
+        bot.venue_ticker = types.SimpleNamespace(mid=2.0)
+        bot._retry_dyn_cap(100.5)
+        bot._retry_dyn_cap(100.9)                   # paced: no second MT5 read
+        self.assertEqual(len(mt5_reads), 1)
+        self.assertIsNone(getattr(bot, "dyn_cap_units", None))
+        bot._mt5_equity_usd = lambda: 4000.0
+        bot._retry_dyn_cap(101.6)
+        self.assertAlmostEqual(bot.dyn_cap_units, 2500.0)
+        bot._mt5_equity_usd = lambda: self.fail("a cap in hand: no more retries")
+        bot._retry_dyn_cap(110.0)
 
     def test_leverage_is_applied_once_and_never_fatal(self):
         pb.LEVERAGE = 5
@@ -2073,6 +2489,34 @@ class GatewayHistoryTest(unittest.TestCase):
         bot.venue_ufunding = -0.2                  # Kraken Futures' unrealizedFunding
         bot._poll_funding_history(time.time())
         self.assertEqual(bot.reporter.records, [])
+
+    def test_the_server_offset_comes_from_an_advancing_tick_near_a_half_hour(self):
+        """The first tick the bot sees is the gateway's last, of any age: a
+        20-min-old one would snap UTC+3 to +2.5 and key the backfilled MT5
+        history 30 min late. Only a tick that ADVANCED sets the offset, and
+        only within SRV_OFFSET_TOL_S of a half hour."""
+        class Stop(Exception):
+            pass
+        bot = self._bot(self._Exchange())
+        bot._srv_offset_s, bot._mt5_sig, bot._pending_marks = None, None, []
+        bot._session_was_open, bot._mt5_change_t = None, 0.0
+        bot.feed = types.SimpleNamespace(get_ticker=lambda: (_ for _ in ()).throw(Stop()))
+        now = 1_800_000_000.0
+
+        def tick(server_ts, bid):
+            xau = types.SimpleNamespace(bid=bid, ask=bid + 0.2, mid=bid + 0.1,
+                                        raw={"time_msc": int(server_ts * 1000)})
+            try:
+                bot.fast_pass(now, xau)
+            except Stop:
+                pass
+        tick(now + 3 * 3600 - 20 * 60, 4100.0)         # the gateway's stale last tick
+        self.assertIsNone(bot._srv_offset_s)
+        tick(now + 3 * 3600 - 20 * 60 + 1, 4100.5)     # advanced, but still lagging
+        self.assertIsNone(bot._srv_offset_s)
+        tick(now + 3 * 3600 - 0.4, 4101.0)             # live
+        self.assertEqual(bot._srv_offset_s, 3 * 3600.0)
+        self.assertEqual(pb.ArbBot._live_srv_offset(now + 2.5 * 3600 + 30, now), 2.5 * 3600)
 
     def test_history_comes_through_the_gateways_paged(self):
         t0 = 1_800_000_000
@@ -2896,7 +3340,25 @@ class HedgeRatioTest(unittest.TestCase):
         bot = self._bot()
         bot.venue_ticker = types.SimpleNamespace(mid=401.0, bid=400.0, ask=402.0)
         self.assertAlmostEqual(bot._maker_price("buy", 0.5), 400.5)    # 0.1 × 4000 + 0.5
-        self.assertAlmostEqual(bot._maker_price("sell", 1.2), 401.2)   # 0.1 × 4000.4 + 1.2 ≈ 401.24
+        # 0.1 × 4000.4 + 1.2 = 401.24: a sell rounds UP to the tick, never below its level
+        self.assertAlmostEqual(bot._maker_price("sell", 1.2), 401.3)
+
+    def test_a_resting_quote_rounds_to_its_better_tick_never_past_its_level(self):
+        """1OZ's L2, 2026-10-08: MT5 bid 4137.00 + level 24.397 = 4161.397
+        went out at 4161.50 (nearest tick), 0.10 past the level — and the
+        quotes rounded towards the market are the ones that fill. A buy now
+        rounds DOWN, a sell UP; an exact tick stays where it is."""
+        bot = self._bot()
+        bot.venue.price_tick = 0.25                          # 1OZ's tick
+        bot.xau_bid, bot.xau_ask = 41370.0, 41370.4          # × HEDGE_RATIO 0.1
+        bot.venue_ticker = types.SimpleNamespace(mid=4162.0, bid=4161.0, ask=4163.0)
+        self.assertAlmostEqual(bot._maker_price("buy", 24.397), 4161.25)    # not 4161.50
+        self.assertAlmostEqual(bot._maker_price("buy", 24.5), 4161.5)       # on the tick
+        self.assertAlmostEqual(bot._maker_price("sell", 25.0), 4162.25)     # 4162.04 -> up
+        self.assertAlmostEqual(bot._taker_price("buy", 24.397), 4161.25)    # same rule
+        for lvl in (24.01, 24.13, 24.26, 24.38, 24.49):
+            p = bot._maker_price("buy", lvl)
+            self.assertLessEqual(p - bot.ref_bid, lvl + 1e-9, lvl)          # never past
 
     def test_the_derisk_exit_level_is_in_venue_terms(self):
         bot = self._bot()

@@ -104,6 +104,11 @@ class GatewayClient:
         self.session: dict = {"ready": False, "state": "off"}
         self.reason = "not connected"
         self.last_error = ""
+        #: the gateway's refusal of the last attempt (bad token, network
+        #: mismatch, ...): kept in ``reason`` while the client retries, so the
+        #: cause stays visible instead of a bare "connecting to"; cleared on
+        #: a welcome
+        self._refused = ""
         self.counters = {"connects": 0, "requests": 0, "executions": 0,
                          "errors": 0, "md": 0, "tickers": 0, "fills": 0}
 
@@ -187,7 +192,9 @@ class GatewayClient:
             delay = min(delay * 2, 30.0)
 
     def _session_once(self) -> None:
-        self.reason = f"connecting to {self.host}:{self.port}"
+        self.reason = f"connecting to {self.host}:{self.port}" + (
+            f" — the gateway refused the last attempt: {self._refused}"
+            if self._refused else "")
         self._sock = self._connect(self.host, self.port, CONNECT_TIMEOUT_S)
         self.counters["connects"] += 1
         self._send(self._hello_message())
@@ -231,6 +238,7 @@ class GatewayClient:
         if op == P.WELCOME:
             self.session = msg.get("session") or {}
             self.reason = ""
+            self._refused = ""
             self._welcomed.set()
             self._log(f"fix gateway: {self.client} attached to "
                       f"{self.host}:{self.port} ({msg.get('resumed', 0)} order(s) "
@@ -270,6 +278,7 @@ class GatewayClient:
         elif op == P.ERROR:
             self.counters["errors"] += 1
             self.last_error = str(msg.get("error") or "")
+            self._refused = self.last_error
             self.reason = f"gateway refused: {self.last_error}"
             self._log(f"fix gateway: {self.reason}")
             raise GatewayError(self.last_error)

@@ -556,6 +556,18 @@ class Venue:
         elif self.free_quote is not None:
             self.free_quote = max(0.0, self.free_quote - units * price)
 
+    def note_entry_released(self, units: float, price: float,
+                            margin: Optional[float] = None) -> None:
+        """The inverse of :meth:`note_entry_placed` for an entry cancelled
+        before it filled: credit back what its placement debited, so a
+        cancel/replace cycle leaves the cached head-room where it was."""
+        if self.is_perp:
+            if self.available_margin is not None:
+                used = margin if margin is not None else units * price * self.im_rate
+                self.available_margin += used
+        elif self.free_quote is not None:
+            self.free_quote += units * price
+
     # ── orders ───────────────────────────────────────────────────────────────
     def place_limit(self, side: str, units: float, price: float,
                     post_only: bool = True, reduce_only: bool = False) -> Order:
@@ -631,6 +643,16 @@ class Venue:
 
     def cancel(self, order_id: str) -> bool:
         return self.client.cancel_order(order_id, self.symbol)
+
+    def cancel_final(self, order_id: str) -> Optional[Order]:
+        """Cancel; the order's final state when the cancel's own answer
+        settles it (a connector with ``cancel_order_final`` — the FIX
+        gateway's), else None: cancelled, final state still to be read."""
+        fn = getattr(self.client, "cancel_order_final", None)
+        if fn is None:
+            self.cancel(order_id)
+            return None
+        return fn(order_id, self.symbol)
 
     def get_order(self, order_id: str) -> Order:
         """One order's current state, open or closed (a gateway without a

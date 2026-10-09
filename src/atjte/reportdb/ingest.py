@@ -391,9 +391,11 @@ class Ingestor:
             rows.append({
                 "source_kind": "gateway", "source_name": name,
                 "account": str(acc.get("account") or ""), "ts": _minute(ts),
-                "exchange": "mt5" if venue == "mt5" else str(body.get("exchange") or venue),
+                "exchange": venue if venue in ("mt5", "ctrader")
+                else str(body.get("exchange") or venue),
                 "currency": acc.get("currency") or (settle or {}).get("currency"),
-                "balance": _f((settle or {}).get("total")) if venue != "mt5"
+                # a hedge account (MT5, cTrader) has ONE balance, in its currency
+                "balance": _f((settle or {}).get("total")) if venue not in ("mt5", "ctrader")
                 else _f((bal[0] if bal else {}).get("total")),
                 "equity": _f(acc.get("equity")) if acc.get("equity") is not None
                 else _f((settle or {}).get("total")),

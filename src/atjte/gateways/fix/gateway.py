@@ -444,10 +444,20 @@ class FixGateway:
         mtype = msg.msg_type
         # 35=j BusinessMessageReject names the offending message in 379, not 11
         cl = msg.get(11) or msg.get(379) or ""
+        # Only a message that ANSWERS the request may take it off the pending
+        # map. An execution report that is not the answer — a PendingNew
+        # (150=A), or one without an OrderID yet — used to pop it anyway, so
+        # the real ack that followed found nobody waiting and the bot timed
+        # out on an order that was resting on the book (XAU entries,
+        # 2026-10-07: 1,257 timeouts, the orders then cancelled as untracked
+        # after some had filled).
         with self._lock:
             rec = self._by_clordid.get(cl)
-            waiting = self._pending.pop(cl, None)
-            sent_t = self._pending_t.pop(cl, None)
+            if mtype != "8" or _answers(msg):
+                waiting = self._pending.pop(cl, None)
+                sent_t = self._pending_t.pop(cl, None)
+            else:
+                waiting = sent_t = None
         if waiting is not None and sent_t is not None:
             self._note_reply((self._clock() - sent_t) * 1000.0)
         if mtype == "8":
@@ -526,6 +536,8 @@ class FixGateway:
                 self._by_clordid.pop(rec.cl_ord_id, None)
                 self._by_clordid.pop(cl, None)
         order = K.exec_report_to_ccxt_order(msg, symbol)
+        # what answers ``waiting`` here is exactly what _answers() says, which
+        # is what let _on_fix take it off the pending map
         if msg.get(39) == "8" or exec_type == "8":
             if waiting:
                 c, req = waiting
@@ -1072,6 +1084,15 @@ def _codec_repr(msg) -> str:
         return repr(msg)
 
 
+def _answers(msg: Msg) -> bool:
+    """Whether an execution report is the reply :meth:`FixGateway._exec_report`
+    sends the waiting client: a rejection, or a report that names the
+    venue's OrderID and is not a PendingNew. Keep the two in step."""
+    if msg.get(39) == "8" or msg.get(150) == "8":
+        return True
+    return bool(msg.get(37)) and msg.get(150) != "A"
+
+
 def _reject_kind(text: str) -> str:
     """The exception class the client re-raises, from the venue's wording.
 
@@ -1092,15 +1113,19 @@ def _reject_kind(text: str) -> str:
 
 
 #: the gateways that are not Kraken FIX: venue -> its config module
-_OTHER_VENUES = {"hyperliquid": "atjte.gateways.hyperliquid.config",
+#: (cTrader first: the others take any folder PATH holding a gateway.json as
+#: theirs; cTrader's checks its venue)
+_OTHER_VENUES = {"ctrader": "atjte.gateways.ctrader.config",
+                 "hyperliquid": "atjte.gateways.hyperliquid.config",
                  "lighter": "atjte.gateways.lighter.config",
                  "ccxt": "atjte.gateways.ccxt.config",
                  "ibkr": "atjte.gateways.ibkr.config",
-                 "mt5": "atjte.gateways.mt5.config"}
+                 "mt5": "atjte.gateways.mt5.config",
+                 "databento": "atjte.gateways.databento.config"}
 
 
 def _other_venue(argv: list):
-    """``hyperliquid`` / ``lighter`` / ``ccxt`` / ``ibkr`` / ``mt5`` when the command is for one of those (by
+    """``hyperliquid`` / ``lighter`` / ``ccxt`` / ``ibkr`` / ``mt5`` / ``ctrader`` when the command is for one of those (by
     ``--venue``, or because the named gateway's folder is one of theirs),
     else None — a Kraken FIX gateway."""
     for i, a in enumerate(argv):
@@ -1150,6 +1175,9 @@ def main(argv=None) -> int:
     if other == "lighter":
         from atjte.gateways.lighter.daemon import main as lt_main
         return lt_main(args_in)
+    if other == "ctrader":
+        from atjte.gateways.ctrader.daemon import main as ct_main
+        return ct_main(args_in)
     if other == "mt5":
         from atjte.gateways.mt5.daemon import main as mt5_main
         return mt5_main(args_in)
@@ -1159,6 +1187,9 @@ def main(argv=None) -> int:
     if other == "ibkr":
         from atjte.gateways.ibkr.daemon import main as ib_main
         return ib_main(args_in)
+    if other == "databento":
+        from atjte.gateways.databento.daemon import main as db_main
+        return db_main(args_in)
 
     ap = argparse.ArgumentParser(prog="atjte-gateway")
     ap.add_argument("gateway", nargs="?", type=Path,

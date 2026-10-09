@@ -492,8 +492,10 @@ class MT5Client(UniversalClient):
     def rates(self, symbol: str, frm: datetime, to: datetime,
               timeframe: str = "M1") -> list[dict]:
         """The ``timeframe`` bars between ``frm`` and ``to`` as ``{"time",
-        "open", "high", "low", "close"}`` dicts, oldest first — the history a
-        chart or a warming-up indicator needs. Like :meth:`history_deals`, the
+        "open", "high", "low", "close", "spread"}`` dicts, oldest first — the
+        history a chart or a warming-up indicator needs. The prices are the
+        BID's (MT5 bars are); ``spread`` is the bar's spread in points (the
+        mid = close + spread × 10^-digits / 2). Like :meth:`history_deals`, the
         bounds and each bar's ``time`` are in the BROKER's clock (labelled
         UTC): the caller shifts both (:func:`atjte.reporting.server_offset_s`)."""
         tf = getattr(mt5, f"TIMEFRAME_{timeframe.upper()}", None)
@@ -502,7 +504,8 @@ class MT5Client(UniversalClient):
         mt5.symbol_select(symbol, True)
         rows = mt5.copy_rates_range(symbol, tf, frm, to)
         return [{"time": int(r["time"]), "open": float(r["open"]), "high": float(r["high"]),
-                 "low": float(r["low"]), "close": float(r["close"])}
+                 "low": float(r["low"]), "close": float(r["close"]),
+                 "spread": int(r["spread"])}
                 for r in (rows if rows is not None else ())]
 
     @_serialised

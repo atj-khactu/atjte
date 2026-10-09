@@ -112,6 +112,8 @@ class FakeIbkr:
         if what == "fetch_balance":
             return {"free": {"USD": 40000.0}, "used": {"USD": 2600.0},
                     "total": {"USD": 50000.0}}
+        if what == "fetch_ohlcv":
+            return [[1_800_000_000_000, 1.0, 2.0, 0.5, 1.5, 0.0]]
         return []
 
     def markets(self, symbol=""):
@@ -316,6 +318,15 @@ class FakeIB:
     async def accountSummaryAsync(self, account=""):
         return list(self.summary)
 
+    hist_bars: list = []
+
+    async def reqHistoricalDataAsync(self, contract, endDateTime, durationStr, barSizeSetting,
+                                     whatToShow, useRTH, formatDate=1, keepUpToDate=False,
+                                     chartOptions=(), timeout=60):
+        self.calls.append(("hist", contract.conId, endDateTime, durationStr, barSizeSetting,
+                           whatToShow, useRTH, formatDate))
+        return list(self.hist_bars)
+
 
 class UpstreamTest(unittest.TestCase):
     def setUp(self):
@@ -335,6 +346,94 @@ class UpstreamTest(unittest.TestCase):
                              on_order=lambda a, o: self.pushed.append(("order", a, o)),
                              on_event=lambda k: self.pushed.append(("event", k)))
 
+    # ── fetch_ohlcv: one reqHistoricalData of midpoint bars ─────────────────
+    def _bars(self, start_s: int, n: int, step_s: int = 3600):
+        from types import SimpleNamespace as NS
+        return [NS(date=datetime.fromtimestamp(start_s + k * step_s, tz=timezone.utc),
+                   open=1.0 + k, high=2.0 + k, low=0.5 + k, close=1.5 + k, volume=-1)
+                for k in range(n)]
+
+    def test_ohlcv_is_one_midpoint_request_from_since(self):
+        t0 = int(time.time()) // 3600 * 3600 - 100 * 3600
+        self.ib.hist_bars = self._bars(t0 - 2 * 3600, 6)    # IB pads before since
+        rows = self.up.read("main", "fetch_ohlcv",
+                            {"symbol": MGC, "timeframe": "1h", "since": t0 * 1000,
+                             "limit": 3})
+        self.assertEqual([r[0] for r in rows], [(t0 + k * 3600) * 1000 for k in range(3)])
+        self.assertEqual(rows[0], [t0 * 1000, 3.0, 4.0, 2.5, 3.5, 0.0])
+        call = self.ib.calls[-1]
+        self.assertEqual(call[0], "hist")
+        # the window: since + 3 bars, as an end time and a duration
+        self.assertEqual(call[2], datetime.fromtimestamp(t0 + 3 * 3600, tz=timezone.utc))
+        self.assertEqual(call[3:8], ("10800 S", "1 hour", "MIDPOINT", False, 2))
+
+    def test_ohlcv_without_since_is_the_latest_window(self):
+        t0 = int(time.time()) // 60 * 60 - 10 * 60
+        self.ib.hist_bars = self._bars(t0, 10, 60)
+        rows = self.up.read("main", "fetch_ohlcv", {"symbol": MGC, "timeframe": "1m",
+                                                     "limit": 4})
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[-1][0], (t0 + 9 * 60) * 1000)
+        self.assertEqual(self.ib.calls[-1][2], "")          # "" = up to now
+
+    def test_daily_bars_are_dates(self):
+        import datetime as dt
+        from types import SimpleNamespace as NS
+        self.ib.hist_bars = [NS(date=dt.date(2026, 10, 1), open=1, high=1, low=1, close=4100.0,
+                                volume=10)]
+        rows = self.up.read("main", "fetch_ohlcv", {"symbol": MGC, "timeframe": "1d"})
+        self.assertEqual(rows[0][0], int(datetime(2026, 10, 1, tzinfo=timezone.utc)
+                                         .timestamp() * 1000))
+
+    def test_ohlcv_refuses_what_it_cannot_serve(self):
+        with self.assertRaises(ccxt.BadSymbol):
+            self.up.read("main", "fetch_ohlcv", {"symbol": "GC/USD:USD-200101",
+                                                 "timeframe": "1h"})
+        with self.assertRaises(ccxt.BadRequest):
+            self.up.read("main", "fetch_ohlcv", {"symbol": MGC, "timeframe": "2h"})
+
+    def test_an_unanswered_request_is_a_timeout_not_an_empty_window(self):
+        # ib_async answers a timeout with an empty list: a pager told "empty"
+        # would skip the window
+        from types import SimpleNamespace as NS
+        self.ib.hist_bars = []
+        since = int(time.time() - 86400) * 1000
+
+        def upstream_clock(*ticks):
+            # the upstream's own view of ``time`` (asyncio keeps the real one)
+            it = iter(ticks)
+            return NS(time=time.time, monotonic=lambda: next(it))
+        with mock.patch.object(U, "time", upstream_clock(0.0, U.HIST_TIMEOUT_S)):
+            with self.assertRaises(ccxt.RequestTimeout):
+                self.up.read("main", "fetch_ohlcv", {"symbol": MGC, "timeframe": "1h",
+                                                     "since": since})
+        with mock.patch.object(U, "time", upstream_clock(0.0, 0.2)):   # quick: a closed market
+            self.assertEqual(self.up.read("main", "fetch_ohlcv", {
+                "symbol": MGC, "timeframe": "1h", "since": since}), [])
+
+    def test_a_caller_may_let_the_gateway_wait_longer_up_to_the_cap(self):
+        self.ib.hist_bars = self._bars(int(time.time()) // 3600 * 3600 - 3600, 1)
+        waits = []
+        orig = self.ib.reqHistoricalDataAsync
+
+        async def spy(*a, timeout=60, **kw):
+            waits.append(timeout)
+            return await orig(*a, timeout=timeout, **kw)
+        self.ib.reqHistoricalDataAsync = spy
+        for asked in (None, 40, 600):
+            self.up.read("main", "fetch_ohlcv", {"symbol": MGC, "timeframe": "1h", "limit": 1,
+                                                 "params": {"timeout_s": asked}})
+        self.assertEqual(waits, [U.HIST_TIMEOUT_S, 40.0, U.HIST_TIMEOUT_MAX_S])
+
+    def test_durations_are_what_ib_accepts(self):
+        self.assertEqual(U.IbkrUpstream._duration(3600), "3600 S")
+        self.assertEqual(U.IbkrUpstream._duration(86400), "86400 S")
+        self.assertEqual(U.IbkrUpstream._duration(2.5 * 86400), "3 D")
+        self.assertEqual(U.IbkrUpstream._duration(1000 * 86400), "3 Y")
+        # every window holds a full 1,000-bar page
+        for size, bar_s, window_s in U.BAR_SIZES.values():
+            self.assertGreaterEqual(window_s // bar_s, 1000, size)
+
     def test_a_contract_becomes_a_ccxt_shaped_future_market(self):
         m = U.market_from_details(_details(), CFG.ContractSpec("MGC", "COMEX"))
         self.assertEqual(m["symbol"], MGC)
@@ -345,6 +444,21 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(m["id"], "551601561")
         self.assertEqual(m["expiryDatetime"], "2026-12-29T00:00:00Z")
         self.assertEqual(m["info"]["localSymbol"], "MGCZ6")
+
+    def test_a_market_carries_its_delivery_month_and_first_delivery_day(self):
+        """1OZZ6 is the DECEMBER contract and last trades on 25 Nov: its basis
+        follows December, which reaches spot on its first delivery day."""
+        cd = _details(last="20261125")
+        cd.contractMonth = "202612"
+        m = U.market_from_details(cd, CFG.ContractSpec("MGC", "COMEX"))
+        self.assertEqual((m["info"]["contractMonth"], m["info"]["firstDeliveryDate"],
+                          m["info"]["lastTradeDate"]), ("202612", "20261201", "20261125"))
+        self.up._markets = {m["symbol"]: m}
+        row = self.up.market_rows()[0]
+        self.assertEqual((row["contract_month"], row["delivery"], row["expiry"]),
+                         ("202612", "20261201", "20261125"))
+        bare = U.market_from_details(_details(), CFG.ContractSpec("MGC", "COMEX"))
+        self.assertIsNone(bare["info"]["firstDeliveryDate"])     # TWS sent no month
 
     def test_the_own_symbol_travels_whole_with_its_margin_rate(self):
         with mock.patch.object(self.up, "_im_rate_of", return_value=0.05):
@@ -424,6 +538,39 @@ class UpstreamTest(unittest.TestCase):
         self.up._on_tickers({ticker(bid=-1, ask=2650.2)})              # one-sided
         self.assertEqual(self.pushed[-1][2], d)
 
+    def test_depth_rows_become_a_book_summed_per_price_best_first(self):
+        """TWS's depth rows as the probe saw them on 1OZ (2026-10-08): one
+        price on two rows, rows not in price order."""
+        from ib_async import DOMLevel, Ticker
+        t = Ticker(contract=self.up._contracts[MGC])
+        t.domBids = [DOMLevel(4160.75, 25.0, ""), DOMLevel(4160.0, 59.0, ""),
+                     DOMLevel(4160.25, 55.0, ""), DOMLevel(4159.75, 45.0, ""),
+                     DOMLevel(4159.75, 55.0, ""), DOMLevel(0.0, 0.0, "")]
+        t.domAsks = [DOMLevel(4161.75, 59.0, ""), DOMLevel(4161.5, 15.0, "")]
+        b = self.up.book_dict(MGC, t)
+        self.assertEqual(b["bids"], [[4160.75, 25.0], [4160.25, 55.0], [4160.0, 59.0],
+                                     [4159.75, 100.0]])
+        self.assertEqual(b["asks"], [[4161.5, 15.0], [4161.75, 59.0]])
+        self.up._h["book"] = lambda sym, bk: self.pushed.append(("book", sym, bk))
+        t.bid, t.ask = 4160.75, 4161.5                     # the quote update carries it
+        self.up._on_tickers({t})
+        self.assertEqual([k for k, *_ in self.pushed[-2:]], ["ticker", "book"])
+        self.assertEqual(self.pushed[-1][2]["bids"][0], [4160.75, 25.0])
+
+    def test_a_depth_refusal_is_not_a_market_data_refusal(self):
+        """No depth subscription: the book falls back to the top of book;
+        the symbol's quotes — the bot's market-data verdict — stay up."""
+        self.up._symbols.add(MGC)
+        self.up._depth_reqs[77] = MGC
+        self.up._on_error(77, 2152, "Exchanges - Depth: COMEX", self.up._contracts[MGC])
+        self.assertIn(77, self.up._depth_reqs)                 # a notice: kept
+        self.up._on_error(77, 10092, "Deep market data is not supported",
+                          self.up._contracts[MGC])
+        self.assertNotIn(77, self.up._depth_reqs)
+        self.assertIn(MGC, self.up.status()["depth"]["unavailable"])
+        self.assertTrue(self.up.public_ok_for(MGC))            # quotes untouched
+        self.assertEqual(self.up.status()["market_data_refused"], {})
+
     def test_a_market_data_refusal_takes_the_symbol_down(self):
         self.up._symbols.add(MGC)
         self.assertTrue(self.up.public_ok)
@@ -432,6 +579,32 @@ class UpstreamTest(unittest.TestCase):
         self.assertFalse(self.up.public_ok)
         self.assertEqual(self.pushed[-1], ("event", "market_data"))
         self.assertIn(MGC, self.up.status()["market_data_refused"])
+
+    def test_a_refusal_is_per_symbol_and_the_next_client_asks_again(self):
+        from types import SimpleNamespace as NS
+        other = "GC/USD:USD-261229"
+        self.up._symbols.update({MGC, other})
+        self.up._md_error[other] = "354: not subscribed"      # GC refused, MGC fine
+        self.assertFalse(self.up.public_ok)                   # the gateway: degraded
+        self.assertTrue(self.up.public_ok_for(MGC))           # MGC's bot: quotes up
+        self.assertFalse(self.up.public_ok_for(other))
+        # a subscription bought since: the next attach re-requests the refused one
+        self.up._md_error[MGC] = "10168: not subscribed"
+        self.up._tickers[MGC] = object()
+        sched = []
+        self.up._loop = NS(call_soon_threadsafe=lambda f, *a: sched.append((f, a)))
+        self.ib.reqMktData = lambda c, *a: ("ticker", c.conId)
+        self.ib.cancelMktData = lambda c: self.ib.calls.append(("cancelMktData", c.conId))
+        self.up.subscribe_ticker(MGC)
+        for f, a in sched:
+            f(*a)
+        conid = self.up._contracts[MGC].conId
+        self.assertEqual(self.ib.calls[-1], ("cancelMktData", conid))
+        self.assertEqual(self.up._tickers[MGC], ("ticker", conid))
+        self.assertTrue(self.up.public_ok_for(MGC))
+        sched.clear()
+        self.up.subscribe_ticker(MGC)                        # live: nothing to redo
+        self.assertEqual(sched, [])
 
     def test_the_account_summary_is_the_flex_block(self):
         from ib_async import AccountValue
@@ -451,6 +624,29 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual((b["free"]["USD"], b["used"]["USD"], b["total"]["USD"]),
                          (40000.0, 2600.0, 50000.0))
 
+    def test_a_eur_account_serves_the_bot_its_markets_currency(self):
+        """TWS gives the margin figures in the account's BASE currency only.
+        The bot asks in its market's quote (USD) and gets them converted at
+        TWS's own ExchangeRate; the balance (the overview card) stays EUR."""
+        from ib_async import AccountValue
+        def av(tag, value, currency):
+            return AccountValue(ACCOUNT_ID, tag, value, currency, "")
+        self.ib.summary = [av("AvailableFunds", "10670.49", "EUR"),
+                           av("NetLiquidation", "10670.49", "EUR"),
+                           av("InitMarginReq", "0", "EUR")]
+        self.ib.values = [av("ExchangeRate", "1.00", "BASE"), av("ExchangeRate", "1.00", "EUR"),
+                          av("ExchangeRate", "0.893917", "USD")]
+        self.ib.accountValues = lambda account="": list(self.ib.values)
+        s = self.up.read("main", "account_summary", {"currency": "USD"})
+        self.assertAlmostEqual(s["availableMargin"], 10670.49 / 0.893917, places=4)
+        self.assertEqual((s["currency"], s["baseCurrency"]), ("USD", "EUR"))
+        self.assertEqual(self.up.read("main", "account_summary", {})["marginEquity"], 10670.49)
+        self.assertEqual(self.up.read("main", "fetch_balance", {})["total"], {"EUR": 10670.49})
+        self.ib.values = self.ib.values[:2]                  # no USD rate from TWS yet
+        s = self.up.read("main", "account_summary", {"currency": "USD"})
+        self.assertIsNone(s["availableMargin"])               # never EUR passed off as USD
+        self.assertIsNone(s["marginEquity"])
+
     def test_positions_are_in_contracts_with_the_entry_per_unit(self):
         from ib_async import Position
         self.ib._positions = [Position(ACCOUNT_ID, self.up._contracts[MGC], -3.0, 26480.0)]
@@ -469,6 +665,15 @@ class UpstreamTest(unittest.TestCase):
         rate = self.up._im_rate_of(MGC)
         self.assertAlmostEqual(rate, 1325.05 / (2650.1 * 10), places=6)
         self.assertEqual(self.ib.calls[-1], ("whatIf", "MKT", 1))
+
+    def test_the_margin_probe_takes_ib_async_2s_list_answer(self):
+        from ib_async import OrderState
+        self.up._last[MGC] = {"bid": 2650.0, "ask": 2650.2}
+
+        async def what_if(contract, order):
+            return [OrderState(initMarginChange="1325.05")]
+        self.ib.whatIfOrderAsync = what_if
+        self.assertAlmostEqual(self.up._im_rate_of(MGC), 1325.05 / (2650.1 * 10), places=6)
 
 
 class ConfigTest(unittest.TestCase):
@@ -578,6 +783,17 @@ class ConnectorTest(GatewayCase):
         with self.assertRaises(ccxt.InvalidOrder):
             self.conn.place_order(MGC, OrderSide.BUY, 1, OrderType.LIMIT, 2650.5,
                                   params={"postOnly": True})
+
+    def test_ohlcv_is_routed_to_the_gateway_by_name(self):
+        rows = self.conn.exchange.fetch_ohlcv(MGC, "1h", since=1_799_000_000_000, limit=7)
+        self.assertEqual(rows, [[1_800_000_000_000, 1.0, 2.0, 0.5, 1.5, 0.0]])
+        what = [r for r in self.up.reads if r[1] == "fetch_ohlcv"][-1]
+        self.assertEqual(what[2], {"symbol": MGC, "timeframe": "1h",
+                                   "since": 1_799_000_000_000, "limit": 7, "params": {}})
+        # a caller that can wait longer says how long the gateway may wait for TWS
+        self.conn.exchange.fetch_ohlcv(MGC, "1h", limit=7, params={"timeout_s": 40})
+        what = [r for r in self.up.reads if r[1] == "fetch_ohlcv"][-1]
+        self.assertEqual(what[2]["params"], {"timeout_s": 40})
 
     def test_venue_reads_the_contract_as_a_perp_in_base_units(self):
         from atjte.engines.ccxt.venue import Venue

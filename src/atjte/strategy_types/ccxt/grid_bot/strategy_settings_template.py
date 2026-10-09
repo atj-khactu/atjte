@@ -48,8 +48,10 @@ CLOSE_ONLY = False
 GRID_STEP = 1.0          # distance between grid levels (spread points)
 GRID_LEVELS = 3              # levels per side (entries stop here; exits
                              # ladder as deep as the position actually goes)
-GRID_LEVEL_UNITS = 1.0           # units per grid level; >= one MT5 min lot
-                             # so every fill can be hedged
+GRID_LEVEL_UNITS = 1.0           # units per grid level ("Exposure per Grid");
+                             # >= one MT5 min lot so every fill can be hedged.
+                             # Unused with DYNAMIC_ALLOCATION on: each level is
+                             # then the dynamic cap / GRID_LEVELS
 # units per resting ORDER, entries and exits alike. The exposure a level holds
 # stays GRID_LEVEL_UNITS; a level bigger than one order fills in several orders
 # of this size, each sized to what the level still lacks (2 units level, 1 units

@@ -42,7 +42,7 @@ T0 = datetime(2026, 9, 20, 12, 0, tzinfo=UTC)
 EXPIRY_MS = int(datetime(2026, 12, 29, tzinfo=UTC).timestamp() * 1000)
 
 
-def make_bot(pos, ref=2600.0, now=T0, expiry_ms=EXPIRY_MS):
+def make_bot(pos, ref=2600.0, now=T0, expiry_ms=EXPIRY_MS, info=None):
     """A carry-grid bot with only what ``_desired_orders`` and the carry
     touch — no ``__init__`` (no clients, no feed)."""
     bot = gc.GridFuturesBot.__new__(gc.GridFuturesBot)
@@ -51,7 +51,8 @@ def make_bot(pos, ref=2600.0, now=T0, expiry_ms=EXPIRY_MS):
     bot.venue = types.SimpleNamespace(
         amount_min=0.001, is_perp=True, contract_size=10.0, symbol="MGC/USD:USD-261229",
         exchange_id="ibkr",
-        exchange=types.SimpleNamespace(market=lambda _s: {"expiry": expiry_ms}))
+        exchange=types.SimpleNamespace(market=lambda _s: {"expiry": expiry_ms,
+                                                          "info": dict(info or {})}))
     bot.close_only_reasons = []
     bot.derisk_active = False
     bot.position_diverged = False
@@ -70,10 +71,17 @@ def by_key(orders):
 
 
 class PureTest(unittest.TestCase):
-    def test_fair_center_is_ref_times_daily_carry_times_dte(self):
-        self.assertAlmostEqual(gc.fair_center(2600.0, 0.01, 100.0), 26.0)
-        self.assertAlmostEqual(gc.fair_center(2600.0, -0.01, 50.0, offset=1.5), -11.5)
+    def test_fair_center_is_ref_times_yearly_carry_times_dte_over_365(self):
+        self.assertAlmostEqual(gc.fair_center(2600.0, 3.65, 100.0), 26.0)
+        self.assertAlmostEqual(gc.fair_center(2600.0, -3.65, 50.0, offset=1.5), -11.5)
         self.assertEqual(gc.fair_center(2600.0, 0.0, 100.0), 0.0)
+
+    def test_a_daily_rate_from_an_older_file_is_read_as_a_yearly_one(self):
+        ns = types.SimpleNamespace
+        self.assertEqual(gc.annual_pct(ns(CARRY_ANNUAL_PCT=3.7)), 3.7)
+        self.assertAlmostEqual(gc.annual_pct(ns(CARRY_DAILY_PCT=0.012)), 4.38)
+        self.assertEqual(gc.annual_pct(ns(CARRY_ANNUAL_PCT=3.7, CARRY_DAILY_PCT=0.012)), 3.7)
+        self.assertIsNone(gc.annual_pct(ns()))
 
     def test_days_to_expiry_counts_through_the_last_trade_date(self):
         exp = gc.parse_expiry("2026-12-29")
@@ -97,7 +105,8 @@ class CarryWiringTest(unittest.TestCase):
                 "MAX_POSITION_UNITS": 30.0, "MAX_SHORT_EFFECTIVE": 30.0,
                 "GRID_TAKE_PROFIT": None, "TAKE_PROFIT_EFFECTIVE": 1.0,
                 "ORDER_VOLUME_EFFECTIVE": 10.0}
-    CARRY = {"CARRY_DAILY_PCT": 0.01, "CARRY_EXPIRY": None, "CARRY_UPDATE_UTC": "00:05",
+    CARRY = {"CARRY_ANNUAL_PCT": 3.65, "CARRY_EXPIRY": None, "CARRY_DELIVERY": None,
+             "CARRY_UPDATE_UTC": "00:05",
              "CARRY_LAST_ENTRY_DTE": 1.0}
 
     def setUp(self):
@@ -127,7 +136,7 @@ class CarryWiringTest(unittest.TestCase):
         self.assertTrue((_STRATEGY / "strategy_settings.py").is_file())
 
     def test_flat_rests_around_the_fair_basis(self):
-        bot = make_bot(0.0)                     # 2600 x 0.01 %/day x 100.5 days = 26.13
+        bot = make_bot(0.0)                     # 2600 x 3.65 %/yr x 100.5/365 days = 26.13
         d = by_key(bot._desired_orders())
         self.assertAlmostEqual(bot.center, 26.13)
         self.assertEqual(set(d), {"grid-entry-L1", "grid-entry-S1"})
@@ -160,7 +169,7 @@ class CarryWiringTest(unittest.TestCase):
         bot._clock[0] = datetime(2026, 9, 21, 0, 6, tzinfo=UTC)   # past 00:05 UTC
         bot._desired_orders()
         self.assertNotEqual(bot.center, first)
-        # 2700 x 0.01 % x (Dec 30 00:00 − Sep 21 00:06 = 99.9958 days)
+        # 2700 x 3.65 %/365 x (Dec 30 00:00 − Sep 21 00:06 = 99.9958 days)
         self.assertAlmostEqual(bot.center, 2700.0 * 0.0001 * gc.days_to_expiry(
             bot._clock[0], gc.parse_expiry("2026-12-29")), places=4)
         self.assertEqual(bot._center_next, datetime(2026, 9, 22, 0, 5, tzinfo=UTC))
@@ -193,11 +202,90 @@ class CarryWiringTest(unittest.TestCase):
         bot._desired_orders()
         self.assertAlmostEqual(bot.center, 2600.0 * 0.0001 * 30.5)
 
+    def test_the_banner_runs_before_the_venue_has_connected(self):
+        """startup() logs the banner BEFORE venue.connect(): the expiry is
+        read in _venue_ready, once the markets exist."""
+        class Unconnected(types.SimpleNamespace):
+            @property
+            def exchange(self):          # Venue.exchange with client None
+                raise AttributeError("'NoneType' object has no attribute 'exchange'")
+        bot = make_bot(0.0)
+        connected = bot.venue
+        bot.venue = Unconnected(**{k: v for k, v in vars(connected).items()
+                                   if k != "exchange"})
+        bot._banner()                           # no market read
+        bot.venue = connected
+        bot._venue_ready()
+        self.assertEqual(bot._expiry(), datetime(2026, 12, 30, tzinfo=UTC))
+
     def test_a_market_without_an_expiry_is_refused(self):
         bot = make_bot(0.0, expiry_ms=None)
         with self.assertRaises(RuntimeError) as cm:
             bot._desired_orders()
         self.assertIn("CARRY_EXPIRY", str(cm.exception))
+
+    def test_the_expiry_is_read_once_the_venue_is_connected(self):
+        """The banner runs before any connection (``venue.client`` is None
+        then): a carry grid whose expiry is the market's own crashed there.
+        The expiry check runs in the engine's ``_venue_ready`` hook, after
+        ``venue.connect()`` and before anything hedges or quotes."""
+        import inspect
+        src = inspect.getsource(pb.ArbBot.startup)
+        self.assertLess(src.index("self.venue.connect()"), src.index("self._venue_ready()"))
+        self.assertLess(src.index("self._venue_ready()"), src.index("self._start_event_hedger()"))
+        self.assertIs(gc.GridFuturesBot._banner, grid_bot.GridBot._banner)
+
+        bot = make_bot(0.0)
+        bot._venue_ready()                       # Dec 29 from the market: fine
+        self.assertEqual(bot._expiry(), datetime(2026, 12, 30, tzinfo=UTC))
+        late = make_bot(0.0, now=datetime(2027, 1, 2, tzinfo=UTC))
+        with self.assertRaises(RuntimeError) as cm:
+            late._venue_ready()
+        self.assertIn("has expired", str(cm.exception))
+
+    def test_the_carry_counts_to_the_delivery_day_not_the_last_trade_date(self):
+        """GC December last trades on 29 Dec but trades as spot from its first
+        delivery day, 1 Dec: the carry runs out there. Entries still stop
+        against the last trade date."""
+        bot = make_bot(0.0, info={"contractMonth": "202612", "firstDeliveryDate": "20261201"})
+        bot._desired_orders()
+        days = (datetime(2026, 12, 1, tzinfo=UTC) - T0).total_seconds() / 86400   # 71.5
+        self.assertAlmostEqual(bot.center, 2600.0 * 0.0365 * days / 365, places=4)
+        self.assertAlmostEqual(bot._dte(), 100.5)                 # trading still ends Dec 29
+        c = bot._extra_state()["carry"]
+        self.assertEqual((c["delivery_utc"], c["delivery_from"]),
+                         ("2026-12-01", "first delivery day of 202612"))
+        late = make_bot(0.0, now=datetime(2026, 12, 10, tzinfo=UTC),
+                        info={"contractMonth": "202612"})          # month only: derived
+        late._desired_orders()
+        self.assertEqual(late.center, 0.0)                        # in delivery: spot
+        self.assertIn("grid-entry-L1", by_key(late._desired_orders()))   # still trading
+
+    def test_a_delivery_after_the_last_trade_keeps_carry_at_expiry(self):
+        """1OZ December stops trading on 25 Nov: at its end it still carries
+        the days to 1 Dec."""
+        last = datetime(2026, 11, 25, 12, 0, tzinfo=UTC)
+        bot = make_bot(0.0, now=last, expiry_ms=int(datetime(2026, 11, 25, tzinfo=UTC)
+                                                     .timestamp() * 1000),
+                       info={"contractMonth": "202612", "firstDeliveryDate": "20261201"})
+        gc.CARRY_LAST_ENTRY_DTE = 0.0
+        bot._desired_orders()
+        self.assertAlmostEqual(bot.center, 2600.0 * 0.0365 * 5.5 / 365, places=4)
+
+    def test_carry_delivery_overrides_and_no_month_means_the_expiry(self):
+        gc.CARRY_DELIVERY = "2026-11-02"
+        bot = make_bot(0.0, info={"contractMonth": "202612"})
+        bot._desired_orders()
+        self.assertAlmostEqual(bot.center, 2600.0 * 0.0365 * 42.5 / 365, places=4)
+        gc.CARRY_DELIVERY = None
+        plain = make_bot(0.0)                                     # a CCXT future: no month
+        plain._desired_orders()
+        self.assertAlmostEqual(plain.center, 26.13)
+        self.assertEqual(plain._delivery()[1], "the expiry (no delivery month)")
+        old_gw = make_bot(0.0, info={"conId": 753716608, "lastTradeDate": "20261125"})
+        with self.assertRaises(RuntimeError) as cm:              # an IBKR market, no month
+            old_gw._venue_ready()
+        self.assertIn("restart the gateway", str(cm.exception))
 
     def test_the_heartbeat_carries_the_grid_and_carry_blocks(self):
         bot = make_bot(10.0)
@@ -208,7 +296,8 @@ class CarryWiringTest(unittest.TestCase):
         self.assertEqual(g["long_entries"], [25.13, 24.13, 23.13])
         self.assertEqual(g["short_exits"], [26.13, 27.13, 28.13])
         self.assertEqual(g["long_fills"], [10.0, 0.0, 0.0])
-        self.assertEqual((c["daily_pct"], c["ref_price"], c["update_utc"]), (0.01, 2600.0, "00:05"))
+        self.assertEqual((c["annual_pct"], c["ref_price"], c["update_utc"]), (3.65, 2600.0, "00:05"))
+        self.assertAlmostEqual(c["daily_pct"], 0.01)
         self.assertAlmostEqual(c["dte_at_update"], 100.5)
         self.assertEqual(c["next_update_utc"], "2026-09-21T00:05:00+00:00")
 

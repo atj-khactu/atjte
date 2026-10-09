@@ -16,6 +16,7 @@ the gateway, and sends every order op to it.
 | `lighter` | `gateways/lighter` | Lighter | machine |
 | `ibkr` | `gateways/ibkr` | Interactive Brokers futures through TWS / IB Gateway (the login stays in TWS) | TWS login (API client id) |
 | `mt5` | `gateways/mt5` | one MetaTrader 5 terminal | terminal |
+| `ctrader` | `gateways/ctrader` | one cTrader account as the HEDGE (the MT5 gateway's wire and machinery over the Open API) | account (ctidTraderAccountId) |
 
 What every gateway owns, and why none of it can live in a bot:
 
@@ -60,7 +61,7 @@ VARIABLE that holds it, never by value. This project is livestreamed.
 ## Run
 
 ```
-atjte-gateway --new NAME --venue ccxt --exchange coinbase    # or kraken / krakenfutures / hyperliquid / lighter / ibkr / mt5
+atjte-gateway --new NAME --venue ccxt --exchange coinbase    # or kraken / krakenfutures / hyperliquid / lighter / ibkr / mt5 / ctrader
 atjte-gateway --list
 atjte-gateway NAME --check                                    # resolve everything, connect to nothing
 atjte-gateway NAME                                            # run it (Ctrl+C reaps every client first)

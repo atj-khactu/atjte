@@ -14,7 +14,7 @@ entries, hard caps, the short mirror, and no self-cross under one_per_side.
 import unittest
 
 from atjte.engines.common.grid_model import (
-    DesiredOrder, bollinger_ladder_orders, bollinger_orders,
+    DesiredOrder, bollinger_ladder_orders, dynamic_level_units, bollinger_orders,
     bollinger_short_ladder_orders, bollinger_short_orders, bollinger_two_sided,
     fixed_entry_exit_levels, grid_long_orders, grid_short_orders, grid_two_sided,
     level_fills, one_per_side, round_to_step,
@@ -323,6 +323,28 @@ class TestBollingerShortLadderOrders(unittest.TestCase):
 
 
 STEP, LEVELS, UNIT = 1.0, 3, 1.0     # the grid bot's shipped geometry
+
+
+class TestDynamicLevelUnits(unittest.TestCase):
+    """Dynamic allocation's grid level: the cap / levels, the nearest lot step."""
+
+    def test_even_split_rounded_to_the_nearest_lot_step(self):
+        # 100 000 EUR cap over 3 levels, 0.01 lot = 1 000 EUR: 33 000 a level
+        self.assertEqual(dynamic_level_units(100000.0, 3, 1000.0), 33000.0)
+        # SP500: a 1.95 cap over 3 levels = 0.65 -> 0.7 (not 0.6), 0.1 lot step
+        self.assertAlmostEqual(dynamic_level_units(1.95, 3, 0.1), 0.7)
+        self.assertAlmostEqual(dynamic_level_units(1.89, 3, 0.1), 0.6)   # 0.63
+
+    def test_no_lot_step_is_the_plain_share(self):
+        self.assertAlmostEqual(dynamic_level_units(3.0, 4), 0.75)
+
+    def test_no_cap_or_too_small_is_none(self):
+        self.assertIsNone(dynamic_level_units(None, 3, 1000.0))
+        self.assertIsNone(dynamic_level_units(0.0, 3, 1000.0))
+        self.assertIsNone(dynamic_level_units(1400.0, 3, 1000.0))          # 0.47 lot -> 0
+        self.assertEqual(dynamic_level_units(1500.0, 3, 1000.0), 1000.0)   # 0.5 lot -> 1
+        self.assertIsNone(dynamic_level_units(3000.0, 3, 1000.0, min_size=1500.0))
+        self.assertEqual(dynamic_level_units(3000.0, 3, 1000.0, min_size=1000.0), 1000.0)
 
 
 class TestLevelFills(unittest.TestCase):

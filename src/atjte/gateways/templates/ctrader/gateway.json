@@ -1,0 +1,9 @@
+{
+  "_comment": "A cTrader gateway: ONE per cTrader account (ctidTraderAccountId). It holds the account's Open API session for every bot on this machine and pushes their quotes. network: demo | live (must match the account).",
+  "name": "ctrader_main",
+  "venue": "ctrader",
+  "listen_port": 5625,
+  "network": "demo",
+  "tick_poll_ms": 10,
+  "clients": []
+}

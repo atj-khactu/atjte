@@ -194,6 +194,10 @@ GATEWAY_CONNECTORS = {
 }
 #: the MT5 hedge's connector (``MT5_CLIENT``): through the terminal's gateway
 MT5_GATEWAY_CONNECTOR = "atjte.clients.gateway.MT5GatewayClient"
+#: the hedge on cTrader (``MT5_CLIENT``): through the account's cTrader gateway
+CTRADER_GATEWAY_CONNECTOR = "atjte.clients.gateway.CTraderGatewayClient"
+#: the hedge connector for each hedge gateway kind
+HEDGE_CONNECTORS = {"mt5": MT5_GATEWAY_CONNECTOR, "ctrader": CTRADER_GATEWAY_CONNECTOR}
 
 
 def gateway_kinds(exchange_id: Optional[str]) -> tuple[str, ...]:

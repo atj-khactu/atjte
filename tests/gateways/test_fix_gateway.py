@@ -80,9 +80,11 @@ class FakeSession:
 
     def exec_report(self, cl, order_id, *, exec_type="0", ord_status="0", **extra):
         pairs = [(35, "8"), (34, 2), (49, "KRAKEN-TRD"), (56, "S"),
-                 (52, K.utc_stamp(0)), (11, cl), (37, order_id), (55, "BTC/USD"),
-                 (54, "1"), (150, exec_type), (39, ord_status), (38, "0.5"),
-                 (44, "83000")]
+                 (52, K.utc_stamp(0)), (11, cl)]
+        if order_id:                    # no OrderID yet: the tag is absent
+            pairs.append((37, order_id))
+        pairs += [(55, "BTC/USD"), (54, "1"), (150, exec_type), (39, ord_status),
+                  (38, "0.5"), (44, "83000")]
         pairs += list(extra.get("extra", ()))
         self.deliver(pairs)
 
@@ -222,6 +224,48 @@ class DeadMansSwitchTest(GatewayCase):
         with self.gw._lock:
             self.gw._clients["strat_a"].last_seen = time.time() - 86400
         self.assertEqual(self.gw.reap_overdue(), [])
+
+
+class CancelReplyTest(GatewayCase):
+    """A cancel is answered with the ExecutionReport that replied to it,
+    tags intact in ``info`` — what lets the engine settle a cancelled order
+    from 39 (OrdStatus) and 14 (CumQty) without a REST read."""
+
+    def _cancel(self, client, order_id, **report):
+        out = {}
+
+        def go():
+            try:
+                out["reply"] = client.cancel(order_id)
+            except Exception as e:
+                out["error"] = e
+
+        before = sum(1 for t, _ in self.session.sent if t == "F")
+        t = threading.Thread(target=go)
+        t.start()
+        cl = self._await_sent("F", after=before)
+        self.session.exec_report(cl, order_id, **report)
+        t.join(timeout=5)
+        if "error" in out:
+            raise out["error"]
+        return out["reply"]
+
+    def test_the_cancel_ack_carries_status_and_cum_qty(self):
+        a = self.client("strat_a")
+        self.place(a, "O-AAA")
+        reply = self._cancel(a, "O-AAA", exec_type="4", ord_status="4",
+                             extra=((14, "0.2"), (151, "0")))
+        self.assertEqual(reply["info"]["39"], "4")
+        self.assertEqual(reply["info"]["14"], "0.2")
+        self.assertAlmostEqual(reply["filled"], 0.2)
+        self.assertEqual(reply["status"], "canceled")
+
+    def test_a_pending_cancel_answers_with_its_own_status(self):
+        a = self.client("strat_a")
+        self.place(a, "O-AAA")
+        reply = self._cancel(a, "O-AAA", exec_type="6", ord_status="6",
+                             extra=((14, "0"),))
+        self.assertEqual(reply["info"]["39"], "6")       # not final: the engine reads later
 
 
 class RefusalTest(GatewayCase):
@@ -679,6 +723,67 @@ class ReplyLatencyTest(GatewayCase):
         self.assertEqual(c["reply_ms_avg"], c["reply_ms_last"])       # first sample
         self.assertEqual(c["reply_ms_max"], c["reply_ms_last"])
         self.assertIn("reply_ms_avg", json.dumps(self.gw.status()))
+
+
+class PendingAckTest(GatewayCase):
+    """A report that is not the answer must leave the request waiting for
+    the one that is. Popping it on the first report hung the bot on orders
+    that were resting on the book (XAU entries, 2026-10-07)."""
+
+    def _place_with(self, client, first_reports):
+        out = {}
+
+        def go():
+            try:
+                out["order"] = client.place("sell", 0.5, 83000.0)
+            except Exception as e:
+                out["error"] = e
+
+        t = threading.Thread(target=go)
+        t.start()
+        cl = self._await_sent("D")
+        for kw in first_reports:
+            self.session.exec_report(cl, **kw)
+        self.assertTrue(t.is_alive(), "the client was answered by a non-answer")
+        self.session.exec_report(cl, "O-ACK")            # the real ack
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive(), "the ack never reached the client")
+        if "error" in out:
+            raise out["error"]
+        return out["order"]
+
+    def test_a_pending_new_then_the_ack_answers_the_client(self):
+        a = self.client("strat_a")
+        order = self._place_with(a, [dict(order_id="O-ACK", exec_type="A",
+                                          ord_status="A")])
+        self.assertEqual(order["id"], "O-ACK")
+        self.assertEqual(self.gw._pending, {})
+
+    def test_a_report_without_an_order_id_does_not_consume_the_request(self):
+        a = self.client("strat_a")
+        order = self._place_with(a, [dict(order_id="", exec_type="0")])
+        self.assertEqual(order["id"], "O-ACK")
+
+    def test_a_reject_report_still_answers_at_once(self):
+        a = self.client("strat_a")
+        out = {}
+        t = threading.Thread(target=lambda: out.update(
+            r=self._catch(lambda: a.place("sell", 0.5, 83000.0))))
+        t.start()
+        cl = self._await_sent("D")
+        self.session.exec_report(cl, "", exec_type="8", ord_status="8",
+                                 extra=[(58, "INSUFFICIENT_MARGIN")])
+        t.join(timeout=5)
+        self.assertIsInstance(out["r"], Exception)
+        self.assertIn("INSUFFICIENT_MARGIN", str(out["r"]))
+        self.assertEqual(self.gw._pending, {})
+
+    @staticmethod
+    def _catch(fn):
+        try:
+            return fn()
+        except Exception as e:
+            return e
 
 
 class RejectKindTest(unittest.TestCase):

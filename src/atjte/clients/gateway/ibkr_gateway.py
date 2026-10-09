@@ -101,8 +101,13 @@ class IbkrGatewayClient(GatewayConnector):
             return gw.read("fetch_closed_orders", symbol=symbol, since=since, limit=limit,
                            params=dict(params or {}))
 
+        def fetch_ohlcv(symbol, timeframe="1m", since=None, limit=None, params=None):
+            # params: ``timeout_s``, how long the gateway may wait for TWS
+            return gw.read("fetch_ohlcv", symbol=symbol, timeframe=timeframe,
+                           since=since, limit=limit, params=dict(params or {}))
+
         for fn in (fetch_balance, fetch_positions, fetch_open_orders, fetch_order,
-                   fetch_my_trades, fetch_closed_orders):
+                   fetch_my_trades, fetch_closed_orders, fetch_ohlcv):
             setattr(x, fn.__name__, fn)
 
     def flex_account(self) -> dict:
@@ -110,5 +115,10 @@ class IbkrGatewayClient(GatewayConnector):
         names ``Venue.read_margin`` reads (``availableMargin``,
         ``initialMargin``, ``maintenanceMargin``, ``marginEquity``,
         ``portfolioValue``, ``totalUnrealized``, ``pnl``): TWS's account
-        summary, through the gateway's per-account cache."""
+        summary, through the gateway's per-account cache — in THIS market's
+        quote currency (the engine adds them to USD figures), converted by
+        the gateway from the account's base currency at TWS's own rate."""
+        quote = (self._x.markets.get(self.symbol) or {}).get("quote") if self.symbol else None
+        if quote:
+            return dict(self.gateway.read("account_summary", currency=quote) or {})
         return dict(self.gateway.read("account_summary") or {})

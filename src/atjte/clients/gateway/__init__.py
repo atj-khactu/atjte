@@ -12,9 +12,11 @@ key; it leases a gateway (:mod:`atjte.gateways`) over loopback:
 - ``KrakenFixClient`` / ``KrakenFuturesFixClient`` — Kraken spot /
   derivatives with order entry over the Kraken FIX gateway (which serves the
   reads, prices and fills too);
-- ``MT5GatewayClient`` — the MT5 hedge through the terminal's MT5 gateway.
+- ``MT5GatewayClient`` — the MT5 hedge through the terminal's MT5 gateway;
+- ``CTraderGatewayClient`` — the hedge on cTrader through the account's
+  cTrader gateway (the MT5 wire, an MT5GatewayClient subclass).
 
-All but the last share :class:`~.base.GatewayConnector`.
+All but the last two share :class:`~.base.GatewayConnector`.
 """
 from __future__ import annotations
 
@@ -25,7 +27,8 @@ _LAZY = {"CcxtGatewayClient": ".ccxt_gateway",
          "HyperliquidGatewayClient": ".hyperliquid_gateway",
          "LighterGatewayClient": ".lighter_gateway",
          "IbkrGatewayClient": ".ibkr_gateway",
-         "MT5GatewayClient": ".mt5_gateway"}
+         "MT5GatewayClient": ".mt5_gateway",
+         "CTraderGatewayClient": ".ctrader_gateway"}
 
 __all__ = [*_LAZY]
 

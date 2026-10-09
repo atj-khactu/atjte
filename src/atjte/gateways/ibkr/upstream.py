@@ -27,7 +27,9 @@ belongs to that client id, which is what lets TWS hand them back with their
   arrives in a later report and is filled into the trade list, not the push:
   the hedge must not wait for it);
 - **reads**: positions, open / closed orders and fills from ib_async's
-  synced state, the balance and the margin block from the account summary.
+  synced state, the balance and the margin block from the account summary;
+  ``fetch_ohlcv`` = one ``reqHistoricalData`` of MIDPOINT bars (the Spread
+  History page's fetch pages it by ``since``).
 
 Liveness, the engine's rules: public OK = the session is up and no symbol a
 client subscribed has a market-data refusal; private OK = the session is up
@@ -47,7 +49,7 @@ from typing import Any, Callable, Optional
 
 import ccxt
 
-from ..common import jsonable
+from ..common import BOOK_LEVELS, book_payload, jsonable
 from .config import ContractSpec
 
 ORDER_TIMEOUT_S = 10.0
@@ -58,6 +60,21 @@ RECONNECT_EVERY_S = 5.0
 ACK_WAIT_S = 2.0
 #: the probed initial-margin rate per symbol is re-asked this often
 IM_RATE_TTL_S = 3600.0
+#: ``fetch_ohlcv``: CCXT timeframe -> (IB bar size, bar seconds, the most
+#: ONE request covers). One read = one IB request, answered well inside the
+#: bots' 10 s request timeout; the caller pages by ``since``. Every window
+#: holds at least 1,000 bars, so a 1,000-bar page is one request (a pager
+#: that skips an empty page's span skips no data).
+BAR_SIZES = {"1m": ("1 min", 60, 1000 * 60), "5m": ("5 mins", 300, 1000 * 300),
+             "15m": ("15 mins", 900, 1000 * 900), "30m": ("30 mins", 1800, 1000 * 1800),
+             "1h": ("1 hour", 3600, 1000 * 3600), "4h": ("4 hours", 14400, 1000 * 14400),
+             "1d": ("1 day", 86400, 1000 * 86400)}
+#: how long one historical request waits for TWS: a bot's read must answer
+#: inside its 10 s request timeout; a caller that waits longer (the spread
+#: history fetch) says so with ``params.timeout_s``, up to the cap — IB's
+#: history service is sometimes slower than 9 s on a thin contract
+HIST_TIMEOUT_S = 9.0
+HIST_TIMEOUT_MAX_S = 60.0
 #: IB error codes that mean "no live market data for this contract"
 MD_REFUSED_CODES = {354, 10167, 10168, 10197, 10089, 10090}
 #: IB error codes that are informational on a connection
@@ -95,8 +112,14 @@ def market_symbol(symbol: str, currency: str, last_trade: str) -> str:
 
 
 def market_from_details(cd, spec: ContractSpec) -> dict:
-    """A CCXT-shaped future market from one ``ContractDetails``."""
+    """A CCXT-shaped future market from one ``ContractDetails``. ``info``
+    carries the delivery month and its first delivery day (``YYYYMMDD``):
+    where a gold future's basis reaches spot, which may be before its last
+    trade date (GC) or after it (1OZ) — :mod:`atjte.engines.common.delivery`."""
+    from atjte.engines.common.delivery import first_delivery_day
     c = cd.contract
+    month = str(getattr(cd, "contractMonth", "") or "")
+    first = first_delivery_day(month)
     mult = _num(c.multiplier) or 1.0
     last = str(c.lastTradeDateOrContractMonth or "")
     sym = market_symbol(c.symbol, c.currency, last)
@@ -124,6 +147,8 @@ def market_from_details(cd, spec: ContractSpec) -> dict:
                  "primaryExchange": c.primaryExchange, "tradingClass": c.tradingClass,
                  "secType": c.secType, "multiplier": c.multiplier, "minTick": cd.minTick,
                  "lastTradeDate": last, "longName": cd.longName,
+                 "contractMonth": month or None,
+                 "firstDeliveryDate": first.strftime("%Y%m%d") if first else None,
                  "spec": spec.as_dict()},
     }
 
@@ -151,6 +176,8 @@ class IbkrUpstream:
         self._symbols: set[str] = set()             # subscribed
         self._md_error: dict[str, str] = {}         # symbol -> refusal text
         self._tickers: dict[str, Any] = {}          # symbol -> ib Ticker
+        self._depth_reqs: dict[int, str] = {}       # reqMktDepth reqId -> symbol
+        self._depth_off: dict[str, str] = {}        # symbol -> why it has no depth
         self._last: dict[str, dict] = {}            # symbol -> last pushed ticker
         self._order_errors: dict[int, str] = {}     # orderId -> TWS's rejection
         self._im_rate: dict[str, tuple[float, float]] = {}   # symbol -> (t, rate)
@@ -297,7 +324,9 @@ class IbkrUpstream:
         return [{"symbol": s, "base": m["base"], "quote": m["quote"], "kind": "future",
                  "contract_size": m["contractSize"], "active": True,
                  "venue_name": str(m["info"].get("localSymbol") or ""),
-                 "expiry": m["info"].get("lastTradeDate")}
+                 "expiry": m["info"].get("lastTradeDate"),
+                 "contract_month": m["info"].get("contractMonth"),
+                 "delivery": m["info"].get("firstDeliveryDate")}
                 for s, m in self._markets.items()]
 
     def markets(self, symbol: str = "") -> dict:
@@ -344,7 +373,9 @@ class IbkrUpstream:
             return None
         state = await self.ib.whatIfOrderAsync(
             contract, MarketOrder("BUY", 1, account=self.account_id(self.accounts()[0])))
-        im = _num(state.initMarginChange)
+        if isinstance(state, list):         # ib_async 2.x answers a list of OrderStates
+            state = state[0] if state else None
+        im = _num(getattr(state, "initMarginChange", None))
         if im is None or im <= 0:
             return None
         return im / (px * float(m["contractSize"] or 1.0))
@@ -358,6 +389,11 @@ class IbkrUpstream:
     def public_ok(self) -> bool:
         return self._up and not any(s in self._md_error for s in self._symbols)
 
+    def public_ok_for(self, symbol: str) -> bool:
+        """THIS symbol's market data: one refused contract (no subscription
+        for it) never takes another symbol's quotes down."""
+        return self._up and symbol in self._symbols and symbol not in self._md_error
+
     def private_ok(self, account: str) -> bool:
         return self._up and account in self._accounts
 
@@ -366,6 +402,8 @@ class IbkrUpstream:
                 "accounts": {a: self.private_ok(a) for a in self._accounts},
                 "symbols": sorted(self._symbols),
                 "market_data_refused": dict(self._md_error),
+                "depth": {"streaming": sorted(set(self._depth_reqs.values())),
+                          "unavailable": dict(self._depth_off)},
                 "tws": f"{self.host}:{self.port} (client id {self.client_id})",
                 "connected": self._up, "markets": len(self._markets),
                 "counters": dict(self.counters), "last_error": self.last_error}
@@ -385,6 +423,15 @@ class IbkrUpstream:
         text = str(errorString or "")
         if code in _CONN_INFO_CODES:
             return
+        if reqId is not None and int(reqId) in self._depth_reqs:
+            # the DEPTH request's answer: never the symbol's quotes (a depth
+            # refusal is no market-data refusal); 21xx are notices
+            if not 2100 <= code < 2200:
+                sym = self._depth_reqs.pop(int(reqId))
+                self._depth_off[sym] = f"{code}: {text}"
+                self._log(f"ib upstream: depth of market for {sym} unavailable ({code}: "
+                          f"{text}) — its book is the top of book only")
+            return
         contract = next((r for r in rest if hasattr(r, "conId")), None)
         sym = self._sym_of.get(getattr(contract, "conId", None))
         if code in MD_REFUSED_CODES and sym:
@@ -402,7 +449,12 @@ class IbkrUpstream:
 
     # ── streams ──────────────────────────────────────────────────────────────
     def subscribe_ticker(self, symbol: str) -> None:
-        if symbol in self._symbols or self._loop is None:
+        """Live market data for ``symbol``, once — and again when TWS refused
+        it before (a subscription bought since then only shows on a new
+        request: the next client to attach asks again)."""
+        if self._loop is None:
+            return
+        if symbol in self._symbols and symbol not in self._md_error:
             return
         if symbol not in self._contracts:
             raise ValueError(f"{symbol} is not among this gateway's contracts")
@@ -412,9 +464,48 @@ class IbkrUpstream:
     def _subscribe(self, symbol: str) -> None:
         try:
             self._md_error.pop(symbol, None)
+            if symbol in self._tickers:     # the refused request: replaced
+                try:
+                    self.ib.cancelMktData(self._contracts[symbol])
+                except Exception:                   # noqa: BLE001
+                    pass
             self._tickers[symbol] = self.ib.reqMktData(self._contracts[symbol], "", False, False)
         except Exception as e:                      # noqa: BLE001
             self._err(f"reqMktData {symbol}", e)
+        self._subscribe_depth(symbol)
+
+    def _subscribe_depth(self, symbol: str) -> None:
+        """Depth of market for the bots' report (DISPLAY only — the panel's
+        order book), once per symbol: ``reqMktDepth``, BOOK_LEVELS rows. It
+        fills the same ib Ticker as the quotes (``domBids`` / ``domAsks``);
+        a refusal (no depth subscription) leaves the top of book, logged."""
+        if (self._h.get("book") is None or symbol in self._depth_off
+                or symbol in self._depth_reqs.values()):
+            return
+        try:
+            t = self.ib.reqMktDepth(self._contracts[symbol], numRows=BOOK_LEVELS,
+                                    isSmartDepth=False)
+            rid = self.ib.wrapper.ticker2ReqId["mktDepth"].get(t)
+            if rid is not None:
+                self._depth_reqs[int(rid)] = symbol
+        except Exception as e:                      # noqa: BLE001
+            self._depth_off[symbol] = f"{type(e).__name__}: {e}"
+            self._log(f"ib upstream: depth of market for {symbol} not requested ({e})")
+
+    def book_dict(self, symbol: str, t) -> Optional[dict]:
+        """The ticker's depth as the wire's book: rows summed per price (TWS
+        may list one price on several rows), best first, BOOK_LEVELS a side.
+        None without both sides."""
+        def side(rows, best_first_desc: bool) -> list:
+            agg: dict[float, float] = {}
+            for r in rows or []:
+                px, sz = _num(getattr(r, "price", None)), _num(getattr(r, "size", None))
+                if px and sz and px > 0 and sz > 0:
+                    agg[px] = agg.get(px, 0.0) + sz
+            return sorted(([p, q] for p, q in agg.items()), key=lambda r: r[0],
+                          reverse=best_first_desc)
+        return book_payload(symbol, {"bids": side(t.domBids, True),
+                                     "asks": side(t.domAsks, False)})
 
     @staticmethod
     def _mid(t) -> Optional[float]:
@@ -450,6 +541,15 @@ class IbkrUpstream:
                 self._h["ticker"](d["symbol"], d)
             except Exception:
                 self.counters["errors"] += 1
+            if (self._h.get("book") is not None and d["symbol"] not in self._depth_off
+                    and (getattr(t, "domBids", None) or getattr(t, "domAsks", None))):
+                b = self.book_dict(d["symbol"], t)
+                if b is not None:
+                    self.counters["books"] = self.counters.get("books", 0) + 1
+                    try:
+                        self._h["book"](d["symbol"], b)   # the gateway throttles it
+                    except Exception:
+                        self.counters["errors"] += 1
 
     # ── orders ───────────────────────────────────────────────────────────────
     def _account_of(self, order) -> str:
@@ -613,17 +713,42 @@ class IbkrUpstream:
                 ccy: {"free": free, "used": used, "total": total},
                 "info": {k: v[0] for k, v in s.items()}}
 
-    def _account_summary(self, account: str) -> dict:
+    def _base_per(self, account: str, currency: str) -> Optional[float]:
+        """How many units of the account's BASE currency one ``currency``
+        buys — TWS's own ``ExchangeRate`` account value (USD 0.8939 on a EUR
+        account), refreshed with the account updates. None when TWS has not
+        sent it."""
+        for v in self.ib.accountValues(self.account_id(account)) or []:
+            if v.tag == "ExchangeRate" and v.currency == currency:
+                return _num(v.value)
+        return None
+
+    def _account_summary(self, account: str, currency: Optional[str] = None) -> dict:
+        """The margin figures. TWS gives them in the account's BASE currency
+        only (EUR on a EUR account, whatever the contract trades in);
+        ``currency`` (the bot's market's quote) converts them at TWS's own
+        rate, because the engine adds them to USD figures and sizes USD
+        notionals off them. No rate = no figures (None), never base-currency
+        numbers passed off as ``currency``."""
         s = self._summary(account)
+        base = next((c for _v, c in s.values() if c and c != "BASE"), "")
+        want = (currency or base or "").upper()
+        rate: Optional[float] = 1.0
+        if want and base and want != base:
+            per = self._base_per(account, want)
+            rate = (1.0 / per) if per else None
 
         def g(tag):
-            return s.get(tag, (None, ""))[0]
+            v = s.get(tag, (None, ""))[0]
+            return None if v is None or rate is None else v * rate
         return {"availableMargin": g("AvailableFunds"), "initialMargin": g("InitMarginReq"),
                 "initialMarginWithOrders": g("InitMarginReq"),
                 "maintenanceMargin": g("MaintMarginReq"), "marginEquity": g("NetLiquidation"),
                 "portfolioValue": g("NetLiquidation"), "totalUnrealized": g("UnrealizedPnL"),
                 "unrealizedFunding": None, "pnl": g("RealizedPnL"),
-                "excessLiquidity": g("ExcessLiquidity"), "cash": g("TotalCashValue")}
+                "excessLiquidity": g("ExcessLiquidity"), "cash": g("TotalCashValue"),
+                "currency": want or None, "baseCurrency": base or None,
+                "fxRate": rate}
 
     def _positions(self, account: str, symbols: Optional[list]) -> list[dict]:
         aid = self.account_id(account)
@@ -679,6 +804,74 @@ class IbkrUpstream:
         out.sort(key=lambda d: d["timestamp"] or 0)
         return out[-int(limit):] if limit else out
 
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        """An IB duration string covering ``seconds``: seconds up to a day,
+        days up to a year, whole years beyond (what IB accepts)."""
+        s = max(60, int(math.ceil(seconds)))
+        if s <= 86400:
+            return f"{s} S"
+        days = int(math.ceil(s / 86400))
+        return f"{days} D" if days <= 365 else f"{int(math.ceil(days / 365))} Y"
+
+    def _ohlcv(self, symbol: str, timeframe: str, since, limit,
+               timeout_s: Optional[float] = None) -> list[list]:
+        """CCXT ``fetch_ohlcv`` over ONE ``reqHistoricalData``: the MIDPOINT
+        bars (no live data subscription needed, unlike quoting) from
+        ``since`` forward — one window of :data:`BAR_SIZES` — or, without
+        ``since``, the latest window. ``[ms, open, high, low, close, 0]``,
+        oldest first; volume is 0 (a midpoint has none)."""
+        contract = self._contracts.get(symbol)
+        if contract is None:
+            raise ccxt.BadSymbol(f"ibkr: this gateway lists no market {symbol!r}")
+        spec = BAR_SIZES.get(timeframe or "1m")
+        if spec is None:
+            raise ccxt.BadRequest(f"ibkr: timeframe {timeframe!r} is not one of "
+                                  f"{', '.join(BAR_SIZES)}")
+        size, bar_s, window_s = spec
+        now = time.time()
+        lim = int(limit) if limit else None
+        if lim:
+            window_s = min(window_s, lim * bar_s)
+        if since is None:
+            start, end = now - window_s, now
+        else:
+            start = float(since) / 1000.0
+            end = min(now, start + window_s)
+            if end <= start:
+                return []
+        end_dt = "" if end >= now - 1 else datetime.fromtimestamp(end, tz=timezone.utc)
+        wait = HIST_TIMEOUT_S
+        if timeout_s:
+            wait = max(1.0, min(float(timeout_s), HIST_TIMEOUT_MAX_S))
+
+        async def go():
+            return await self.ib.reqHistoricalDataAsync(
+                contract, end_dt, self._duration(end - start), size, "MIDPOINT",
+                False, formatDate=2, timeout=wait)
+
+        t0 = time.monotonic()
+        bars = self._call(go(), wait + 1.0) or []
+        if not bars and time.monotonic() - t0 >= wait * 0.9:
+            # ib_async answers a timeout with an empty list: that is not "no
+            # bars in the window" (a closed market), and a pager told so
+            # would skip the window
+            raise ccxt.RequestTimeout(f"ibkr: no historical data reply for {symbol} "
+                                      f"within {wait:g}s")
+        rows = []
+        for b in bars:
+            d = b.date
+            if not isinstance(d, datetime):     # a daily bar's date
+                d = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+            ms = _ms(d)
+            if ms is None or (since is not None and ms < int(since)):
+                continue
+            rows.append([ms, float(b.open), float(b.high), float(b.low), float(b.close), 0.0])
+        rows.sort(key=lambda r: r[0])
+        if lim:
+            rows = rows[:lim] if since is not None else rows[-lim:]
+        return rows
+
     def read(self, account: str, what: str, args: dict) -> Any:
         a = dict(args or {})
         self.counters["reads"] += 1
@@ -687,7 +880,7 @@ class IbkrUpstream:
         if what == "fetch_balance":
             return jsonable(self._balance(account))
         if what == "account_summary":
-            return jsonable(self._account_summary(account))
+            return jsonable(self._account_summary(account, a.get("currency")))
         if what == "fetch_positions":
             return jsonable(self._positions(account, a.get("symbols")))
         if what == "fetch_open_orders":
@@ -702,4 +895,8 @@ class IbkrUpstream:
         if what == "fetch_my_trades":
             return jsonable(self._my_trades(account, a.get("symbol"), a.get("since"),
                                             a.get("limit")))
+        if what == "fetch_ohlcv":               # public: no account in it
+            return self._ohlcv(str(a.get("symbol")), a.get("timeframe") or "1m",
+                               a.get("since"), a.get("limit"),
+                               (a.get("params") or {}).get("timeout_s"))
         raise ValueError(f"unknown read {what!r}")

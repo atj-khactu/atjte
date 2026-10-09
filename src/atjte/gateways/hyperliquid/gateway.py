@@ -477,7 +477,9 @@ class HlGateway:
     def session_for(self, c: _Client) -> dict:
         """What this client may rely on: the public stream AND its account's
         private stream up — the bot's quote gate reads both."""
-        pub, priv = bool(self.up.public_ok), bool(self.up.private_ok(c.account))
+        per_symbol = getattr(self.up, "public_ok_for", None)    # IBKR: per contract
+        pub = bool(per_symbol(c.symbol) if per_symbol else self.up.public_ok)
+        priv = bool(self.up.private_ok(c.account))
         reason = ("" if pub and priv else
                   "public market-data stream down" if not pub else
                   f"private stream of account {c.account} down")
