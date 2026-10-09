@@ -67,8 +67,16 @@ def main(argv=None) -> int:
     if args.port:
         cfg.listen_port = args.port
     if args.check:
-        print(json.dumps(cfg.status(), indent=1))
-        return 0 if cfg.complete else 2
+        # resolve everything, connect to nothing: the Open API layer must
+        # load (protobuf + the vendored messages) for the gateway to start
+        status = cfg.status()
+        try:
+            from . import backend as _backend  # noqa: F401
+            status["open_api"] = "ok"
+        except Exception as e:                          # noqa: BLE001
+            status["open_api"] = f"{type(e).__name__}: {e}"
+        print(json.dumps(status, indent=1))
+        return 0 if cfg.complete and status["open_api"] == "ok" else 2
     if not cfg.complete:
         print(f"{cfg.name} is not ready — missing {', '.join(cfg.missing)} in "
               f"{cfg.dir / C.ENV_NAME}")
