@@ -16,7 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -488,6 +488,48 @@ class UpstreamTest(unittest.TestCase):
                               reduce_only=False, cloid="x")
         self.assertIn("insufficient margin", str(cm.exception))
 
+    TOKEN = ("Order rejected - reason:BEFORE WE CAN ACCEPT YOUR ORDER IN THIS SECURITY, "
+             "PLEASE LOGIN TO CLIENT PORTAL AND VERIFY USING THE TOKEN WE <br>EMAILED TO YOU.")
+
+    def test_a_late_rejection_pauses_the_symbols_orders(self):
+        """2026-10-09: TWS acknowledged each order, THEN rejected it (201,
+        verify a token first); the place had returned, so the bot re-placed
+        the vanished order every pass. Now one rejection refuses the
+        symbol's new orders for reject_pause_s, cancels still go."""
+        o = self.up.place("main", MGC, "buy", 1, 2649.5, post_only=True, reduce_only=False,
+                          cloid="c1")
+        self.up._on_error(int(o["id"]), 201, self.TOKEN)        # after the ack
+        n = len(self.ib.calls)
+        with self.assertRaises(ccxt.InvalidOrder) as cm:
+            self.up.place("main", MGC, "buy", 1, 2649.4, post_only=True, reduce_only=False,
+                          cloid="c2")
+        self.assertIn("paused", str(cm.exception))
+        self.assertIn("VERIFY USING THE TOKEN WE EMAILED", str(cm.exception))   # no <br>
+        with self.assertRaises(ccxt.InvalidOrder):
+            self.up.amend("main", MGC, o["id"], "buy", 2649.6, 1, cloid="c1",
+                          post_only=True, reduce_only=False)
+        self.assertEqual(len(self.ib.calls), n)                  # nothing reached TWS
+        self.assertIn(MGC, self.up.status()["orders_paused"])
+        self.up.cancel("main", MGC, [o["id"]])                   # cancels are never paused
+        self.assertEqual(self.ib.calls[-1][0], "cancelOrder")
+        # the pause runs out: orders go again
+        until, why = self.up._paused[MGC]
+        self.up._paused[MGC] = (time.time() - 1, why)
+        self.assertIsNone(self.up.orders_paused(MGC))
+        self.up.place("main", MGC, "buy", 1, 2649.4, post_only=True, reduce_only=False,
+                      cloid="c3")
+        self.assertEqual(self.ib.calls[-1][0], "placeOrder")
+        self.assertEqual(self.up.status()["orders_paused"], {})
+
+    def test_no_pause_when_it_is_off_or_for_other_errors(self):
+        o = self.up.place("main", MGC, "buy", 1, 2649.5, post_only=True, reduce_only=False,
+                          cloid="c1")
+        self.up._on_error(int(o["id"]), 202, "Order Canceled - reason:")   # a cancel ack
+        self.assertIsNone(self.up.orders_paused(MGC))
+        self.up.reject_pause_s = 0.0
+        self.up._on_error(int(o["id"]), 201, self.TOKEN)
+        self.assertIsNone(self.up.orders_paused(MGC))
+
     def test_amend_keeps_the_id_and_cancel_uses_the_resting_order(self):
         o = self.up.place("main", MGC, "buy", 1, 2649.5, post_only=True, reduce_only=False,
                           cloid="c1")
@@ -519,6 +561,48 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual((t["fee"], t["takerOrMaker"]), ({"cost": 0.62, "currency": "USD"}, "maker"))
         self.up._on_exec(None, Fill(c, ex, rep, datetime.now(timezone.utc)))   # replayed
         self.assertEqual(sum(1 for p in self.pushed if p[0] == "fill"), 1)
+
+    def test_the_fee_follows_the_fill_in_a_second_push(self):
+        """2026-10-09: ib_async hands every fill an EMPTY CommissionReport
+        (0 commission, 0 realized) until TWS's report for that execution
+        lands, and those zeros went out as the fill's fee and realized PnL —
+        MGC's IBKR leg showed 0 realized, the day −191 USD for +2.50 earned.
+        Now the first push has no fee and no realized figure; the report
+        pushes the same fill again, once, with the fee."""
+        from ib_async import CommissionReport, Execution, Fill
+        c = self.up._contracts[MGC]
+        ex = Execution(execId="0000e1a7.2", time=datetime.now(timezone.utc), acctNumber=ACCOUNT_ID,
+                       exchange="COMEX", side="BOT", shares=1.0, price=4205.8, permId=10,
+                       orderId=501, orderRef="0xa71e0002", lastLiquidity=1)
+        fill = Fill(c, ex, CommissionReport(), datetime.now(timezone.utc))   # the placeholder
+        self.up._on_exec(None, fill)
+        _k, _a, first = self.pushed[-1]
+        self.assertIsNone(first["fee"])
+        self.assertNotIn("realized_pnl", first["info"])
+        self.assertIsNone(first["info"]["ib_realized_pnl_net"])
+        # TWS's report, written INTO the placeholder as ib_async does;
+        # realizedPNL is IB's UNSET on an opening fill
+        rep = fill.commissionReport
+        rep.execId, rep.commission, rep.currency = "0000e1a7.2", 1.17, "USD"
+        rep.realizedPNL = 1.7976931348623157e308
+        self.up._on_commission(None, fill, rep)
+        _k, account, second = self.pushed[-1]
+        self.assertEqual((account, second["id"]), ("main", "0000e1a7.2"))
+        self.assertEqual(second["fee"], {"cost": 1.17, "currency": "USD"})
+        self.assertIsNone(second["info"]["ib_realized_pnl_net"])       # unset, not 1.8e308
+        self.up._on_commission(None, fill, rep)                         # again: nothing
+        self.assertEqual(sum(1 for p in self.pushed if p[0] == "fill"), 2)
+
+    def test_a_replayed_fills_commission_is_not_pushed(self):
+        from ib_async import CommissionReport, Execution, Fill
+        old = datetime.now(timezone.utc) - timedelta(hours=1)
+        ex = Execution(execId="0000e1a7.3", time=old, acctNumber=ACCOUNT_ID, side="BOT",
+                       shares=1.0, price=4200.0, orderId=502)
+        rep = CommissionReport(execId="0000e1a7.3", commission=1.17, currency="USD")
+        fill = Fill(self.up._contracts[MGC], ex, rep, old)
+        self.up._on_exec(None, fill)
+        self.up._on_commission(None, fill, rep)
+        self.assertFalse([p for p in self.pushed if p[0] == "fill"])
 
     def test_a_ticker_needs_both_sides(self):
         from ib_async import Ticker
@@ -646,6 +730,21 @@ class UpstreamTest(unittest.TestCase):
         s = self.up.read("main", "account_summary", {"currency": "USD"})
         self.assertIsNone(s["availableMargin"])               # never EUR passed off as USD
         self.assertIsNone(s["marginEquity"])
+
+    def test_a_position_of_exactly_one_contract_is_a_position(self):
+        """2026-10-09: _num() takes -1 for IB's "unset", so a position of
+        exactly ONE contract short read as no position at all — the grid
+        re-quoted the level it had just filled, then the reconciler closed
+        the MT5 hedge of a short that was still open."""
+        from ib_async import Position
+        for qty, side in ((-1.0, "short"), (1.0, "long"), (-2.0, "short")):
+            self.ib._positions = [Position(ACCOUNT_ID, self.up._contracts[MGC], qty, 42235.0)]
+            p = self.up.read("main", "fetch_positions", {"symbols": [MGC]})
+            self.assertEqual([(x["side"], x["contracts"]) for x in p], [(side, abs(qty))], qty)
+        self.assertEqual(U._qty(-1), -1.0)
+        self.assertIsNone(U._qty(1.7976931348623157e308))       # UNSET_DOUBLE
+        self.assertIsNone(U._qty(float("nan")))
+        self.assertIsNone(U._num(-1))                           # a PRICE of -1 stays unset
 
     def test_positions_are_in_contracts_with_the_entry_per_unit(self):
         from ib_async import Position

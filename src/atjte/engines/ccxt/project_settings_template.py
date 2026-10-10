@@ -44,6 +44,10 @@ EXCHANGE_ID = 'binanceusdm'
 SYMBOL_VENUE = 'BTC/USDT:USDT'
 MARKET_KIND = 'auto'             # 'spot' | 'swap' | 'auto' (see the docstring)
 UNIT_LABEL = 'BTC'               # what one base unit is called (display only)
+SIZE_UNIT = 'contracts'          # the strategy's sizes count the venue's contracts
+                                 # (ORDER_VOLUME 1 = one MGC contract = 10 oz);
+                                 # 'units' = base units. 1 contract = 1 unit on
+                                 # most crypto markets
 # The MT5 leg: the broker-native CFD symbol that is both the reference price
 # and the hedge.
 SYMBOL_MT5 = 'BTCUSD'

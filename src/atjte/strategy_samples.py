@@ -11,9 +11,7 @@ symbol (:func:`samples_for`). Two kinds per pair:
   limit. Where to start.
 - ``*_atj_live`` — the full settings form of the strategy ATJ Research runs
   on that pair (exported 2026-10-05): its real sizes and leverage, so it is
-  sized for a live account, not a test. The IBKR gold futures pair — 1OZ and
-  MGC vs XAUUSD (exported 2026-10-09) — is ONE strategy in contracts: every
-  setting equal, the sizes one contract's ounces apart (1 oz / 10 oz).
+  sized for a live account, not a test.
 
 Neither sets the strategy's symbols, the project's hedge ratio or FX pair
 (the panel's Import keeps those), nor LIVE_TRADING. Loading one only fills

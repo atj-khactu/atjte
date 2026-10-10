@@ -115,6 +115,55 @@ class ReportHooksTest(unittest.TestCase):
         self.assertAlmostEqual(rows[1]["amount"], 0.6)
         self.assertEqual(rows[1]["id"], "o1:poll:1.00000000")
 
+    def _ib_bot(self):
+        """A bot on a venue whose fee follows the fill (IBKR via its gateway)."""
+        bot = bot_with_reporter(self.tmp)
+        rec = T.resting(amount=2.0)
+        bot.orders[rec.key] = rec
+        bot._venue_ib = types.SimpleNamespace(
+            to_units=lambda a: a, client=types.SimpleNamespace(fees_follow_fills=True))
+        return bot
+
+    def _ws_fee_follows(self, bot, tid, fee):
+        bot._hedge = lambda: None
+        bot.dump_state = lambda: None
+        bot.fill_q = queue.Queue()
+        bot.counters.setdefault("fill_events", 0)
+        bot.venue = bot._venue_ib
+        bot._started_utc = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        bot._process_fill_events(Trade(
+            exchange=pb.EXCHANGE_ID, trade_id=tid, symbol=pb.SYMBOL_VENUE,
+            side=OrderSide.SELL, amount=1.0, price=4450.0, order_id="o1", fee=fee,
+            fee_currency="USD", realized_pnl=None,
+            timestamp=datetime(2027, 1, 1, tzinfo=timezone.utc)))
+
+    def test_a_fill_whose_fee_follows_is_recorded_with_it(self):
+        """IBKR: the fill comes without its fee and the gateway pushes it
+        again once TWS's commission report lands. The fill is booked once,
+        and its ONE record carries the fee."""
+        bot = self._ib_bot()
+        self._ws_fee_follows(bot, "e-1", None)
+        self.assertEqual(R.read_jsonl(bot.reporter.trades_file), [])   # waiting for the fee
+        self.assertAlmostEqual(bot.pos_units, -1.0)                      # booked already
+        self._ws_fee_follows(bot, "e-1", 1.17)                           # the fee push
+        rows = R.read_jsonl(bot.reporter.trades_file)
+        self.assertEqual([(r["id"], r["fee_usd"], r["amount"]) for r in rows],
+                         [("e-1", 1.17, 1.0)])
+        self.assertNotIn("realized_usd", rows[0])         # replayed at average cost
+        self.assertAlmostEqual(bot.pos_units, -1.0)                      # not booked twice
+
+    def test_a_fee_that_never_comes_is_not_waited_for_forever(self):
+        bot = self._ib_bot()
+        self._ws_fee_follows(bot, "e-2", None)
+        bot._flush_fee_waits(time.time())                 # not yet due
+        self.assertEqual(R.read_jsonl(bot.reporter.trades_file), [])
+        bot._flush_fee_waits(time.time() + pb.FEE_WAIT_S + 1)
+        rows = R.read_jsonl(bot.reporter.trades_file)
+        self.assertEqual([(r["id"], r["fee_usd"]) for r in rows], [("e-2", 0.0)])
+        self._ws_fee_follows(bot, "e-3", None)
+        bot._flush_fee_waits(time.time(), final=True)     # teardown writes the rest
+        self.assertEqual(len(R.read_jsonl(bot.reporter.trades_file)), 2)
+
     def test_a_venue_trade_after_an_inference_keeps_its_own_size(self):
         """The poll inferred 0.6 of the order; the venue's trade for all 1.0
         arrives after. The replay skips the inferred record, so the venue's

@@ -132,6 +132,9 @@ def _fmt(v) -> str:
 class FixedEntryExitBot(ArbBot):
     STRATEGY_KEY = "fixed_entry_exit"
     STRATEGY_LABEL = "fixed entry/exit bot"
+    # what SIZE_UNIT = 'contracts' multiplies by the contract size
+    SIZE_SETTINGS = ("ORDER_SIZE_UNITS", "EXIT_CLIP_UNITS", "MAX_POSITION_UNITS",
+                     "MAX_SHORT_UNITS")
 
     # ── startup ──────────────────────────────────────────────────────────────
     def _banner(self) -> None:

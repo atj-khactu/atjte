@@ -135,6 +135,13 @@ SAMPLES_PER_WINDOW = BB_PERIOD_MIN * 60   # full band window in 1 s samples
 class BollingerBot(ArbBot):
     STRATEGY_KEY = "bollinger"
     STRATEGY_LABEL = "Bollinger MM bot"
+    # what SIZE_UNIT = 'contracts' multiplies by the contract size
+    SIZE_SETTINGS = ("ORDER_SIZE_UNITS", "MAX_POSITION_UNITS", "MAX_SHORT_UNITS")
+
+    def _sizes_derived(self) -> None:
+        global MAX_SHORT_EFFECTIVE
+        MAX_SHORT_EFFECTIVE = (MAX_POSITION_UNITS if MAX_SHORT_UNITS is None
+                               else MAX_SHORT_UNITS)
     # the engine's 1 s spread sampler (which owns spread_1s.json) must keep
     # the full band window + grace for _bands
     SAMPLES_KEEP_S = (BB_PERIOD_MIN + BAR_GRACE_MIN) * 60.0 + 300.0

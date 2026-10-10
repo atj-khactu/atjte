@@ -47,6 +47,15 @@ DEFAULT_TYPE = ''
 # What one base unit is called in logs and on the dashboard ('oz', 'BTC',
 # 'ETH', 'units'). Display only — it never changes a calculation.
 UNIT_LABEL = 'units'
+# What the strategy's SIZE settings count — the level size, order volume,
+# order / exit clips and position caps (GRID_LEVEL_UNITS, ORDER_VOLUME,
+# ORDER_SIZE_UNITS, EXIT_CLIP_UNITS, MAX_POSITION_UNITS, MAX_SHORT_UNITS):
+# 'units' = base units (oz); 'contracts' = the venue's contracts (one MGC
+# contract = 10 oz), multiplied by the market's contract size once the venue
+# has connected. Everything else stays in base units: the hedge threshold and
+# reconcile tolerances (measured against MT5 lots) and the spot inventories.
+# The control panel writes 'contracts' into every project it creates.
+SIZE_UNIT = 'units'
 
 # --- Leg ratio: spread = venue price − HEDGE_RATIO × MT5 price ---------------
 # For two instruments on the SAME underlying quoted in different sizes — a

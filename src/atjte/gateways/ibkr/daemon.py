@@ -110,7 +110,8 @@ def main(argv=None) -> int:
             except (ValueError, OSError):
                 pass
     up = IbkrUpstream(dict(cfg.account_ids), cfg.contracts, host=cfg.host, port=cfg.port,
-                      client_id=cfg.client_id, network=cfg.network, log=log)
+                      client_id=cfg.client_id, network=cfg.network,
+                      reject_pause_s=cfg.reject_pause_s, log=log)
     log(f"{cfg.name}: {cfg.network.upper()} — connecting to TWS at {cfg.host}:{cfg.port} "
         f"(client id {cfg.client_id}) for account(s) {', '.join(cfg.accounts)}; listing "
         f"{', '.join(f'{c.symbol}@{c.exchange}' for c in cfg.contracts)}")

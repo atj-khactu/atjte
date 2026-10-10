@@ -61,9 +61,9 @@ def wait_for(cond, timeout=2.0):
 
 
 class EventHedgerTest(unittest.TestCase):
-    def hedger(self, mt5, live=True):
+    def hedger(self, mt5, live=True, to_units=lambda c: c):
         results, failures, logs = [], [], []
-        h = EventHedger(place=mt5.place, symbol_venue="XAUT/USD:USD", to_units=lambda c: c,
+        h = EventHedger(place=mt5.place, symbol_venue="XAUT/USD:USD", to_units=to_units,
                         contract_size=100.0, volume_step=0.01, volume_min=0.01,
                         threshold_units=1.0, live=live, started_utc=NOW - timedelta(seconds=5),
                         on_result=lambda *a: results.append(a),
@@ -86,6 +86,16 @@ class EventHedgerTest(unittest.TestCase):
         self.assertEqual(h.counters["hedges"], 1)
         self.assertAlmostEqual(h.residue_units, 0.0)
         self.assertTrue(any("HEDGE (event) sell 0.04 lot" in l for l in logs), logs)
+
+    def test_one_mgc_contract_is_hedged_as_ten_oz(self):
+        """A venue fill counts contracts (MGC: 10 oz each); at HEDGE_RATIO 1
+        one contract is 10 oz = 0.10 lot of a 100 oz XAUUSD lot — whatever
+        unit the strategy's size settings are written in (SIZE_UNIT)."""
+        mt5 = FakeMt5()
+        h, _r, _f, _l = self.hedger(mt5, to_units=lambda c: c * 10.0)
+        h.submit(fill("t1", "buy", 1.0))
+        self.assertTrue(wait_for(lambda: mt5.orders))
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.1)])
 
     def test_duplicates_other_contracts_and_pre_start_fills_are_not_hedged(self):
         mt5 = FakeMt5()

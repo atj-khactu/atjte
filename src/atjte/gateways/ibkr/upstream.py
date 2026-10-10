@@ -23,9 +23,10 @@ belongs to that client id, which is what lets TWS hand them back with their
 - **orders**: limit orders (GTC) with ``orderRef`` = the gateway's client
   id, waited on for TWS's acknowledgement so a rejection surfaces as the
   refusal it is; modify in place; cancel by the resting ``Order`` object;
-- **fills**: ``execDetailsEvent`` as CCXT own-trade dicts (the commission
-  arrives in a later report and is filled into the trade list, not the push:
-  the hedge must not wait for it);
+- **fills**: ``execDetailsEvent`` as CCXT own-trade dicts, pushed with NO
+  fee (the hedge must not wait for it); TWS's commission report follows and
+  the same fill is pushed AGAIN with its fee (``commissionReportEvent``) —
+  the bot books it once and writes its report record with the fee;
 - **reads**: positions, open / closed orders and fills from ib_async's
   synced state, the balance and the margin block from the account summary;
   ``fetch_ohlcv`` = one ``reqHistoricalData`` of MIDPOINT bars (the Spread
@@ -58,6 +59,15 @@ CONNECT_TIMEOUT_S = 10.0
 RECONNECT_EVERY_S = 5.0
 #: how long a place / modify waits for TWS to acknowledge (or reject) it
 ACK_WAIT_S = 2.0
+#: TWS errors that REJECT an order (201 "Order rejected - reason: …", 203
+#: "the security is not available or allowed for this account"). They often
+#: come after the acknowledgement, so the place had already returned and the
+#: bot re-placed the vanished order every pass — 61 rejections in minutes
+#: for an account that had to verify a token first (2026-10-09). After one,
+#: the symbol's new orders are refused for ``reject_pause_s``.
+ORDER_REJECT_CODES = frozenset({201, 203})
+#: the default of that pause (gateway.json ``reject_pause_s``; 0 = off)
+REJECT_PAUSE_S = 60.0
 #: the probed initial-margin rate per symbol is re-asked this often
 IM_RATE_TTL_S = 3600.0
 #: ``fetch_ohlcv``: CCXT timeframe -> (IB bar size, bar seconds, the most
@@ -91,7 +101,23 @@ def _num(v) -> Optional[float]:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    if math.isnan(f) or f == -1:
+    if math.isnan(f) or f == -1 or abs(f) > 1e300:     # UNSET_DOUBLE = 1.79e308
+        return None
+    return f
+
+
+def _qty(v) -> Optional[float]:
+    """A QUANTITY or an amount of money as a float — None only for NaN and
+    IB's UNSET_DOUBLE. Never :func:`_num`, whose -1 = "unset" is right for a
+    price or a quote size but turned a position of exactly ONE contract
+    short into no position: the gateway read MGC flat while TWS held -1
+    (2026-10-09) — the grid re-quoted a level it had just filled, and the
+    reconciler closed the MT5 hedge of a short that was still open."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or abs(f) > 1e300:
         return None
     return f
 
@@ -156,7 +182,7 @@ def market_from_details(cd, spec: ContractSpec) -> dict:
 class IbkrUpstream:
     def __init__(self, accounts: dict[str, str], contracts: list[ContractSpec], *,
                  host: str = "127.0.0.1", port: int = 7497, client_id: int = 7,
-                 network: str = "paper",
+                 network: str = "paper", reject_pause_s: float = REJECT_PAUSE_S,
                  log: Optional[Callable[[str], None]] = None) -> None:
         if not accounts:
             raise ValueError("the gateway needs at least one account")
@@ -180,6 +206,11 @@ class IbkrUpstream:
         self._depth_off: dict[str, str] = {}        # symbol -> why it has no depth
         self._last: dict[str, dict] = {}            # symbol -> last pushed ticker
         self._order_errors: dict[int, str] = {}     # orderId -> TWS's rejection
+        #: execId -> its fee pushed yet (the fills this session pushed)
+        self._pushed_fills: dict[str, bool] = {}
+        self.reject_pause_s = max(0.0, float(reject_pause_s))
+        self._oid_sym: dict[int, str] = {}          # orderId -> symbol (its rejection's)
+        self._paused: dict[str, tuple[float, str]] = {}   # symbol -> (until, why)
         self._im_rate: dict[str, tuple[float, float]] = {}   # symbol -> (t, rate)
         self._seen_fills: set[str] = set()
         self._t0_ms = int(time.time() * 1000)
@@ -406,6 +437,8 @@ class IbkrUpstream:
                           "unavailable": dict(self._depth_off)},
                 "tws": f"{self.host}:{self.port} (client id {self.client_id})",
                 "connected": self._up, "markets": len(self._markets),
+                "orders_paused": {s: w for s in self._paused
+                                  if (w := self.orders_paused(s))},
                 "counters": dict(self.counters), "last_error": self.last_error}
 
     def _err(self, where: str, e: BaseException) -> None:
@@ -442,10 +475,36 @@ class IbkrUpstream:
             return
         if reqId is not None and int(reqId) > 0 and code >= 100:
             self._order_errors[int(reqId)] = f"{code}: {text}"
+            if code in ORDER_REJECT_CODES:
+                self._pause_orders(self._oid_sym.get(int(reqId)) or sym, code, text)
         if code in (1100, 1300, 2110):
             self._event("connection")
         self.counters["errors"] += 1
         self.last_error = f"TWS {code}: {text}"
+
+    def _pause_orders(self, symbol: Optional[str], code: int, text: str) -> None:
+        """IBKR rejected an order on ``symbol``: refuse its new orders for
+        ``reject_pause_s`` (the timer restarts with each rejection)."""
+        if not symbol or self.reject_pause_s <= 0:
+            return
+        why = f"{code}: {' '.join(text.replace('<br>', ' ').split())}"
+        fresh = symbol not in self._paused or self._paused[symbol][0] < time.time()
+        self._paused[symbol] = (time.time() + self.reject_pause_s, why)
+        self.counters["reject_pauses"] = self.counters.get("reject_pauses", 0) + int(fresh)
+        if fresh:
+            self._log(f"ib upstream: IBKR rejected an order on {symbol} ({why}) — new orders "
+                      f"on {symbol} refused for {self.reject_pause_s:g} s")
+
+    def orders_paused(self, symbol: str) -> Optional[str]:
+        """Why ``symbol``'s new orders are refused right now, else None."""
+        until, why = self._paused.get(symbol, (0.0, ""))
+        if until <= time.time():
+            return None
+        # the END, not a countdown: the bot logs a refusal again only when
+        # its text changes, so it logs this once per rejection, not per second
+        end = datetime.fromtimestamp(until, tz=timezone.utc).strftime("%H:%M:%S")
+        return (f"orders on {symbol} paused until {end} UTC: IBKR rejected the last one "
+                f"({why})")
 
     # ── streams ──────────────────────────────────────────────────────────────
     def subscribe_ticker(self, symbol: str) -> None:
@@ -573,18 +632,30 @@ class IbkrUpstream:
     def trade_dict(self, fill) -> dict:
         ex, rep = fill.execution, fill.commissionReport
         sym = self._sym_of.get(fill.contract.conId, fill.contract.localSymbol)
+        # ib_async gives every fill an EMPTY CommissionReport (commission 0,
+        # realizedPNL 0) until TWS's report for that execution arrives: only
+        # one carrying this execId is real — the placeholder's zeros made
+        # every IBKR fill a free one that realized nothing (2026-10-09)
+        if rep is not None and getattr(rep, "execId", "") != ex.execId:
+            rep = None
         fee = None
         if rep is not None and _num(rep.commission) is not None:
-            fee = {"cost": _num(rep.commission), "currency": rep.currency or None}
+            fee = {"cost": _num(rep.commission), "currency": rep.currency or "USD"}
         liq = int(getattr(ex, "lastLiquidity", 0) or 0)
         return {"id": str(ex.execId), "order": str(ex.orderId), "symbol": sym,
                 "side": "buy" if ex.side == "BOT" else "sell",
                 "amount": _num(ex.shares) or 0.0, "price": _num(ex.price) or 0.0,
                 "timestamp": _ms(fill.time) or _ms(ex.time),
                 "fee": fee, "takerOrMaker": {1: "maker", 2: "taker"}.get(liq, ""),
+                # NOT "realized_pnl": TWS's realizedPNL is net of BOTH legs'
+                # commissions (and unset on an opening fill), while the
+                # report's realized figure is before fees, the fees booked on
+                # their own; without it the reader replays the fills at
+                # average cost (reporting.venue_realized_pnl)
                 "info": {"permId": ex.permId, "orderRef": ex.orderRef, "account": ex.acctNumber,
                          "exchange": ex.exchange, "lastLiquidity": liq,
-                         "realized_pnl": (_num(rep.realizedPNL) if rep is not None else None)}}
+                         "ib_realized_pnl_net": (_qty(rep.realizedPNL) if rep is not None
+                                                 else None)}}
 
     def _find_trade(self, order_id: str, open_only: bool = False):
         oid = int(order_id)
@@ -612,6 +683,9 @@ class IbkrUpstream:
         contract = self._contracts.get(symbol)
         if contract is None:
             raise ccxt.BadSymbol(f"{symbol} is not among this gateway's contracts")
+        paused = self.orders_paused(symbol)
+        if paused:
+            raise ccxt.InvalidOrder(paused)
         # GTC: the quote rests until the bot re-prices it or the reaper pulls
         # it; no outsideRth (a stock attribute — a future trades its own hours)
         order = LimitOrder("BUY" if side == "buy" else "SELL", float(amount), float(price),
@@ -620,6 +694,7 @@ class IbkrUpstream:
 
         async def go():
             trade = self.ib.placeOrder(contract, order)
+            self._oid_sym[trade.order.orderId] = symbol
             await self._await_ack(trade)
             return self.order_dict(trade)
         o = self._call(go(), ORDER_TIMEOUT_S)
@@ -630,6 +705,9 @@ class IbkrUpstream:
     def amend(self, account, symbol, order_id, side, price, amount, *, cloid,
               post_only, reduce_only) -> dict:
         """Modify in place: TWS keeps the order id and its reference."""
+        paused = self.orders_paused(symbol)
+        if paused:
+            raise ccxt.InvalidOrder(paused)
         self.counters["posts"] += 1
 
         async def go():
@@ -673,6 +751,8 @@ class IbkrUpstream:
         # this gateway started are news to a bot (the order poll has the rest)
         if (d["timestamp"] or 0) < self._t0_ms - 5_000:
             return
+        # pushed; its fee follows (_on_commission) unless it is already here
+        self._pushed_fills[d["id"]] = d["fee"] is not None
         account = self._by_id.get(fill.execution.acctNumber or "", "")
         self.counters["fills"] += 1
         try:
@@ -681,7 +761,23 @@ class IbkrUpstream:
             self.counters["errors"] += 1
 
     def _on_commission(self, trade, fill, report) -> None:
-        pass                    # the fee lands in fill.commissionReport; reads carry it
+        """TWS's commission report for an execution already pushed: push the
+        same fill again, now with its fee — the bot books a fill once (by
+        its id) and takes the fee for its report record. Once per fill; a
+        fill this session never pushed (a replay) is left to the reads."""
+        eid = getattr(fill.execution, "execId", "")
+        if self._pushed_fills.get(eid) is not False:
+            return
+        d = self.trade_dict(fill)
+        if d["fee"] is None:
+            return
+        self._pushed_fills[eid] = True
+        account = self._by_id.get(fill.execution.acctNumber or "", "")
+        self.counters["fees"] = self.counters.get("fees", 0) + 1
+        try:
+            self._h["fill"](account, d)
+        except Exception:
+            self.counters["errors"] += 1
 
     def _on_order_status(self, trade) -> None:
         self.counters["orders"] += 1
@@ -700,7 +796,7 @@ class IbkrUpstream:
             cur = out.get(r.tag)
             # the account's base-currency figure wins over a per-currency one
             if cur is None or r.currency == "BASE":
-                out[r.tag] = (_num(r.value), r.currency)
+                out[r.tag] = (_qty(r.value), r.currency)
         return out
 
     def _balance(self, account: str) -> dict:
@@ -720,7 +816,7 @@ class IbkrUpstream:
         sent it."""
         for v in self.ib.accountValues(self.account_id(account)) or []:
             if v.tag == "ExchangeRate" and v.currency == currency:
-                return _num(v.value)
+                return _qty(v.value)
         return None
 
     def _account_summary(self, account: str, currency: Optional[str] = None) -> dict:
@@ -753,13 +849,13 @@ class IbkrUpstream:
     def _positions(self, account: str, symbols: Optional[list]) -> list[dict]:
         aid = self.account_id(account)
         out = []
-        upnl = {p.contract.conId: (_num(p.unrealizedPNL), _num(p.marketPrice))
+        upnl = {p.contract.conId: (_qty(p.unrealizedPNL), _num(p.marketPrice))
                 for p in (self.ib.portfolio(aid) or [])}
         for p in self.ib.positions(aid) or []:
             sym = self._sym_of.get(p.contract.conId)
             if sym is None or (symbols and sym not in symbols):
                 continue
-            qty = _num(p.position) or 0.0
+            qty = _qty(p.position) or 0.0
             if not qty:
                 continue
             m = self._markets[sym]

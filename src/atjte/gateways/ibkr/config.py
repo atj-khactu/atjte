@@ -76,7 +76,8 @@ SEC_TYPES = ("FUT",)
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "host", "port", "client_id",
-          "accounts", "contracts", "msgs_per_min", "max_inflight", "clients", "_comment"}
+          "accounts", "contracts", "msgs_per_min", "max_inflight", "clients", "_comment",
+          "reject_pause_s"}
 _KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 _CONTRACT_KEYS = {"symbol", "exchange", "currency", "sec_type"}
 
@@ -122,6 +123,9 @@ class GatewayConfig:
     contracts: list = field(default_factory=list)      # [ContractSpec]
     msgs_per_min: float = 2400.0
     max_inflight: int = 20
+    #: after IBKR rejects an order (201 / 203), new orders on that symbol are
+    #: refused this long (0 = off) — see upstream.ORDER_REJECT_CODES
+    reject_pause_s: float = 60.0
     clients: list = field(default_factory=list)
     #: account_state.json (:mod:`atjte.gateways.accounts`)
     publish_accounts: bool = True
@@ -248,6 +252,8 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         accounts=accounts, contracts=contracts,
         msgs_per_min=float(raw.get("msgs_per_min") or 2400.0),
         max_inflight=int(raw.get("max_inflight") or 20),
+        reject_pause_s=float(60.0 if raw.get("reject_pause_s") is None
+                             else raw["reject_pause_s"]),
         clients=[str(c) for c in (raw.get("clients") or [])])
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME

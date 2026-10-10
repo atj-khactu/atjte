@@ -58,6 +58,9 @@ class IbkrGatewayClient(GatewayConnector):
     transport_label = "ib-gw"
     #: TWS modifies an order in place (same order id): the gateway amends
     supports_amend = True
+    #: a fill is pushed without its fee; TWS's commission report follows and
+    #: the gateway pushes the fill again with it (ArbBot._report_fill waits)
+    fees_follow_fills = True
     venue_label = "IBKR"
     GATEWAY_CLASS = _IbLease
     DEFAULT_GATEWAY_PORT = DEFAULT_PORT

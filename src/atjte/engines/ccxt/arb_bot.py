@@ -305,6 +305,11 @@ SYMBOL_VENUE = _cfg("SYMBOL_VENUE")
 MARKET_KIND = str(_cfg("MARKET_KIND") or "auto").lower()
 DEFAULT_TYPE = _cfg("DEFAULT_TYPE") or ""
 UNIT_LABEL = _cfg("UNIT_LABEL") or "units"
+# what the strategy's size settings count (base_settings): 'contracts' are
+# multiplied by the market's contract size in _venue_ready
+SIZE_UNIT = str(_cfg("SIZE_UNIT") or "units").lower()
+if SIZE_UNIT not in ("units", "contracts"):
+    raise RuntimeError(f"SIZE_UNIT must be 'units' or 'contracts' — got {SIZE_UNIT!r}")
 # k in spread = venue − k × MT5, and the hedge size per venue unit (base_settings).
 # The instrument PAIR's, like the symbols: every strategy of the project
 # shares the one MT5 hedge book, so a strategy of its own k would re-size the
@@ -439,6 +444,10 @@ MIN_VENUE_AVAILABLE_MARGIN_USD = _cfg("MIN_VENUE_AVAILABLE_MARGIN_USD")
 PLACE_MARGIN_SAFETY = float(_cfg("PLACE_MARGIN_SAFETY"))
 SPOT_FUNDS_SAFETY = float(_cfg("SPOT_FUNDS_SAFETY"))
 MARGIN_REJECT_PAUSE_S = float(_cfg("MARGIN_REJECT_PAUSE_S") or 0.0)
+#: how long a fill's report record waits for a fee that follows the fill
+#: (IBKR's commission report, ArbBot._defer_until_fee) before it is written
+#: without one
+FEE_WAIT_S = 10.0
 CLOSE_ONLY = _cfg("CLOSE_ONLY")
 RISK_DAY_UTC = bool(_cfg("RISK_DAY_UTC"))
 
@@ -1077,6 +1086,8 @@ class ArbBot:
         #: no new entries before this time: the venue rejected one for
         #: insufficient margin (MARGIN_REJECT_PAUSE_S)
         self._entry_pause_until = 0.0
+        #: trade id -> (report record, write-by): fills waiting for their fee
+        self._fee_waits: dict[str, tuple[dict, float]] = {}
         self.venue_available_margin: Optional[float] = None
         self.venue_margin_equity: Optional[float] = None
         self.venue_portfolio_value: Optional[float] = None
@@ -1266,7 +1277,37 @@ class ArbBot:
         """Hook: the venue's markets are loaded (``self.venue.exchange``
         answers), nothing hedges or quotes yet. A strategy that needs a
         market fact to start (a dated future's expiry) checks it here —
-        :meth:`_banner` runs before any connection."""
+        :meth:`_banner` runs before any connection. An override calls this
+        first: it is where sizes in contracts become base units."""
+        if SIZE_UNIT == "contracts":
+            self._sizes_to_units(float(self.venue.contract_size or 1.0))
+
+    # the strategy type's size settings — the module holding them and their
+    # names — that SIZE_UNIT = 'contracts' multiplies by the contract size
+    SIZE_SETTINGS: tuple = ()
+
+    def _size_module(self):
+        return sys.modules[type(self).__module__]
+
+    def _sizes_to_units(self, contract: float) -> None:
+        """Every size setting in :attr:`SIZE_SETTINGS` × ``contract`` (base
+        units per contract), once, then :meth:`_sizes_derived`. Everything
+        after this runs in base units, as with SIZE_UNIT = 'units'."""
+        if getattr(self, "_sizes_in_units", False):
+            return
+        mod, done = self._size_module(), []
+        for name in self.SIZE_SETTINGS:
+            v = getattr(mod, name, None)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                setattr(mod, name, v * contract)
+                done.append(f"{name} {v:g} = {v * contract:g} {UNIT_LABEL}")
+        self._sizes_derived()
+        self._sizes_in_units = True
+        _log(f"sizes in contracts (1 contract = {contract:g} {UNIT_LABEL}): "
+             + (", ".join(done) or "none set"))
+
+    def _sizes_derived(self) -> None:
+        """Hook: re-derive what a type computed from its sizes at import."""
 
     def startup(self) -> None:
         self._banner()
@@ -1641,6 +1682,8 @@ class ArbBot:
             self.counters["fill_events"] += 1
             if tr.symbol and tr.symbol != SYMBOL_VENUE:
                 continue   # another contract's fill on the same account
+            if getattr(tr, "fee", None) is not None and self._fee_arrived(tr):
+                continue   # the fee of a fill already booked (IBKR)
             rec = self._rec_by_order_id(tr.order_id) if tr.order_id else None
             if rec is None:
                 # ignore silently when it's a pre-start trade (the fills
@@ -3743,6 +3786,11 @@ class ArbBot:
                                        reduce_only=reduce_only)
         except Exception as e:
             msg = str(e).lower()
+            if "paused until" in msg:
+                # the gateway holds orders after a venue rejection (IBKR):
+                # once per pause, not once per re-priced order
+                self._log_once("orders_paused", f"place {key} refused: {e}")
+                return
             if "insufficient" in msg or "margin" in msg or "balance" in msg:
                 self._bal_dirty = True   # cached head-room is wrong — refetch
             self._log_once(f"place_{key}",
@@ -4337,7 +4385,7 @@ class ArbBot:
             else:
                 tid = f"{rec.order_id}:{source}:{rec.booked:.8f}"
                 ts, fee = time.time(), None
-            self.reporter.record_fill(_reporting.fill_record(
+            record = _reporting.fill_record(
                 EXCHANGE_ID, trade_id=tid, ts=ts, side=side, amount=delta,
                 price=price, symbol=SYMBOL_VENUE, fee_usd=fee, order_id=order_id,
                 source=source, key=rec.key if rec is not None else "",
@@ -4345,10 +4393,56 @@ class ArbBot:
                 realized_usd=(trade.realized_pnl if trade is not None else None),
                 inferred=trade is None,
                 taker_or_maker=(getattr(trade, "taker_or_maker", "") or ""
-                                if trade is not None else "")))
+                                if trade is not None else ""))
+            if trade is not None and trade.fee is None and self._defer_until_fee(tid, record):
+                return
+            self.reporter.record_fill(record)
         except Exception as e:
             self._log_once("report_fill", f"warning: fill not reported: "
                                           f"{type(e).__name__}: {e}")
+
+    def _defer_until_fee(self, tid: str, record: dict) -> bool:
+        """A fill from a venue whose fee follows it (IBKR: TWS's commission
+        report, pushed again by the gateway): hold its report record until
+        the fee arrives (:meth:`_fee_arrived`) or FEE_WAIT_S passes
+        (:meth:`_flush_fee_waits`). The marks are stamped now — they are the
+        market at the fill. Booking and hedging never wait for this."""
+        if not getattr(getattr(self.venue, "client", None), "fees_follow_fills", False):
+            return False
+        self.reporter.stamp_marks(record)
+        self.__dict__.setdefault("_fee_waits", {})[tid] = (record, time.time() + FEE_WAIT_S)
+        return True
+
+    def _fee_arrived(self, tr: Trade) -> bool:
+        """The fee for a fill whose record waits: write it with the fee.
+        False when no record waits for this trade (booked as a fill then)."""
+        held = getattr(self, "_fee_waits", {}).pop(tr.trade_id, None)
+        if held is None:
+            return False
+        record = held[0]
+        try:
+            base, quote = _reporting.symbol_parts(SYMBOL_VENUE)
+            fee = _reporting.fee_usd(tr.fee, tr.fee_currency, float(record["price"]),
+                                     base, quote)
+            record["fee_usd"] = 0.0 if fee is None else float(fee)
+            self.reporter.record_fill(record)
+        except Exception as e:
+            self._log_once("report_fill", f"warning: fill not reported: "
+                                          f"{type(e).__name__}: {e}")
+        return True
+
+    def _flush_fee_waits(self, now: float, final: bool = False) -> None:
+        """Write the records whose fee never came (FEE_WAIT_S; all of them at
+        teardown) — with no fee rather than not at all."""
+        waits = getattr(self, "_fee_waits", {})
+        for tid in [t for t, (_r, due) in waits.items() if final or now >= due]:
+            record, _due = waits.pop(tid)
+            try:
+                self.reporter.record_fill(record)
+            except Exception:                                   # noqa: BLE001
+                pass
+            self._log_once("fee_missing", f"note: no fee from {EXCHANGE_ID} for fill {tid} "
+                                          f"within {FEE_WAIT_S:g} s — recorded without one")
 
     def _report_seed(self) -> None:
         """The basis at the moment recording starts — written once per
@@ -4504,6 +4598,7 @@ class ArbBot:
         rep = getattr(self, "reporter", None)
         if rep is None:
             return
+        self._flush_fee_waits(now, final)
         if not rep.seed_file.exists():
             self._report_seed()
         if not final:
@@ -4636,6 +4731,10 @@ class ArbBot:
             "market": {"price_tick": getattr(self.venue, "price_tick", None),
                        "amount_min": getattr(self.venue, "amount_min", None),
                        "amount_step": getattr(self.venue, "amount_step", None),
+                       # base units per contract, and what the size settings
+                       # count: the panel converts a 'contracts' file with them
+                       "contract_size": getattr(self.venue, "contract_size", None),
+                       "size_unit": SIZE_UNIT,
                        "maker_fee": getattr(self.venue, "maker_fee", None),
                        "taker_fee": getattr(self.venue, "taker_fee", None),
                        "hedge_threshold_units": HEDGE_THRESHOLD_UNITS,

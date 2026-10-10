@@ -218,6 +218,40 @@ class CarryWiringTest(unittest.TestCase):
         bot._venue_ready()
         self.assertEqual(bot._expiry(), datetime(2026, 12, 30, tzinfo=UTC))
 
+    def _with_size_unit(self, unit):
+        saved = (pb.SIZE_UNIT, grid_bot.ORDER_VOLUME, grid_bot.MAX_SHORT_UNITS)
+        pb.SIZE_UNIT = unit
+        grid_bot.ORDER_VOLUME, grid_bot.MAX_SHORT_UNITS = 1.0, None
+
+        def restore():
+            pb.SIZE_UNIT, grid_bot.ORDER_VOLUME, grid_bot.MAX_SHORT_UNITS = saved
+        self.addCleanup(restore)
+
+    def test_sizes_in_contracts_become_base_units_once_connected(self):
+        """SIZE_UNIT = 'contracts': ORDER_VOLUME 1 = one MGC contract = 10 oz,
+        and every size the grid reads, derived ones included, follows."""
+        self._with_size_unit("contracts")
+        grid_bot.GRID_LEVEL_UNITS, grid_bot.MAX_POSITION_UNITS = 1.0, 3.0
+        bot = make_bot(0.0)                          # contract_size = 10 oz
+        bot._venue_ready()
+        self.assertEqual(grid_bot.GRID_LEVEL_UNITS, 10.0)
+        self.assertEqual(grid_bot.ORDER_VOLUME, 10.0)
+        self.assertEqual(grid_bot.ORDER_VOLUME_EFFECTIVE, 10.0)
+        self.assertEqual(grid_bot.MAX_POSITION_UNITS, 30.0)
+        self.assertEqual(grid_bot.MAX_SHORT_EFFECTIVE, 30.0)      # None = the long cap
+        self.assertIsNone(grid_bot.MAX_SHORT_UNITS)
+        bot._venue_ready()                           # a second call converts nothing
+        self.assertEqual(grid_bot.GRID_LEVEL_UNITS, 10.0)
+        d = by_key(bot._desired_orders())
+        self.assertTrue(d and all(abs(o.size - 10.0) < 1e-9 for o in d.values()), d)
+
+    def test_sizes_in_units_are_left_alone(self):
+        self._with_size_unit("units")
+        grid_bot.GRID_LEVEL_UNITS = 1.0
+        make_bot(0.0)._venue_ready()
+        self.assertEqual(grid_bot.GRID_LEVEL_UNITS, 1.0)
+        self.assertEqual(grid_bot.ORDER_VOLUME, 1.0)
+
     def test_a_market_without_an_expiry_is_refused(self):
         bot = make_bot(0.0, expiry_ms=None)
         with self.assertRaises(RuntimeError) as cm:

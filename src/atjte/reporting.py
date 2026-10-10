@@ -744,6 +744,12 @@ class Reporter:
             self._mark_mt5_t = now
         self._prune_bars(now)
 
+    def stamp_marks(self, record: dict) -> None:
+        """Stamp a fill's marks NOW, for a record written later (its fee
+        still to come): :meth:`record_fill` keeps marks already on it."""
+        with self._lock:
+            self._stamp_marks(record)
+
     def _stamp_marks(self, record: dict, now: Optional[float] = None) -> None:
         """Both legs' mids on a fill booked live (:data:`MARK_AT_FILL_MAX_S`):
         what the market was when it filled — the fill's slippage and the

@@ -57,6 +57,7 @@ while any strategy folder's heartbeat is fresh.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -141,6 +142,19 @@ def _tp_lvl(k: int, sign: int) -> float:
 class GridBot(ArbBot):
     STRATEGY_KEY = "grid"
     STRATEGY_LABEL = "grid MM bot"
+    # what SIZE_UNIT = 'contracts' multiplies by the contract size
+    SIZE_SETTINGS = ("GRID_LEVEL_UNITS", "ORDER_VOLUME", "MAX_POSITION_UNITS",
+                     "MAX_SHORT_UNITS")
+
+    def _size_module(self):
+        # this module's, also for a subclass defined elsewhere (grid futures)
+        return sys.modules[__name__]
+
+    def _sizes_derived(self) -> None:
+        global MAX_SHORT_EFFECTIVE, ORDER_VOLUME_EFFECTIVE
+        MAX_SHORT_EFFECTIVE = (MAX_POSITION_UNITS if MAX_SHORT_UNITS is None
+                               else MAX_SHORT_UNITS)
+        ORDER_VOLUME_EFFECTIVE = GRID_LEVEL_UNITS if ORDER_VOLUME is None else ORDER_VOLUME
 
     #: dynamic allocation: the level size derived from the cap it was taken
     #: from, and the last usable one (the exits' geometry while none is)
