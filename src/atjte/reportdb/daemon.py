@@ -138,6 +138,10 @@ def run(folder: Optional[Path] = None, log=print, stop: Optional[threading.Event
     except OSError:
         pass
     stop = stop or threading.Event()
+    # started by the control panel: its heartbeat is a lease, so a panel
+    # killed outright (its console window closed) never leaves this running
+    from ..gateways.shutdown import REPORTER_LEASE_S, PanelLease
+    lease = PanelLease(REPORTER_LEASE_S)
     log(f"reporter: {cfg['backend']} database {cfg['sqlite_path']}, a pass every "
         f"{cfg['interval_s']:g} s")
     passes, started = 0, time.time()
@@ -168,6 +172,10 @@ def run(folder: Optional[Path] = None, log=print, stop: Optional[threading.Event
                 except OSError:
                     pass
                 log("reporter: stop signal — stopping")
+                break
+            if lease.lapsed():
+                log(f"reporter: no heartbeat from the control panel (ACP) for "
+                    f"{lease.age():.0f}s — stopping")
                 break
             stop.wait(cfg["interval_s"])
     finally:

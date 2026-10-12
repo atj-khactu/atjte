@@ -31,6 +31,14 @@ from typing import Optional, Sequence
 COMMANDS = ("bot", "migrate", "workspace", "version", "mt5-probe", "report",
             "backfill", "fixcheck", "gateway", "reporter", "spread-history")
 
+#: what each gateway kind speaks to its platform with — most are imported
+#: lazily, so a missing one shows only when that gateway starts
+#: (``atjte version --libs`` imports them all; a release build's smoke test
+#: requires it to pass)
+GATEWAY_LIBS = (("ccxt", "ccxt.pro"), ("kraken FIX", "simplefix"),
+                ("mt5", "MetaTrader5"), ("ctrader", "google.protobuf"),
+                ("ibkr", "ib_async"), ("databento", "databento"))
+
 
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="atjte", description=__doc__,
@@ -49,7 +57,10 @@ def _parser() -> argparse.ArgumentParser:
     m.add_argument("--dry-run", action="store_true")
 
     sub.add_parser("workspace", help="show how the workspace resolves")
-    sub.add_parser("version", help="print the library version")
+    v = sub.add_parser("version", help="print the library version")
+    v.add_argument("--libs", action="store_true",
+                   help="also import every gateway's platform library and say which "
+                        "fail (exit 1 if any)")
     sub.add_parser("mt5-probe", help="attach to MT5 and report the account (ATJ_MT5_* env vars)")
     sub.add_parser("reporter", add_help=False,
                    help="the reporting database: run | rebuild [--strategy KEY] | status")
@@ -159,7 +170,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.command == "version":
         from . import __version__
         print(f"atjte {__version__} (python {sys.version.split()[0]})")
-        return 0
+        if not args.libs:
+            return 0
+        failed = 0
+        for kind, module in GATEWAY_LIBS:
+            try:
+                __import__(module)
+                print(f"  {kind}: {module} ok")
+            except Exception as e:              # noqa: BLE001 — named, not raised
+                failed += 1
+                print(f"  {kind}: {module} FAILED ({type(e).__name__}: {e})")
+        return 1 if failed else 0
     if args.command == "workspace":
         from . import workspace
         try:

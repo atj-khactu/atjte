@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
 from .. import accounts as A
+from .. import shutdown as SD
 from ..common import BookThrottle, ReadCache
 from . import cloid as C
 from . import protocol as P
@@ -1037,6 +1038,22 @@ class HlGateway:
                                     also=self._account_also)}
             accounts.append(acc)
         return {"accounts": accounts, "network": self.network}
+
+    def cancel_bot_orders(self, settle_s: float = 1.5) -> dict:
+        """The control panel's shutdown sweep (``cancel.request``,
+        :mod:`..shutdown`): every order this gateway's bots own -- connected
+        or not, adopted, orphaned -- cancelled until a fresh read of the venue
+        shows none; foreign orders are never touched."""
+        def cancel(account: str, symbol: str, orders: list) -> None:
+            ids = [str(o["id"]) for o in orders if o.get("id")]
+            if ids:
+                self._cancel_ids(account, symbol, ids)
+
+        def invalidate() -> None:
+            for account in self.up.accounts():
+                self._invalidate(account)
+        return SD.sweep(self.account_snapshot, cancel, invalidate=invalidate, settle_s=settle_s,
+                        log=lambda m: self._log(f"{self.LABEL}: {m}"))
 
 
 def _kind_of(e: Exception) -> str:

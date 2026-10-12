@@ -20,6 +20,7 @@ import time
 
 from atjte.gateways.hyperliquid.daemon import stop_requested, write_state
 
+from .. import shutdown as SD
 from . import config as C
 
 
@@ -135,6 +136,10 @@ def main(argv=None) -> int:
         log(f"WARNING: no {C.TOKEN_NAME} — any process on this machine can attach")
     state = cfg.dir / C.STATE_NAME
     stop_requested(cfg.dir)                 # a stale signal must not stop this start
+    # closing ACP: its shutdown sweep (cancel.request) and its heartbeat as a
+    # lease, so a panel killed outright cannot leave this gateway running
+    SD.discard_stale_request(cfg.dir)
+    lease = SD.PanelLease(SD.GATEWAY_LEASE_S)
     try:
         while not stop.wait(1.0):
             s = gw.status()
@@ -154,6 +159,8 @@ def main(argv=None) -> int:
                                                        else "market data refused for a symbol"),
                                             "last_error": s["upstream"].get("last_error", "")},
                                 **s})
+            if SD.daemon_tick(cfg.dir, gw.cancel_bot_orders, lease, log):
+                break
             if stop_requested(cfg.dir):
                 log(f"{cfg.name}: stop signal — shutting down cleanly")
                 break

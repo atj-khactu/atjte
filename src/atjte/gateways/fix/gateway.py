@@ -55,6 +55,7 @@ from atjte.fix.codec import Msg
 from atjte.fix.session import FixSession, SessionDown
 
 from .. import accounts as A
+from .. import shutdown as SD
 from ..common import BookThrottle, ReadCache
 from . import protocol as P
 
@@ -1025,6 +1026,40 @@ class FixGateway:
         return {"accounts": [acc], "exchange": self.up.exchange_id,
                 "dialect": self.dialect.name}
 
+    def cancel_bot_orders(self, settle_s: float = 1.5) -> dict:
+        """The control panel's shutdown sweep (``cancel.request``,
+        :mod:`..shutdown`): every order a bot placed through this session,
+        connected or not, cancelled by id (35=F) until the CCXT side's fresh
+        read shows none. Foreign orders are never touched."""
+        if self.up is None:
+            return {"remaining": [], "cancelled": 0, "confirmed": False,
+                    "errors": ["this gateway has no CCXT side to read the account with"]}
+
+        def cancel(_account: str, symbol: str, orders: list) -> None:
+            if self.session is None or not self.session.ready:
+                raise RuntimeError("the FIX session is not up")
+            wire = self._wire_symbol(symbol)
+            if wire == symbol and self.dialect is K.DERIVATIVES:
+                wire = self.up.market_id(symbol)
+            missing = []
+            for o in orders:
+                with self._lock:
+                    rec = (self._by_orderid.get(str(o.get("id") or ""))
+                           or self._by_clordid.get(str(o.get("client_id") or "")))
+                if rec is None or not rec.order_id:
+                    missing.append(str(o.get("id") or ""))
+                    continue
+                self._pace()
+                self.session.send("F", K.cancel_request(
+                    cl_ord_id=self._ids.next(), orig_cl_ord_id=rec.cl_ord_id,
+                    order_id=rec.order_id, symbol=wire, side=rec.side,
+                    when=self._clock(), dialect=self.dialect))
+            if missing:
+                raise RuntimeError(f"not on this FIX session: {', '.join(missing)}")
+        return SD.sweep(self.account_snapshot, cancel, settle_s=settle_s,
+                        invalidate=lambda: self._reads.invalidate(ACCOUNT),
+                        log=lambda m: self._log(f"gateway: {m}"))
+
 
 def write_state(path, gw: "FixGateway", cfg, pid: int) -> None:
     """The daemon's heartbeat for the control panel: the gateway's
@@ -1333,6 +1368,10 @@ def main(argv=None) -> int:
                 pass
     # a stale stop file from a previous run must not stop this one at once
     stop_requested(cfg.dir)
+    # closing ACP: its shutdown sweep (cancel.request) and its heartbeat as a
+    # lease, so a panel killed outright cannot leave this gateway running
+    SD.discard_stale_request(cfg.dir)
+    lease = SD.PanelLease(SD.GATEWAY_LEASE_S)
     state_file = cfg.dir / C.STATE_NAME
     import os
     pid = os.getpid()
@@ -1344,6 +1383,9 @@ def main(argv=None) -> int:
                 write_state(state_file, gw, cfg, pid)
             except Exception as e:
                 log(f"gateway: could not write {state_file.name}: {e}")
+            if SD.daemon_tick(cfg.dir, gw.cancel_bot_orders, lease,
+                              lambda m: log(f"gateway: {m}")):
+                bye()
             if stop_requested(cfg.dir):
                 bye()
     finally:

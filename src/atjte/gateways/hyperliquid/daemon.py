@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .. import shutdown as SD
 from ..common import replace_retrying
 from . import cloid as CL
 from . import config as C
@@ -218,6 +219,10 @@ def main(argv=None) -> int:
         log("WARNING: no hl_gateway_token — any process on this machine can attach")
     state = cfg.dir / C.STATE_NAME
     stop_requested(cfg.dir)                 # a stale signal must not stop this start
+    # closing ACP: its shutdown sweep (cancel.request) and its heartbeat as a
+    # lease, so a panel killed outright cannot leave this gateway running
+    SD.discard_stale_request(cfg.dir)
+    lease = SD.PanelLease(SD.GATEWAY_LEASE_S)
     # a purchase left from before this start is never made (see RESERVE_MAX_AGE_S)
     if C.take_reserve_request(cfg.dir) is not None:
         log(f"{cfg.name}: a request purchase left from before this start — discarded")
@@ -237,6 +242,8 @@ def main(argv=None) -> int:
                                             "reason": "" if ready else "a stream is down",
                                             "last_error": s["upstream"].get("last_error", "")},
                                 **s})
+            if SD.daemon_tick(cfg.dir, gw.cancel_bot_orders, lease, log):
+                break
             if stop_requested(cfg.dir):
                 log(f"{cfg.name}: stop signal — shutting down cleanly")
                 break
