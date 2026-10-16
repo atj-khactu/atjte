@@ -46,6 +46,13 @@ from atjte.engines.common.grid_model import DesiredOrder  # noqa: E402
 from atjte.engines.ccxt.arb_bot import OrderRec, ArbBot, _classify_order_error  # noqa: E402
 from atjte.clients.base import OrderStatus  # noqa: E402
 
+# the tolerances default to None (one MT5 min lot, resolved at startup,
+# which these bots never run): the values a gold bot resolves them to
+if pb.RECONCILE_TOLERANCE_UNITS is None:
+    pb.RECONCILE_TOLERANCE_UNITS = 1.0
+if pb.POSITION_RECONCILE_TOLERANCE_UNITS is None:
+    pb.POSITION_RECONCILE_TOLERANCE_UNITS = 0.5
+
 
 # ── stubs ─────────────────────────────────────────────────────────────────────
 
@@ -267,6 +274,8 @@ def make_bot(logs=None):
     bot.venue_pos_units = None
     bot._hedge_dirty = False
     bot.hedger = None                       # HEDGE_MODE = 'parity' unless a test builds one
+    bot.hedge_refusal = None
+    bot.volume_max = 0.0
     bot._hedge_results = queue.Queue()
     bot._mt5_settle_until = 0.0
     bot._mt5_settle_prev = 0.0
@@ -774,6 +783,192 @@ class BookAdvancesVenuePositionTest(unittest.TestCase):
         self.assertAlmostEqual(bot._venue_exposure_units(), -0.7)
 
 
+class _RefFeed:
+    """A stand-in for the read-only IBKR reference lease's feed."""
+    def __init__(self, bid, ask, age=0.5, ok=True):
+        self.bid, self.ask, self.age, self.ok = bid, ask, age, ok
+        self.ticker_error, self.public_reason = None, "down"
+        self.counters = {"tickers": 0}
+
+    def get_ticker(self):
+        return types.SimpleNamespace(bid=self.bid, ask=self.ask, mid=(self.bid + self.ask) / 2)
+
+    @property
+    def ticker_age_s(self):
+        return self.age
+
+    @property
+    def public_ok(self):
+        return self.ok
+
+
+class PriceReferenceTest(unittest.TestCase):
+    """PRICE_REFERENCE = 'ibkr': quotes priced off IBKR's XAUUSD put in MT5
+    terms by the measured offset, MT5 half spread added back; the hedge side
+    stays MT5; nothing is quoted until the offset is known or while the
+    reference is down/stale. 'mt5' is the unchanged default."""
+
+    def setUp(self):
+        self._orig = (pb.PRICE_REFERENCE, pb.HEDGE_RATIO, pb.REF_OFFSET_MIN_S,
+                      pb.REF_STALE_S)
+        pb.HEDGE_RATIO = 1.0
+        pb.REF_OFFSET_MIN_S = 60.0
+
+    def tearDown(self):
+        (pb.PRICE_REFERENCE, pb.HEDGE_RATIO, pb.REF_OFFSET_MIN_S, pb.REF_STALE_S) = self._orig
+
+    def _bot(self):
+        bot = make_bot()
+        bot.xau_bid, bot.xau_ask, bot.xau_mid = 4180.00, 4180.40, 4180.20   # MT5: spread 0.40
+        bot.venue_ticker = types.SimpleNamespace(mid=4204.0, bid=4203.9, ask=4204.1)
+        return bot
+
+    def test_mt5_mode_is_unchanged(self):
+        pb.PRICE_REFERENCE = "mt5"
+        bot = self._bot()
+        self.assertEqual((bot.ref_bid, bot.ref_ask), (4180.00, 4180.40))
+        self.assertAlmostEqual(bot.ref_mid, 4180.20)
+        self.assertIsNone(bot._ref_gate() if bot.ref_feed else None)
+
+    def test_ibkr_mode_prices_off_ibkr_plus_the_offset_and_the_mt5_spread(self):
+        pb.PRICE_REFERENCE = "ibkr"
+        bot = self._bot()
+        bot.ref_feed = _RefFeed(4180.05, 4180.25)                     # IBKR mid 4180.15
+        t0 = 1_000_000.0
+        for i in range(61):                                           # 60 s of samples
+            bot._update_ref(t0 + i)
+        self.assertAlmostEqual(bot.ref_offset, 0.05)                  # MT5 4180.20 - IBKR 4180.15
+        self.assertIsNone(bot._ref_gate())
+        # IBKR moves first: +0.50, MT5 not yet -> quotes follow IBKR
+        bot.ref_feed.bid, bot.ref_feed.ask = 4180.55, 4180.75
+        bot._update_ref(t0 + 61.5, sample=False)
+        self.assertAlmostEqual(bot.ref_mid, 4180.65 + 0.05)
+        self.assertAlmostEqual(bot.ref_bid, 4180.70 - 0.20)           # MT5 half spread
+        self.assertAlmostEqual(bot.ref_ask, 4180.70 + 0.20)
+        # ... while the hedge side still marks at MT5
+        self.assertAlmostEqual(bot.mt5_mid_k, 4180.20)
+
+    def test_nothing_is_priced_before_the_offset_is_measured(self):
+        pb.PRICE_REFERENCE = "ibkr"
+        bot = self._bot()
+        bot.ref_feed = _RefFeed(4180.05, 4180.25)
+        for i in range(10):
+            bot._update_ref(1_000_000.0 + i)
+        self.assertIsNone(bot.ref_offset)
+        self.assertIsNone(bot.ref_bid)
+        self.assertIn("measuring", bot._ref_gate())
+
+    def test_a_stale_or_down_reference_takes_the_quotes_down(self):
+        pb.PRICE_REFERENCE = "ibkr"
+        pb.REF_STALE_S = 30.0
+        bot = self._bot()
+        bot.ref_feed = _RefFeed(4180.05, 4180.25)
+        for i in range(61):
+            bot._update_ref(1_000_000.0 + i)
+        bot.ref_feed.age = 31.0
+        self.assertIn("unchanged", bot._ref_gate())
+        bot.ref_feed.age, bot.ref_feed.ok = 0.5, False
+        self.assertIn("feed down", bot._ref_gate())
+        bot.ref_feed = None
+        self.assertIn("not connected", bot._ref_gate())
+
+    def test_the_offset_is_a_median_robust_to_a_lagging_mt5_tick(self):
+        pb.PRICE_REFERENCE = "ibkr"
+        bot = self._bot()
+        bot.ref_feed = _RefFeed(4180.05, 4180.25)
+        t0 = 1_000_000.0
+        for i in range(61):
+            bot.xau_mid = 4180.20 if i % 10 else 4181.20               # every 10th: MT5 lags 1.0
+            bot._update_ref(t0 + i)
+        self.assertAlmostEqual(bot.ref_offset, 0.05)
+
+
+class MinOrderIntervalTest(unittest.TestCase):
+    """MIN_ORDER_INTERVAL_S: no order (entries AND exits) for that long after
+    any fill; the margin de-risk exit is exempt (GC 2026-10-14 12:13)."""
+
+    def setUp(self):
+        self._orig = pb.MIN_ORDER_INTERVAL_S
+
+    def tearDown(self):
+        pb.MIN_ORDER_INTERVAL_S = self._orig
+
+    def _orders(self, derisk=False):
+        mk = lambda key, side, purpose: DesiredOrder(key=key, side=side, purpose=purpose,  # noqa: E731
+                                                     level_index=1, level=0.0, size=1.0)
+        out = [mk("exit-S1", "buy", "exit"), mk("entry-S2", "sell", "entry")]
+        if derisk:
+            out.append(mk(pb.RISK_FLAT_KEY, "buy", "exit"))
+        return out
+
+    def test_entries_and_exits_wait(self):
+        pb.MIN_ORDER_INTERVAL_S = 2.0
+        bot = make_bot()
+        bot._last_fill_t = 1000.0
+        self.assertEqual(bot._order_interval_gate(self._orders(), now=1001.0), [])
+        self.assertEqual(len(bot._order_interval_gate(self._orders(), now=1002.1)), 2)
+
+    def test_the_derisk_exit_is_never_paused(self):
+        pb.MIN_ORDER_INTERVAL_S = 2.0
+        bot = make_bot()
+        bot._last_fill_t = 1000.0
+        kept = bot._order_interval_gate(self._orders(derisk=True), now=1000.5)
+        self.assertEqual([d.key for d in kept], [pb.RISK_FLAT_KEY])
+
+    def test_off_and_before_any_fill_nothing_is_held(self):
+        bot = make_bot()
+        pb.MIN_ORDER_INTERVAL_S = None
+        bot._last_fill_t = 1000.0
+        self.assertEqual(len(bot._order_interval_gate(self._orders(), now=1000.5)), 2)
+        pb.MIN_ORDER_INTERVAL_S = 2.0
+        bot._last_fill_t = 0.0
+        self.assertEqual(len(bot._order_interval_gate(self._orders(), now=1000.5)), 2)
+
+
+class MinTobSpreadTest(unittest.TestCase):
+    """MIN_TOB_SPREAD: a maker quote keeps at least that PRICE distance from
+    the opposite top of book (a sell from the best bid, a buy from the best
+    ask), rounded up to the tick; None keeps the one-tick clamp."""
+
+    def setUp(self):
+        self._orig = (pb.MIN_TOB_SPREAD, pb.HEDGE_RATIO)
+        pb.HEDGE_RATIO = 1.0
+
+    def tearDown(self):
+        pb.MIN_TOB_SPREAD, pb.HEDGE_RATIO = self._orig
+
+    def _bot(self):
+        bot = make_bot()
+        bot.xau_bid, bot.xau_ask, bot.xau_mid = 3474.0, 3474.0, 3474.0
+        # the book: best bid 3550.0, best ask 3550.5
+        bot.venue_ticker = types.SimpleNamespace(mid=3550.25, bid=3550.0, ask=3550.5)
+        return bot
+
+    def test_a_sell_through_the_bid_rests_the_distance_above_it(self):
+        bot = self._bot()
+        # a sell level priced at 3500 (MT5 ask 3474 + 26): through the bid
+        pb.MIN_TOB_SPREAD = None
+        self.assertAlmostEqual(bot._maker_price("sell", 26.0), 3550.1)   # one tick
+        pb.MIN_TOB_SPREAD = 0.2
+        self.assertAlmostEqual(bot._maker_price("sell", 26.0), 3550.2)
+        pb.MIN_TOB_SPREAD = 0.15                                          # up to the tick
+        self.assertAlmostEqual(bot._maker_price("sell", 26.0), 3550.2)
+        pb.MIN_TOB_SPREAD = 0.0                                           # never < a tick
+        self.assertAlmostEqual(bot._maker_price("sell", 26.0), 3550.1)
+
+    def test_a_buy_through_the_ask_rests_the_distance_below_it(self):
+        bot = self._bot()
+        pb.MIN_TOB_SPREAD = 0.2
+        # a buy level priced at 3600 (MT5 bid 3474 + 126): through the ask
+        self.assertAlmostEqual(bot._maker_price("buy", 126.0), 3550.3)
+
+    def test_a_level_already_further_away_is_left_where_it_is(self):
+        bot = self._bot()
+        pb.MIN_TOB_SPREAD = 0.2
+        self.assertAlmostEqual(bot._maker_price("sell", 77.0), 3551.0)    # above the ask
+        self.assertAlmostEqual(bot._maker_price("buy", 75.0), 3549.0)     # below the bid
+
+
 class TakerOrderTest(unittest.TestCase):
     """ALLOW_TAKER_ENTRY / ALLOW_TAKER_EXIT: an allowed order is a plain limit
     AT its level (never clamped into the book, never past the level), placed
@@ -932,15 +1127,19 @@ class HedgeGateTest(unittest.TestCase):
 
     def test_startup_warns_and_starts(self):
         """A warning (log + the report), never a refusal: the operator decides."""
-        orig = (pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS)
+        orig = (pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS,
+                pb.POSITION_RECONCILE_TOLERANCE_UNITS)
         try:
             bot = make_bot()
             bot.mt5 = types.SimpleNamespace(
                 get_ticker=lambda s: types.SimpleNamespace(bid=65498.0, ask=65502.0))
             pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS = 0.005, 1.0
+            pb.POSITION_RECONCILE_TOLERANCE_UNITS = 0.5     # the old default: warned too
             bot._check_hedge_thresholds(self.JP225_LOT)        # no raise
-            self.assertEqual(len(bot.hedge_gate_warnings), 1)
+            self.assertEqual(len(bot.hedge_gate_warnings), 2)
             self.assertIn("RECONCILE_TOLERANCE_UNITS", bot.hedge_gate_warnings[0])
+            self.assertIn("POSITION_RECONCILE_TOLERANCE_UNITS", bot.hedge_gate_warnings[1])
+            pb.POSITION_RECONCILE_TOLERANCE_UNITS = 0.003
             self.assertNotIn("refusing", bot.hedge_gate_warnings[0])
             self.assertAlmostEqual(bot.mt5_min_lot_units, self.JP225_LOT)
             pb.RECONCILE_TOLERANCE_UNITS = 0.005
@@ -953,7 +1152,8 @@ class HedgeGateTest(unittest.TestCase):
             bot._check_hedge_thresholds(self.JP225_LOT)
             self.assertIn("HEDGE_THRESHOLD_UNITS", bot.hedge_gate_warnings[0])
         finally:
-            pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS = orig
+            (pb.HEDGE_THRESHOLD_UNITS, pb.RECONCILE_TOLERANCE_UNITS,
+             pb.POSITION_RECONCILE_TOLERANCE_UNITS) = orig
 
 
 class HedgeCommentTest(unittest.TestCase):
@@ -1810,6 +2010,495 @@ class EntryGateTest(unittest.TestCase):
         self.assertEqual({d.key for d in kept}, {"buy-x", "sell-x"})   # exits nearest
 
 
+class _PairHedger:
+    """The event hedger's surface a market pair uses."""
+
+    def __init__(self):
+        self.submitted, self.parity = [], []
+
+    def submit(self, tr):
+        self.submitted.append(tr)
+        return "queued"
+
+    def parity_sent(self, units, why):
+        self.parity.append(units)
+
+
+class MarketPairTest(unittest.TestCase):
+    """EXECUTION_MODE 'market': the MT5 leg goes to the event hedger at the
+    same moment the venue market order is sent; a refused or short venue
+    leg corrects the hedger's residue and leaves the exposure to the
+    reconciler; a dry run paper-trades at both touches."""
+
+    def setUp(self):
+        self._orig = (pb.MARKET_PAIR, pb.LIVE_TRADING, pb.STRATEGY_DIR, pb.PAPER_FILE)
+        self._tmp = tempfile.TemporaryDirectory()
+        pb.MARKET_PAIR, pb.LIVE_TRADING = True, True
+        pb.STRATEGY_DIR = Path(self._tmp.name)
+        pb.PAPER_FILE = Path(self._tmp.name) / "paper_state.json"
+
+    def tearDown(self):
+        pb.MARKET_PAIR, pb.LIVE_TRADING, pb.STRATEGY_DIR, pb.PAPER_FILE = self._orig
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _t(side="sell", purpose="entry", amount=1.0):
+        return {"side": side, "purpose": purpose, "level_index": 1, "level": 7.0,
+                "grid_level": 7.0, "price": 4449.9 if side == "sell" else 4450.1,
+                "amount": amount, "taker": True}
+
+    def _bot(self, fill=None, error=None):
+        bot = make_bot([])
+        bot.hedger = _PairHedger()
+        bot.hedge_ok = True
+        bot._recheck_at = None
+        bot._mark_fill = lambda *a, **k: None
+        bot._report_fill = lambda *a, **k: None
+        bot._persist_position = lambda: None
+        bot.xau_bid, bot.xau_ask = 4442.9, 4443.0
+
+        def place_market(side, units):
+            if error is not None:
+                raise error
+            o = StubOrder(units if fill is None else fill, order_id="d1",
+                          status=OrderStatus.FILLED)
+            o.price = 4449.9 if side == "sell" else 4450.1
+            return o
+        bot.venue.place_market = place_market
+        return bot
+
+    def test_both_legs_leave_together_and_the_fill_is_booked(self):
+        bot = self._bot()
+        bot._fire_pair("grid-entry-S1", self._t())
+        self.assertEqual(len(bot.hedger.submitted), 1)
+        tr = bot.hedger.submitted[0]
+        self.assertEqual(tr.side.value, "sell")
+        self.assertAlmostEqual(tr.amount, 1.0)
+        self.assertEqual(bot.hedger.parity, [])            # sizes agree: nothing to correct
+        self.assertAlmostEqual(bot.pos_units, -1.0)
+        self.assertEqual(bot.orders, {})                     # nothing rests
+        self.assertTrue(bot.hedge_ok)
+
+    def test_a_refused_venue_leg_corrects_the_residue_and_waits_for_the_reconciler(self):
+        bot = self._bot(error=RuntimeError("market closed"))
+        bot._fire_pair("grid-entry-S1", self._t())
+        self.assertEqual(len(bot.hedger.submitted), 1)     # the MT5 leg went out
+        self.assertEqual(bot.hedger.parity, [1.0])          # residue owes the sell back
+        self.assertFalse(bot.hedge_ok)                       # quotes down
+        self.assertIsNotNone(bot._recheck_at)                # the reconciler fixes it
+        self.assertAlmostEqual(bot.pos_units, 0.0)
+
+    def test_a_short_venue_fill_corrects_by_the_difference(self):
+        bot = self._bot(fill=0.4)
+        bot._fire_pair("grid-entry-L1", self._t(side="buy"))
+        self.assertEqual(len(bot.hedger.parity), 1)
+        self.assertAlmostEqual(bot.hedger.parity[0], -0.6)
+        self.assertAlmostEqual(bot.pos_units, 0.4)
+        self.assertIsNotNone(bot._recheck_at)
+
+    def test_a_refused_level_is_held_and_three_refusals_stop_the_pairs(self):
+        bot = self._bot(error=RuntimeError("order rejected: retcode=10019 'No money'"))
+        bot._entry_pause_until = 0.0
+        bot._pause_entries = lambda t: setattr(bot, "_paused", True)
+        bot._fire_pair("grid-entry-S3", self._t())
+        bot.hedge_ok = True                                  # the hedge booking clears it
+        bot._fired_t["grid-entry-S3"] = 0.0                  # past the re-fire guard
+        bot._fire_pair("grid-entry-S3", self._t())
+        self.assertEqual(len(bot.hedger.submitted), 1)      # held: no second hedge
+        self.assertTrue(getattr(bot, "_paused", False))      # a margin refusal pauses entries
+        for key in ("grid-entry-S4", "grid-entry-S5"):
+            bot._fire_pair(key, self._t())
+        self.assertIsNotNone(bot._pair_latched)
+        bot._fire_pair("grid-entry-S6", self._t())
+        self.assertEqual(len(bot.hedger.submitted), 3)      # latched: no entry
+        bot._fire_pair("grid-exit-S1", self._t(side="buy", purpose="exit"))
+        self.assertEqual(len(bot.hedger.submitted), 4)      # an exit still fires
+
+    def test_a_fill_resets_the_refusal_count(self):
+        bot = self._bot()
+        bot._pair_refusals = 2
+        bot._fire_pair("grid-entry-S1", self._t())
+        self.assertEqual(bot._pair_refusals, 0)
+
+    def test_one_pair_per_pass(self):
+        bot = self._bot()
+        bot.venue_ticker = types.SimpleNamespace(mid=4450.0, bid=4449.9, ask=4450.1)
+        bot._desired_orders = lambda: [
+            DesiredOrder(key=f"grid-entry-S{k}", side="sell", purpose="entry", level_index=k,
+                         level=float(k), size=1.0) for k in (1, 2, 3, 4)]
+        bot._sync_quotes()
+        self.assertEqual(len(bot.hedger.submitted), 1)       # S1 only; S2 next pass
+        bot._sync_quotes()
+        self.assertEqual(len(bot.hedger.submitted), 2)
+
+    def test_the_same_key_is_not_fired_twice_at_once(self):
+        bot = self._bot()
+        bot._fire_pair("grid-entry-S1", self._t())
+        bot._fire_pair("grid-entry-S1", self._t())
+        self.assertEqual(len(bot.hedger.submitted), 1)
+
+    def test_a_dry_run_paper_trades_at_both_touches(self):
+        pb.LIVE_TRADING = False
+        bot = self._bot()
+        bot._paper_fire("grid-entry-S1", self._t())
+        self.assertEqual(bot.hedger.submitted, [])           # nothing real
+        self.assertAlmostEqual(bot.paper_pos_units, -1.0)
+        self.assertAlmostEqual(bot._position_units(), -1.0)  # the grid walks on paper
+        # the exit: venue buy at its ask, MT5 sell at its bid
+        bot.venue_ticker = types.SimpleNamespace(mid=4446.0, bid=4445.9, ask=4446.1)
+        bot.xau_bid, bot.xau_ask = 4440.0, 4440.1
+        bot._paper_fire("grid-exit-S1", self._t(side="buy", purpose="exit"))
+        self.assertAlmostEqual(bot.paper_pos_units, 0.0)
+        # sold the basis at 4449.9 - 4443.0 = 6.9, bought it back at
+        # 4446.1 - 4440.0 = 6.1: +0.8 per unit
+        self.assertAlmostEqual(bot.paper_realized_usd, 0.8, places=6)
+        rows = (pb.STRATEGY_DIR / "report" / "paper_trades.jsonl").read_text(
+            encoding="utf-8").splitlines()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(pb.PAPER_FILE.exists())
+
+    def _avgs(self, mode):
+        orig = pb.BASIS_MODE
+        try:
+            pb.BASIS_MODE = mode
+            bot = make_bot([])
+            bot._basis_samples = deque()
+            bot.venue_ticker = types.SimpleNamespace(bid=4449.9, ask=4450.1)
+            bot.xau_bid, bot.xau_ask = 4443.0, 4443.1
+            for i in range(30):
+                bot._sample_basis(100.0 + i * 0.25)
+            return bot.basis_avg_bid, bot.basis_avg_ask
+        finally:
+            pb.BASIS_MODE = orig
+
+    def test_market_market_is_the_executable_basis(self):
+        # a buy pays the venue ask and sells MT5 at the bid; a sell the reverse
+        b, a = self._avgs("market-market")
+        self.assertAlmostEqual(b, 4450.1 - 4443.0)
+        self.assertAlmostEqual(a, 4449.9 - 4443.1)
+
+    def test_limit_market_is_the_resting_quotes_basis(self):
+        b, a = self._avgs("limit-market")
+        self.assertAlmostEqual(b, 4449.9 - 4443.0)
+        self.assertAlmostEqual(a, 4450.1 - 4443.1)
+
+    def test_mid_mid_is_one_basis_for_both_sides(self):
+        b, a = self._avgs("mid-mid")
+        self.assertAlmostEqual(b, 4450.0 - 4443.05)
+        self.assertAlmostEqual(a, b)
+
+
+class NettingHedgeTest(unittest.TestCase):
+    """A netting hedge account whose position carries another magic refuses
+    the start; a hedging account, or this bot's own position, passes."""
+
+    def _bot(self, mode, magic):
+        from atjte.clients.base import Account, Position, PositionSide
+        bot = make_bot([])
+        pos = Position(exchange="mt5", symbol=pb.SYMBOL_MT5, side=PositionSide.LONG, size=0.03,
+                       entry_price=4000.0, position_id="1", raw={"magic": magic})
+        bot.mt5 = types.SimpleNamespace(
+            get_account=lambda: Account(exchange="mt5", currency="EUR", balance=1.0,
+                                        equity=1.0, raw={"margin_mode": mode}),
+            get_positions=lambda sym=None: [pos])
+        return bot
+
+    def test_another_magic_on_a_netting_account_refuses(self):
+        with self.assertRaises(RuntimeError):
+            self._bot(0, int(pb.MT5_MAGIC) + 1)._check_netting_hedge()
+
+    def test_its_own_position_passes(self):
+        self._bot(0, int(pb.MT5_MAGIC))._check_netting_hedge()
+
+    def test_a_hedging_account_passes(self):
+        self._bot(2, int(pb.MT5_MAGIC) + 1)._check_netting_hedge()
+
+
+class EodCloseTest(unittest.TestCase):
+    """EOD_CLOSE_AT: from the close time, rounds of the order size, each
+    checked on both legs before the next; no entries until the MT5 symbol
+    reopens after its daily break."""
+
+    def setUp(self):
+        from zoneinfo import ZoneInfo
+        self._orig = (pb._EOD, pb.LIVE_TRADING, pb.EOD_ROUND_TIMEOUT_S)
+        pb._EOD = (22, 30, ZoneInfo("Europe/Prague"))
+        self._roll = pb._ROLL
+        pb._ROLL = (23, 0, ZoneInfo("Europe/Prague"))
+        self._eodf = pb.EOD_FILE
+        pb.EOD_FILE = Path(tempfile.gettempdir()) / "atjte_test_no_eod_state.json"
+        pb.LIVE_TRADING = True
+        pb.EOD_ROUND_TIMEOUT_S = 10.0
+        from datetime import timezone
+        self.close = datetime(2026, 10, 14, 20, 30, tzinfo=timezone.utc).timestamp()  # 22:30 CEST
+
+    def tearDown(self):
+        pb._EOD, pb.LIVE_TRADING, pb.EOD_ROUND_TIMEOUT_S = self._orig
+        pb.EOD_FILE = self._eodf
+        pb._ROLL = self._roll
+
+    def _bot(self, pos=-2.0):
+        bot = make_bot([])
+        bot.venue_pos_units = pos
+        bot._clip_units = lambda: 1.0
+        bot._session_reopen_t = None
+        state = {"venue": pos, "mt5": -pos}
+        bot.venue.read_position = lambda: setattr(bot.venue, "position_units", state["venue"])
+        bot._read_mt5_net_units = lambda: state["mt5"]
+        return bot, state
+
+    def test_outside_the_window_nothing_happens(self):
+        bot, _ = self._bot()
+        self.assertIsNone(bot._eod_window(self.close - 60))
+
+    def test_rounds_of_the_order_size_each_checked_first(self):
+        bot, state = self._bot(-2.0)
+        t = self.close + 5
+        o = bot._eod_orders(t)
+        self.assertEqual([(d.key, d.side, d.size, d.purpose) for d in o],
+                         [(pb.EOD_KEY, "buy", 1.0, "exit")])
+        # the round fills: the books say -1, the check is now due
+        bot.venue_pos_units = -1.0
+        bot._eod_round_sent(t)
+        self.assertEqual(bot._eod_orders(t + 0.5), [])        # not checked yet
+        state["venue"], state["mt5"] = -1.0, 1.0               # both legs moved
+        self.assertEqual(bot._eod_orders(t + 1.5), [])        # checked, but 5 s apart
+        self.assertIsNone(bot._eod_pending)
+        o = bot._eod_orders(t + 5.0)
+        self.assertEqual([d.size for d in o], [1.0])           # next round
+
+    def test_a_round_that_does_not_check_out_stops_the_close(self):
+        bot, state = self._bot(-2.0)
+        t = self.close + 5
+        bot._eod_orders(t)
+        bot.venue_pos_units = -1.0
+        bot._eod_round_sent(t)
+        state["venue"], state["mt5"] = -1.0, 2.0              # the hedge did not follow
+        self.assertEqual(bot._eod_orders(t + 2), [])
+        self.assertEqual(bot._eod_orders(t + 11), [])
+        self.assertIsNotNone(bot._eod_failed)
+        self.assertIsNotNone(bot._recheck_at)
+        self.assertEqual(bot._eod_orders(t + 60), [])          # stopped for the day
+
+    def test_the_last_round_is_checked_too(self):
+        bot, state = self._bot(-1.0)
+        t = self.close + 5
+        bot._eod_orders(t)
+        bot.venue_pos_units = 0.0
+        bot._eod_round_sent(t)                                 # the books say flat
+        state["venue"], state["mt5"] = 0.0, 1.0               # the hedge did not follow
+        bot._eod_orders(t + 11)
+        self.assertIsNotNone(bot._eod_failed)                  # caught, not "flat"
+
+    def test_entries_wait_for_the_reopen_and_a_late_restart_is_not_held(self):
+        bot, _ = self._bot(0.0)
+        self.assertIsNotNone(bot._eod_window(self.close + 600))    # flat, still no entries
+        bot._session_reopen_t = self.close + 5400                  # the daily break ends
+        self.assertIsNone(bot._eod_window(self.close + 5500))
+        fresh, _ = self._bot(0.0)                                   # restarted next morning
+        self.assertIsNone(fresh._eod_window(self.close + 12 * 3600))
+
+    def test_a_restart_after_the_reopen_closes_nothing(self):
+        orig = pb.EOD_FILE
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                pb.EOD_FILE = Path(d) / "eod_state.json"
+                pb.EOD_FILE.write_text(json.dumps({"reopen_t": self.close + 5460}),
+                                       encoding="utf-8")      # 00:01, seen by the last run
+                bot, _ = self._bot(-5.0)                         # a fresh process at 00:24
+                self.assertIsNone(bot._eod_window(self.close + 6840))
+        finally:
+            pb.EOD_FILE = orig
+
+    def test_a_late_start_before_the_rollover_still_closes(self):
+        bot, _ = self._bot(-2.0)
+        t = self.close + 15 * 60                                 # 22:45, rollover 23:00
+        self.assertTrue(bot._eod_closing(t))
+        self.assertEqual([d.key for d in bot._eod_orders(t)], [pb.EOD_KEY])
+
+    def test_past_the_rollover_nothing_is_closed_and_a_tick_ends_the_hold(self):
+        bot, _ = self._bot(-5.0)
+        t = self.close + 45 * 60                                 # 23:15, in the break
+        self.assertIsNotNone(bot._eod_window(t))                 # entries held ...
+        self.assertEqual(bot._eod_orders(t), [])                 # ... nothing closed
+        self.assertFalse(bot._eod_closing(t))
+        bot._mt5_tick_t = self.close + 5460                      # IC ticks at 00:01
+        self.assertIsNone(bot._eod_window(self.close + 5500))    # trading again
+
+    def test_a_fresh_bot_after_the_break_trades_on_its_first_tick(self):
+        bot, _ = self._bot(-5.0)                                 # started 00:24
+        bot._mt5_tick_t = self.close + 6845                      # its first live tick
+        self.assertIsNone(bot._eod_window(self.close + 6846))
+
+    def test_the_close_time_follows_the_zone(self):
+        start = pb._eod_start(self.close + 3600)
+        self.assertEqual(start, self.close)
+
+
+class CloseOnlySignalTest(unittest.TestCase):
+    """close_only.signal: a live entry gate, lifted by deleting the file."""
+
+    def test_the_file_gates_entries_and_its_removal_lifts_it(self):
+        orig = pb.CLOSE_ONLY_FILE
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                pb.CLOSE_ONLY_FILE = Path(d) / "close_only.signal"
+                bot = make_bot([])
+                bot._update_gate_reasons()
+                self.assertEqual(bot.close_only_reasons, [])
+                pb.CLOSE_ONLY_FILE.write_text("monitor: drift -1 on two checks\n",
+                                              encoding="utf-8")
+                bot._update_gate_reasons()
+                self.assertEqual(len(bot.close_only_reasons), 1)
+                self.assertIn("drift -1", bot.close_only_reasons[0])
+                pb.CLOSE_ONLY_FILE.unlink()
+                bot._update_gate_reasons()
+                self.assertEqual(bot.close_only_reasons, [])
+        finally:
+            pb.CLOSE_ONLY_FILE = orig
+
+
+class BrokerMarginTest(unittest.TestCase):
+    """An MT5 quote leg's margin is the broker's rate, never LEVERAGE (the
+    engine default 1 counted the whole notional and refused every entry)."""
+
+    def setUp(self):
+        self._orig = (pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY)
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = 1, 1.0
+
+    def tearDown(self):
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = self._orig
+
+    def test_the_broker_rate_wins(self):
+        bot = make_bot([])
+        bot.venue.im_rate = 0.10
+        bot.venue.client = types.SimpleNamespace(broker_margin=True)
+        self.assertAlmostEqual(bot._entry_margin(1.0, 4093.0), 409.3)
+
+    def test_a_crypto_venue_keeps_leverage(self):
+        bot = make_bot([])
+        bot.venue.im_rate = 0.10
+        bot.venue.client = types.SimpleNamespace()
+        self.assertAlmostEqual(bot._entry_margin(1.0, 4093.0), 4093.0)
+
+
+class SamePlatformTest(unittest.TestCase):
+    """An MT5 quote leg on the hedge's own gateway: two symbols of one
+    account, two magics — refused at start otherwise."""
+
+    def setUp(self):
+        self._orig = (pb.VENUE_CLIENT_OPTIONS, pb.MT5_CLIENT_OPTIONS, pb.MT5_MAGIC,
+                      pb.SYMBOL_VENUE, pb.SYMBOL_MT5)
+        pb.VENUE_CLIENT_OPTIONS = {"gateway_port": 5623, "magic": 77016}
+        pb.MT5_CLIENT_OPTIONS = {"gateway_port": 5623}
+        pb.MT5_MAGIC, pb.SYMBOL_VENUE, pb.SYMBOL_MT5 = 77015, "XAUUSD247.i", "XAUUSD.i"
+
+    def tearDown(self):
+        (pb.VENUE_CLIENT_OPTIONS, pb.MT5_CLIENT_OPTIONS, pb.MT5_MAGIC,
+         pb.SYMBOL_VENUE, pb.SYMBOL_MT5) = self._orig
+
+    def _bot(self):
+        bot = make_bot([])
+        bot.venue.client = types.SimpleNamespace(market_orders=True)
+        return bot
+
+    def test_two_magics_two_symbols_start(self):
+        self._bot()._check_same_platform()
+
+    def test_one_magic_on_both_legs_is_refused(self):
+        pb.VENUE_CLIENT_OPTIONS = {"gateway_port": 5623, "magic": 77015}
+        with self.assertRaises(RuntimeError) as cm:
+            self._bot()._check_same_platform()
+        self.assertIn("must differ from MT5_MAGIC", str(cm.exception))
+
+    def test_one_symbol_on_both_legs_is_refused(self):
+        pb.SYMBOL_VENUE = "XAUUSD.i"
+        with self.assertRaises(RuntimeError):
+            self._bot()._check_same_platform()
+
+    def test_two_platforms_are_not_checked(self):
+        pb.MT5_CLIENT_OPTIONS = {"gateway_port": 5621}
+        pb.VENUE_CLIENT_OPTIONS = {"gateway_port": 5623, "magic": 77015}
+        self._bot()._check_same_platform()
+
+
+class BasisTriggerModeTest(unittest.TestCase):
+    """BASIS_TRIGGER_MODE 'min/max': an order arms only when the WHOLE window
+    is through its level (buy: the highest bid basis, sell: the lowest ask
+    basis) and is released on the average as in 'avg'."""
+
+    def setUp(self):
+        self._orig = (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE)
+        pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE = True, "min/max", 0.25
+
+    def tearDown(self):
+        pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE = self._orig
+
+    @staticmethod
+    def _buy(level=-1.0):
+        return DesiredOrder(key="b", side="buy", purpose="entry", level_index=1,
+                            level=level, size=1.0)
+
+    @staticmethod
+    def _sell(level=1.0):
+        return DesiredOrder(key="s", side="sell", purpose="entry", level_index=1,
+                            level=level, size=1.0)
+
+    def _bot(self, bids, asks):
+        """A bot whose window holds these bid/ask basis samples, evenly
+        spread over one full window."""
+        bot = make_bot([])
+        bot._basis_samples = deque()
+        step = pb.BASIS_WINDOW_S / (len(bids) - 1)
+        for i, (b, a) in enumerate(zip(bids, asks)):
+            bot._push_basis(100.0 + i * step, b, a)
+        return bot
+
+    def test_extremes_are_published_with_the_averages(self):
+        bot = self._bot([-2.0, -1.5, 0.5, -2.0, -2.0], [2.0, 2.0, -0.5, 1.5, 2.0])
+        self.assertAlmostEqual(bot.basis_max_bid, 0.5)
+        self.assertAlmostEqual(bot.basis_min_ask, -0.5)
+        self.assertLess(bot.basis_avg_bid, -1.0)          # the average alone would arm
+
+    def test_a_blip_through_the_average_does_not_arm(self):
+        # one sample in the window is NOT through the buy's level: 'avg' arms
+        # (average -1.4 <= -1), 'min/max' must not
+        bot = self._bot([-2.0, -2.0, 0.5, -2.0, -1.5], [2.0] * 5)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+        pb.BASIS_TRIGGER_MODE = "avg"
+        self.assertEqual([d.key for d in bot._basis_gate([self._buy()])], ["b"])
+
+    def test_the_whole_window_through_arms_both_sides(self):
+        bot = self._bot([-1.2, -1.1, -1.5, -1.0, -1.3], [1.0, 1.4, 1.1, 1.2, 1.0])
+        kept = bot._basis_gate([self._buy(), self._sell()])
+        self.assertEqual({d.key for d in kept}, {"b", "s"})
+
+    def test_a_sell_needs_the_lowest_ask_basis(self):
+        bot = self._bot([0.0] * 5, [1.5, 1.5, 0.9, 1.5, 1.5])
+        self.assertEqual(bot._basis_gate([self._sell()]), [])
+
+    def test_armed_orders_release_on_the_average(self):
+        bot = self._bot([-1.5] * 5, [2.0] * 5)
+        self.assertEqual(len(bot._basis_gate([self._buy()])), 1)      # armed
+        # one sample above the level: the max is through it, but the average
+        # stays inside level + release -> still live
+        bot._push_basis(100.0 + pb.BASIS_WINDOW_S + 0.25, -0.5, 2.0)
+        self.assertGreater(bot.basis_max_bid, -1.0)
+        self.assertEqual(len(bot._basis_gate([self._buy()])), 1)
+        # the average itself retreats past level + release -> released
+        for i in range(2, 30):
+            bot._push_basis(100.0 + pb.BASIS_WINDOW_S + 0.25 * i, 0.0, 2.0)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+        self.assertFalse(bot._basis_armed.get("b"))
+
+    def test_no_coverage_no_extremes(self):
+        bot = make_bot([])
+        bot._basis_samples = deque()
+        bot._push_basis(100.0, -2.0, 2.0)
+        self.assertIsNone(bot.basis_max_bid)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+
+
 class LimitOffsetTest(unittest.TestCase):
     """OPTIMIZE_LIMIT_OFFSET: an order (entry or exit) the basis average is
     already through is priced the offset inside the average, never past its
@@ -2321,17 +3010,20 @@ class DailyLimitWiringTest(unittest.TestCase):
         self.assertEqual(bot.mt5_swap["long"], -6.5)
 
     def test_a_hedge_priced_in_another_currency_is_booked_in_usd(self):
-        """USDJPY-style hedge: the MT5 price is in JPY; the day's volume and
-        realized PnL (what the USD caps judge) are divided by the FX rate."""
+        """xyz:JPY vs USDJPY: the hedge is sized through the FX rate
+        (contract_size = 100,000 / 150 venue units a lot), so the day's
+        volume and realized PnL — what the USD caps judge — come out in USD
+        with no second division by the rate (they were 150x too small)."""
         bot = make_bot([])
-        bot.contract_size = 100.0
         bot.fx_rate = 150.0                                     # JPY per USD
+        bot.contract_size = 100_000.0 / (pb.HEDGE_RATIO * bot.fx_rate)
         bot._book_hedge(pb.OrderSide.SELL, 0.02,
-                        types.SimpleNamespace(raw={"price": 15000.0}, order_id="j1"))
-        self.assertAlmostEqual(bot.day.mt5_volume_usd, 2 * 15000.0 / 150.0)
+                        types.SimpleNamespace(raw={"price": 150.0}, order_id="j1"))
+        self.assertAlmostEqual(bot.day.mt5_volume_usd, 2_000.0)       # 0.02 lot = 2,000 USD
         bot._book_hedge(pb.OrderSide.BUY, 0.01,
-                        types.SimpleNamespace(raw={"price": 14850.0}, order_id="j2"))
-        self.assertAlmostEqual(bot.day.realized_mt5_usd, 150.0 / 150.0)   # 150 JPY = 1 USD
+                        types.SimpleNamespace(raw={"price": 149.0}, order_id="j2"))
+        # 1,000 USD short covered 1 JPY lower = 1,000 JPY = 6.67 USD
+        self.assertAlmostEqual(bot.day.realized_mt5_usd, 1_000.0 / 150.0)
 
     def test_hedge_without_a_venue_price_falls_back_to_the_tick(self):
         bot = make_bot([])
@@ -2362,7 +3054,7 @@ class DailyLimitWiringTest(unittest.TestCase):
         bot.mark_px = bot.xau_mid = 4400.0
         bot._refresh_risk(time.time())
         self.assertEqual(len(bot.risk_reasons), 1)
-        self.assertIn("the crypto venue", bot.risk_reasons[0])
+        self.assertIn("the quote exchange", bot.risk_reasons[0])
         self.assertTrue(bot.day.venue_volume_latched)
         self.assertFalse(bot.day.mt5_volume_latched)
 
@@ -3498,6 +4190,177 @@ class HedgeRatioTest(unittest.TestCase):
             other._load_samples()
             self.assertEqual(len(other._samples), 0)
             self.assertTrue(any("not reloaded" in m for m in logs), logs)
+
+
+class HedgeSplitAndRefusalTest(unittest.TestCase):
+    """2026-10-15: a 316.6-lot startup hedge, above the symbol's volume_max,
+    refused 10014 and resent unchanged ~35 times in 25 minutes; and the book
+    it would have doubled sat under another magic the bot could not see."""
+
+    def setUp(self):
+        self._saved = (pb.LIVE_TRADING, pb.MT5_SETTLE_WAIT_S, pb.MT5_ADOPT_MAGICS,
+                       pb.MT5_REFUSED_HOLD_S, pb.HEDGE_THRESHOLD_UNITS)
+        pb.LIVE_TRADING, pb.MT5_SETTLE_WAIT_S, pb.MT5_REFUSED_HOLD_S = True, 0.0, 600.0
+        pb.HEDGE_THRESHOLD_UNITS = 1.0
+
+    def tearDown(self):
+        (pb.LIVE_TRADING, pb.MT5_SETTLE_WAIT_S, pb.MT5_ADOPT_MAGICS,
+         pb.MT5_REFUSED_HOLD_S, pb.HEDGE_THRESHOLD_UNITS) = self._saved
+
+    def _bot(self, refuse=None, err="order rejected: retcode=10014 'Invalid volume'",
+             positions=()):
+        logs = []
+        bot = make_bot(logs)
+        calls = []
+        bot.hedger = types.SimpleNamespace(
+            rebase=lambda units, why: calls.append(("rebase", round(units, 6))),
+            parity_sent=lambda units, why: calls.append(("sent", round(units, 6))),
+            quiet=lambda now=None: False, status=lambda: {"idle": True})
+        bot.contract_size, bot.volume_step, bot.volume_min = 100.0, 0.01, 0.01
+        bot.volume_max = 100.0
+        bot._close_by_unsupported = True
+        bot._read_venue_position = lambda: None
+        bot._read_mt5_net_units = lambda: 0.0
+        bot.mt5_net_units = 0.0
+        bot.counters["hedges"] = 0
+        bot.hedge_ok = True
+        sent = []
+
+        def place_order(symbol, side, lots, *a, **k):
+            if refuse is not None and refuse(len(sent), lots):
+                raise RuntimeError(err)
+            sent.append((side.value, lots))
+            return types.SimpleNamespace(order_id=f"T{len(sent)}", filled=lots,
+                                         raw={"price": 4300.0})
+        bot.mt5 = types.SimpleNamespace(place_order=place_order,
+                                        get_positions=lambda symbol=None: list(positions))
+        return bot, sent, calls, logs
+
+    def test_a_parity_hedge_over_volume_max_goes_as_several_orders(self):
+        bot, sent, calls, logs = self._bot()
+        bot.venue_pos_units = -31660.0                      # 316.6 lot to buy
+        bot._hedge(source="startup")
+        self.assertEqual(sent, [("buy", 100.0), ("buy", 100.0), ("buy", 100.0),
+                                ("buy", 16.6)])
+        self.assertEqual(bot.counters["hedges"], 4)
+        self.assertTrue(bot.hedge_ok)
+        self.assertEqual(calls, [("rebase", 0.0)])
+        self.assertTrue(any("4 orders <= 100 lot" in m for m in logs), logs)
+
+    def test_a_refusal_mid_sequence_hands_off_only_what_filled(self):
+        bot, sent, calls, logs = self._bot(refuse=lambda n, lots: n == 2)
+        bot.venue_pos_units = -31660.0
+        bot._hedge(source="reconcile")
+        self.assertEqual(sent, [("buy", 100.0), ("buy", 100.0)])
+        self.assertEqual(calls, [("sent", 20000.0)])         # 200 lot, never 316.6
+        self.assertEqual(bot.counters["hedges"], 2)
+        self.assertFalse(bot.hedge_ok)
+
+    def test_a_permanent_refusal_is_held_not_resent_unchanged(self):
+        bot, sent, calls, logs = self._bot(refuse=lambda n, lots: True)
+        bot.venue_pos_units = -500.0                        # 5 lot
+        bot._hedge(source="reconcile")
+        self.assertFalse(bot.hedge_ok)
+        self.assertEqual(bot.hedge_refusal["retcode"], 10014)
+        self.assertIn("invalid volume", bot.last_error)
+        self.assertTrue(any("HEDGE REFUSED" in m for m in logs), logs)
+        attempts = []
+        bot.mt5.place_order = lambda *a, **k: attempts.append(a)
+        for _ in range(5):                                   # every re-check after it
+            bot._hedge(source="reconcile")
+        self.assertEqual(attempts, [])                       # the same order: held
+        self.assertTrue(any("HELD" in m for m in logs), logs)
+        bot.venue_pos_units = -700.0                         # the drift moved: a NEW order
+        bot._hedge(source="reconcile")
+        self.assertEqual(len(attempts), 1)
+
+    def test_the_hold_runs_out(self):
+        bot, sent, calls, logs = self._bot(refuse=lambda n, lots: True)
+        bot.venue_pos_units = -500.0
+        bot._hedge(source="reconcile")
+        bot.hedge_refusal["until"] = time.time() - 1.0
+        attempts = []
+        bot.mt5.place_order = lambda *a, **k: attempts.append(a)
+        bot._hedge(source="reconcile")
+        self.assertEqual(len(attempts), 1)
+
+    def test_a_margin_refusal_is_not_held(self):
+        bot, sent, calls, logs = self._bot(refuse=lambda n, lots: True,
+                                           err="order rejected: retcode=10019 'No money'")
+        bot.venue_pos_units = -500.0
+        bot._hedge(source="reconcile")
+        self.assertIsNone(bot.hedge_refusal)
+        attempts = []
+        bot.mt5.place_order = lambda *a, **k: attempts.append(a)
+        bot._hedge(source="reconcile")
+        self.assertEqual(len(attempts), 1)                   # one try per re-check, as before
+
+    def test_a_hedge_too_large_to_split_is_refused_unsent_and_held(self):
+        bot, sent, calls, logs = self._bot()
+        bot.venue_pos_units = -1_000_000.0                   # 10,000 lot at 100 an order
+        bot._hedge(source="startup")
+        self.assertEqual(sent, [])
+        self.assertFalse(bot.hedge_ok)
+        self.assertEqual(bot.hedge_refusal["why"], "too large")
+
+    # ── the inherited book ───────────────────────────────────────────────────
+    @staticmethod
+    def _pos(magic, lots, side="long"):
+        return types.SimpleNamespace(size=lots, position_id=str(magic),
+                                     side=pb.PositionSide.LONG if side == "long"
+                                     else pb.PositionSide.SHORT,
+                                     entry_price=4300.0, raw={"magic": magic})
+
+    def test_an_unknown_magic_on_the_hedge_side_refuses_a_live_start(self):
+        bot, sent, calls, logs = self._bot(positions=[self._pos(55555, 316.6)])
+        bot._other_project_magics = lambda: {}
+        with self.assertRaises(RuntimeError) as cm:
+            bot._check_foreign_hedge_book(-31660.0)          # the venue short, unhedged
+        self.assertIn("55555", str(cm.exception))
+        self.assertIn("MT5_ADOPT_MAGICS", str(cm.exception))
+        self.assertEqual(sent, [])
+
+    def test_a_dry_run_only_warns(self):
+        bot, sent, calls, logs = self._bot(positions=[self._pos(55555, 316.6)])
+        bot._other_project_magics = lambda: {}
+        pb.LIVE_TRADING = False
+        bot._check_foreign_hedge_book(-31660.0)
+        self.assertTrue(any("WARNING" in m and "55555" in m for m in logs), logs)
+
+    def test_no_refusal_in_parity_on_the_other_side_or_for_another_project(self):
+        bot, sent, calls, logs = self._bot(positions=[self._pos(55555, 316.6)])
+        bot._other_project_magics = lambda: {}
+        bot._check_foreign_hedge_book(-0.4)                  # under the threshold
+        bot._check_foreign_hedge_book(31660.0)               # the hedge would SELL: no doubling
+        bot._other_project_magics = lambda: {55555: "paxg_spot_arbitrage"}
+        bot._check_foreign_hedge_book(-31660.0)              # that project's own book
+        self.assertTrue(any("paxg_spot_arbitrage" in m for m in logs), logs)
+
+    def test_adopted_magics_count_as_the_hedge_book(self):
+        pb.MT5_ADOPT_MAGICS = (55555,)
+        bot, sent, calls, logs = self._bot(positions=[self._pos(55555, 316.6),
+                                                      self._pos(424242, 3.0)])
+        del bot._read_mt5_net_units                          # the real read
+        self.assertAlmostEqual(bot._read_mt5_net_units(), 31660.0)
+        self.assertAlmostEqual(bot._read_mt5_book()[0], 31660.0)
+        bot._other_project_magics = lambda: {}
+        bot._check_foreign_hedge_book(31660.0)               # adopted: not foreign, no refusal
+        with self.assertRaises(RuntimeError) as cm:          # an unadopted magic still is
+            bot._check_foreign_hedge_book(-300.0)
+        self.assertIn("424242", str(cm.exception))
+        self.assertNotIn("magic 55555", str(cm.exception))
+
+    def test_other_projects_magics_are_read_from_the_catalogue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name, magic, sym in (("mine", 1, pb.SYMBOL_MT5), ("other", 2, pb.SYMBOL_MT5),
+                                     ("elsewhere", 3, "EURUSD")):
+                (root / name).mkdir()
+                (root / name / "project_settings.py").write_text(
+                    f"MT5_MAGIC = {magic}\nSYMBOL_MT5 = {sym!r}\n", encoding="utf-8")
+            bot = make_bot()
+            with mock.patch.object(pb, "PROJECT_DIR", root / "mine"):
+                self.assertEqual(bot._other_project_magics(), {2: "other"})
 
 
 if __name__ == "__main__":

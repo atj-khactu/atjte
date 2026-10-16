@@ -366,7 +366,8 @@ def grid_two_sided(pos: float, step: float, levels: int, unit: float,
                    min_size: float = 0.0, max_pos: Optional[float] = None,
                    short: bool = True, max_short: Optional[float] = None,
                    center: float = 0.0,
-                   take_profit: Optional[float] = None) -> list[DesiredOrder]:
+                   take_profit: Optional[float] = None,
+                   first_offset: Optional[float] = None) -> list[DesiredOrder]:
     """The complete desired order set of the grid bot for the SIGNED
     position ``pos`` (+ long, − short): :func:`grid_long_orders` on the part
     above zero and, with ``short`` on, :func:`grid_short_orders` on the part
@@ -387,15 +388,28 @@ def grid_two_sided(pos: float, step: float, levels: int, unit: float,
     the other side's first entry at the same or a nearer level. Either way
     the position walks one level at a time and the bot's own quotes can
     never cross (the resting sell is always take_profit + step above the
-    resting buy while a side is held, 2·step when flat)."""
+    resting buy while a side is held, 2·step when flat).
+
+    ``first_offset``: how far the FIRST level of each side sits from the
+    center (None = one ``step``, the layout above). Every further level is
+    one ``step`` beyond it, so with step 1 and first_offset 0.5 the long
+    buys at center −0.5, −1.5, −2.5 … and the short sells at +0.5, +1.5 …:
+    no step is skipped around the center, and flat the two first entries
+    are 2·first_offset apart, so the quotes still never cross. Must be > 0
+    (at 0 both sides would rest at the center and trade against each
+    other). Implemented as each side's own center moved towards the other
+    by step − first_offset; exits keep their take-profit from the entry."""
+    shift = 0.0 if first_offset is None else step - float(first_offset)
+    if first_offset is not None and not float(first_offset) > 0:
+        raise ValueError(f"first_offset must be > 0 — got {first_offset!r}")
     longs = grid_long_orders(max(pos, 0.0), step, levels, unit,
                              min_size=min_size, max_pos=max_pos,
-                             center=center, take_profit=take_profit)
+                             center=center + shift, take_profit=take_profit)
     if not short:
         return longs
     shorts = grid_short_orders(max(-pos, 0.0), step, levels, unit,
                                min_size=min_size, max_short=max_short,
-                               center=center, take_profit=take_profit)
+                               center=center - shift, take_profit=take_profit)
     if any(o.purpose == "exit" for o in longs):
         shorts = [o for o in shorts if o.purpose == "exit"]     # none: pos > 0
     elif any(o.purpose == "exit" for o in shorts):

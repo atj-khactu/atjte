@@ -48,7 +48,9 @@ Snapshot schema (``schema`` 1)::
                "margin": {"available", "margin_equity", "portfolio_value",
                           "initial_margin", "initial_margin_with_orders",
                           "unrealized_funding", "total_unrealized", "pnl",
-                          "ts"} | None,
+                          "ts", "ccy"?, "usd_rate"?} | None
+                       (ccy / usd_rate: the account's own currency when the
+                       figures are converted to USD — an EUR MT5 quote leg),
                "balances": {"free": {ccy: x}, "total": {ccy: x}, "ts"} | None,
                "funding": {"rate", "prediction", "next_ms", "mark", "index"} | None,
                "open_orders": [{"id", "side", "price", "amount", "remaining",
@@ -729,14 +731,23 @@ class Reporter:
 
     # ── 1 m bars ─────────────────────────────────────────────────────────────
     def mark(self, now: float, venue_mid: Optional[float],
-             mt5_mid: Optional[float]) -> None:
+             mt5_mid: Optional[float], venue_live: bool = True) -> None:
         """Feed the current mids; the previous minute's last values become a
-        bar when the minute rolls. Call as often as you like."""
+        bar when the minute rolls. Call as often as you like.
+
+        ``venue_live=False``: the venue's price feed is DOWN, so its last mid
+        is not a price — the bar leaves the venue leg empty (the history
+        backfill may fill it from the gateway's own closes) instead of
+        carrying it forward. Carried, it drew a 46-minute spike to +35 on
+        MGC: TWS was down after the Sunday reopen (2026-10-11 22:00-22:46
+        UTC) and Friday's close was recorded against live MT5 prices."""
         m = minute(now)
         if self._bar_minute is not None and m != self._bar_minute:
             self._flush_bar()
         self._bar_minute = m
-        if venue_mid is not None:
+        if not venue_live:
+            self._bar_venue = self._mark_venue_t = None
+        elif venue_mid is not None:
             self._bar_venue = float(venue_mid)
             self._mark_venue_t = now
         if mt5_mid is not None:

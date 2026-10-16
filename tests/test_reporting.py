@@ -227,6 +227,19 @@ class ReporterTest(unittest.TestCase):
         self.assertEqual(len(R.read_jsonl(self.rep.bars_file)), 2)
 
 
+    def test_a_venue_feed_that_is_down_leaves_the_venue_leg_empty(self):
+        """TWS down after the Sunday reopen: Friday's MGC close must not be
+        recorded against live MT5 prices (a 46-minute spike to +35)."""
+        t0 = 1_800_000_000.0 - 1_800_000_000.0 % 60
+        self.rep.mark(t0 + 1, 4220.25, 4195.11)
+        self.rep.mark(t0 + 61, 4220.25, 4192.05, venue_live=False)   # feed down
+        self.rep.mark(t0 + 121, 4220.25, 4186.64, venue_live=False)
+        self.rep.mark(t0 + 181, 4211.30, 4186.78)                     # feed back
+        self.rep.mark(t0 + 241, 4211.75, 4187.26)
+        rows = R.read_jsonl(self.rep.bars_file)
+        self.assertEqual([r["venue"] for r in rows], [4220.25, None, None, 4211.30])
+        self.assertEqual([r["mt5"] for r in rows], [4195.11, 4192.05, 4186.64, 4186.78])
+
 class ReportReaderTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

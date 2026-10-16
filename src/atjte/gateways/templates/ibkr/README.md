@@ -29,3 +29,37 @@ position is refused), amends are in place (the order keeps its id), and
 there is no venue-side cancel-all — the gateway's per-bot reaper is the
 only dead man's switch, so if the GATEWAY dies its orders stay resting in
 TWS until you cancel them there.
+
+## The hedge side (optional)
+
+With a `hedge` block in `gateway.json` the gateway ALSO serves the hedge leg
+on the account, the way an MT5 gateway does: a second listener on the MT5
+wire (`listen_port`, 5662 live / 5663 paper by default) sends market hedges
+over the same TWS session. See `atjte/src/atjte/gateways/ibkr/hedge.py`.
+
+```json
+"hedge": {"account": "main", "fill_timeout_s": 10,
+          "symbols": [{"sec_type": "CASH", "symbol": "USDJPY"},
+                      {"sec_type": "STK", "symbol": "SPY", "primary_exchange": "ARCA"},
+                      {"sec_type": "CFD", "symbol": "IBUS500", "name": "US500"},
+                      {"sec_type": "FUT", "symbol": "MGC", "exchange": "COMEX",
+                       "expiry": "202612"}]}
+```
+
+A strategy hedges there with `MT5_CLIENT =
+'atjte.clients.gateway.IbkrHedgeGatewayClient'`, `MT5_CLIENT_OPTIONS =
+{'gateway_port': 5663}` and `SYMBOL_MT5` = a symbol's `name` (the panel's New
+strategy dialog writes all three when you pick this gateway as the hedge).
+
+- A lot is MT5's: FX 100,000 units of the base, one share, one CFD unit, one
+  futures contract (worth its multiplier). `qty_per_lot`, `contract_size`,
+  `volume_min` / `volume_step` / `volume_max` override them.
+- Each bot's position is its OWN book (by magic, carried in the order
+  reference), replayed from `executions.jsonl`: IBKR nets one position per
+  contract. What the account holds beyond those books shows as magic 0, and
+  a live start that would hedge onto it is refused.
+- A hedge not filled within `fill_timeout_s` (a closed market) is
+  CANCELLED, never left to fill at the next open.
+- A future is ONE contract month: the hedge never rolls. Before expiry,
+  flatten the strategy, change the symbol and `SYMBOL_MT5`, restart.
+- Live market data for each hedge symbol is needed (quotes down otherwise).

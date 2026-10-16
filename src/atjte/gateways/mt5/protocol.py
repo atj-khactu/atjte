@@ -42,7 +42,7 @@ CLIENT_OPS = frozenset({HELLO, CALL, SUBSCRIBE, PING, BYE})
 #: what a bot may READ through the gateway
 READ_METHODS = frozenset({"get_account", "get_margin", "get_positions",
                           "get_open_orders", "get_trades", "history_deals",
-                          "get_ticker", "get_symbol_specs", "bar_open",
+                          "get_ticker", "get_symbol_specs", "bar_open", "calc_margin",
                           # history: the bots backfill their report bars and
                           # warm their indicators from it at startup
                           "rates"})

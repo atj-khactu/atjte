@@ -93,7 +93,7 @@ def _parser() -> argparse.ArgumentParser:
     bf.add_argument("strategy_dir", type=Path)
     bf.add_argument("--since", default=None, metavar="YYYY-MM-DD",
                     help="start of the window, UTC (default: as far back as the venue serves)")
-    bf.add_argument("--no-venue", action="store_true", help="skip the crypto venue's fills")
+    bf.add_argument("--no-venue", action="store_true", help="skip the quote exchange's fills")
     bf.add_argument("--refresh", action="store_true",
                     help="also REPLACE fills already on file with the freshly "
                          "fetched copy (picks up fields the stored rows predate, "
@@ -120,8 +120,9 @@ def _parser() -> argparse.ArgumentParser:
     sh.add_argument("--fix", action="store_true", help="the gateway is a Kraken FIX gateway")
     sh.add_argument("--mt5-symbol", required=True)
     sh.add_argument("--mt5-port", type=int, required=True,
-                    help="the hedge gateway's listen_port (MT5 or cTrader)")
-    sh.add_argument("--mt5-kind", default=None, choices=["mt5", "ctrader"],
+                    help="the hedge gateway's listen_port (MT5, cTrader, or an IBKR "
+                         "gateway's hedge port)")
+    sh.add_argument("--mt5-kind", default=None, choices=["mt5", "ctrader", "ibkr"],
                     help="the hedge gateway's kind (default: the instance on --mt5-port)")
     sh.add_argument("--timeframe", default="1h", help="1m 5m 15m 30m 1h 4h 1d")
     sh.add_argument("--since", required=True, metavar="YYYY-MM-DD", help="UTC")

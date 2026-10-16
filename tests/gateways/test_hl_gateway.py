@@ -577,6 +577,20 @@ class QuotaTest(GatewayCase):
         self.assertFalse(self.reserve(weight=10000)["ok"])    # a fresh read: room
         self.assertEqual(len(self.up.reserved), 1)
 
+    def test_an_unreadable_quota_buys_nothing_on_the_last_verdict(self):
+        self.up.quota = {**self.up.quota, "used": 49_805, "cap": 49_743}
+        self.gw.poll_quota(force=True)
+        self.assertIn("sub1", self.gw._over_cap)             # the last read: at the limit
+
+        def down(account):
+            raise ConnectionError("info endpoint unreachable")
+        self.up.rate_limit = down
+        out = self.reserve(weight=100)
+        self.assertFalse(out["ok"])
+        self.assertIn("could not be read", out["text"])
+        self.assertEqual(self.up.reserved, [])
+        self.assertEqual(self.gw._quota["sub1"]["cap"], 49_743)  # the card keeps its figures
+
     def test_no_bot_can_buy_requests(self):
         from atjte.gateways.hyperliquid import protocol as P
         self.assertFalse({op for op in P.CLIENT_OPS if "reserve" in op})

@@ -82,7 +82,9 @@ CARRY_EXPIRY = getattr(_S, "CARRY_EXPIRY", None)
 #: trades as spot from then on, before its last trade date for GC, after it
 #: for 1OZ), else — a market with no delivery month — the expiry
 CARRY_DELIVERY = getattr(_S, "CARRY_DELIVERY", None)
-#: wall-clock UTC "HH:MM" at which the center is recomputed, once a day
+#: when the center is recomputed, once a day: "HH:MM" = UTC wall clock, or
+#: "HH:MM Area/City" = that zone's (daylight saving followed), e.g.
+#: "23:05 Europe/Prague"
 CARRY_UPDATE_UTC = getattr(_S, "CARRY_UPDATE_UTC", "00:05")
 #: no new entries inside this many days of expiry (exits keep quoting)
 CARRY_LAST_ENTRY_DTE = getattr(_S, "CARRY_LAST_ENTRY_DTE", 1.0)
@@ -108,10 +110,10 @@ def _check_settings() -> None:
             raise RuntimeError(f"CARRY_DELIVERY must be None (the contract's first delivery "
                                f"day) or 'YYYY-MM-DD' — got {CARRY_DELIVERY!r} ({e})") from None
     try:
-        parse_hhmm(CARRY_UPDATE_UTC)
+        parse_update(CARRY_UPDATE_UTC)
     except ValueError as e:
-        raise RuntimeError(f"CARRY_UPDATE_UTC must be 'HH:MM' (UTC) — got "
-                           f"{CARRY_UPDATE_UTC!r} ({e})") from None
+        raise RuntimeError(f"CARRY_UPDATE_UTC must be 'HH:MM' (UTC) or 'HH:MM Area/City' "
+                           f"(e.g. '23:05 Europe/Prague') — got {CARRY_UPDATE_UTC!r} ({e})") from None
     if not (num(CARRY_LAST_ENTRY_DTE) and CARRY_LAST_ENTRY_DTE >= 0):
         raise RuntimeError(f"CARRY_LAST_ENTRY_DTE must be a number >= 0 (days) — got "
                            f"{CARRY_LAST_ENTRY_DTE!r}")
@@ -156,11 +158,42 @@ def fair_center(ref_price: float, carry_annual_pct: float, dte: float,
                  6) + 0.0
 
 
-def next_update(now: datetime, hhmm: str) -> datetime:
-    """The first ``hhmm`` UTC strictly after ``now``."""
+def parse_update(s: str):
+    """``CARRY_UPDATE_UTC``: ``"HH:MM"`` (UTC) or ``"HH:MM Area/City"`` (that
+    zone's wall clock, daylight saving followed) -> ``(h, m, zone or None)``."""
+    hhmm, _, zone = str(s).strip().partition(" ")
     h, m = parse_hhmm(hhmm)
-    t = now.astimezone(timezone.utc).replace(hour=h, minute=m, second=0, microsecond=0)
-    return t if t > now else t + timedelta(days=1)
+    zone = zone.strip()
+    if not zone or zone.upper() == "UTC":
+        return h, m, None
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        return h, m, ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ValueError(f"unknown timezone {zone!r}") from e
+
+
+def _update_label() -> str:
+    """CARRY_UPDATE_UTC as a person reads it: "00:05 UTC", "23:05 Europe/Prague"."""
+    _h, _m, zone = parse_update(CARRY_UPDATE_UTC)
+    return f"{CARRY_UPDATE_UTC} UTC" if zone is None else str(CARRY_UPDATE_UTC).strip()
+
+
+def next_update(now: datetime, hhmm: str) -> datetime:
+    """The first ``hhmm`` strictly after ``now``, in UTC: UTC wall clock for
+    ``"HH:MM"``, the zone's for ``"HH:MM Area/City"`` (``"23:05 Europe/Prague"``
+    is 21:05 UTC in summer, 22:05 UTC in winter)."""
+    h, m, zone = parse_update(hhmm)
+    if zone is None:
+        t = now.astimezone(timezone.utc).replace(hour=h, minute=m, second=0, microsecond=0)
+        return t if t > now else t + timedelta(days=1)
+    local = now.astimezone(zone)
+    for add in (0, 1, 2):          # built per calendar day, so a DST change is followed
+        d = (local + timedelta(days=add)).date()
+        t = datetime(d.year, d.month, d.day, h, m, tzinfo=zone)
+        if t > now:
+            return t.astimezone(timezone.utc)
+    raise ValueError(f"no next update after {now} for {hhmm!r}")
 
 
 _check_settings()
@@ -271,7 +304,7 @@ class GridFuturesBot(GridBot):
         dlv, dlv_from = self._delivery()
         _log(f"carry: the grid center follows the fair basis — ref x {CARRY_ANNUAL_PCT:g}%/yr "
              f"x days to delivery/365 (+ {_grid.GRID_CENTER:+g} offset), recomputed daily at "
-             f"{CARRY_UPDATE_UTC} UTC; the basis reaches spot on {dlv.date()} ({dlv_from}), "
+             f"{_update_label()}; the basis reaches spot on {dlv.date()} ({dlv_from}), "
              f"{self._carry_days():.1f} days away; trading ends {(exp - timedelta(days=1)).date()} "
              f"({'CARRY_EXPIRY' if CARRY_EXPIRY is not None else 'the venue market'}), "
              f"{dte:.1f} days away; no new entries inside {CARRY_LAST_ENTRY_DTE:g} day(s) of it")
@@ -290,21 +323,23 @@ class GridFuturesBot(GridBot):
 
     # ── monitoring ───────────────────────────────────────────────────────────
     def _lvl(self, k: int, sign: int) -> float:
-        return round((self.center or 0.0) + sign * _grid.GRID_STEP * k, 4) + 0.0
+        return round((self.center or 0.0)
+                     + sign * (_grid.GRID_STEP * k - _grid._shift()), 4) + 0.0
 
     def _tp_lvl(self, k: int, sign: int) -> float:
         return round((self.center or 0.0)
-                     + sign * (_grid.GRID_STEP * k - _grid.TAKE_PROFIT_EFFECTIVE), 4) + 0.0
+                     + sign * (_grid.GRID_STEP * k - _grid._shift()
+                               - _grid.TAKE_PROFIT_EFFECTIVE), 4) + 0.0
 
     def _extra_state(self) -> dict:
         st = super()._extra_state()
         g = st["grid"]
         ks = range(1, _grid.GRID_LEVELS + 1)
         g["center_usd"] = self.center
-        g["long_entries"] = [self._lvl(k, -1) for k in ks]
-        g["long_exits"] = [self._tp_lvl(k, -1) for k in ks]
-        g["short_entries"] = [self._lvl(k, 1) for k in ks] if _grid.GRID_SHORT else []
-        g["short_exits"] = [self._tp_lvl(k, 1) for k in ks] if _grid.GRID_SHORT else []
+        g["long_entries"] = [self._lvl(k, -1) for k in ks] if _grid._long_on() else []
+        g["long_exits"] = [self._tp_lvl(k, -1) for k in ks] if _grid._long_on() else []
+        g["short_entries"] = [self._lvl(k, 1) for k in ks] if _grid._short_on() else []
+        g["short_exits"] = [self._tp_lvl(k, 1) for k in ks] if _grid._short_on() else []
         try:
             dte = self._dte()
         except Exception:                                   # noqa: BLE001

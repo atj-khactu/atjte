@@ -121,6 +121,8 @@ class Venue:
         self.unrealized_funding: Optional[float] = None
         self.total_unrealized: Optional[float] = None
         self.pnl: Optional[float] = None
+        self.account_ccy: Optional[str] = None
+        self.account_usd_rate: Optional[float] = None
         self.free_base: Optional[float] = None      # spot only
         self.free_quote: Optional[float] = None     # spot only
         self.base_balance: Optional[float] = None   # spot only (total, incl. locked)
@@ -311,14 +313,24 @@ class Venue:
     def _read_contract_position(self) -> None:
         """The venue's SIGNED position, in base units. Absent = flat."""
         units = 0.0
-        entry = upnl = ufund = liq = None
+        upnl = ufund = liq = None
+        cost, priced = 0.0, True
         for p in self.client.get_positions(self.symbol):
             if p.symbol and p.symbol != self.symbol:
                 continue
             signed = p.size if p.side is PositionSide.LONG else -p.size
             units += self.to_units(signed)
-            entry = p.entry_price or None
-            upnl, liq = p.unrealized_pnl, p.liquidation_price
+            # several positions (an MT5 hedging account: one ticket per
+            # fill) are ONE position here — their PnL summed, their entry
+            # the net cost (2026-10-15 Blueberry: entry and PnL were the
+            # LAST ticket's, 58 USD of a 422 USD open PnL)
+            if p.entry_price:
+                cost += self.to_units(signed) * float(p.entry_price)
+            else:
+                priced = False
+            if p.unrealized_pnl is not None:
+                upnl = (upnl or 0.0) + float(p.unrealized_pnl)
+            liq = p.liquidation_price
             info = (p.raw or {}).get("info") or {}
             try:
                 raw_f = info.get("unrealizedFunding")
@@ -326,6 +338,7 @@ class Venue:
             except (TypeError, ValueError):
                 ufund = None
         self.position_units = round(units, 8)
+        entry = (cost / units) if (priced and abs(units) > 1e-12) else None
         self.entry_px, self.upnl = entry, upnl
         self.ufunding, self.liq_px = ufund, liq
 
@@ -463,6 +476,10 @@ class Venue:
         self.unrealized_funding = f("unrealizedFunding")
         self.total_unrealized = f("totalUnrealized")
         self.pnl = f("pnl")
+        # a connector whose account is in another currency than the market's
+        # quote (an EUR MT5 account) converted the figures above; these say so
+        self.account_ccy = str(flex.get("accountCurrency") or "") or None
+        self.account_usd_rate = f("accountUsdRate")
 
     def _perp_dex_params(self) -> dict:
         """``{"dex": name}`` for a Hyperliquid HIP-3 perp (a builder-deployed
@@ -581,6 +598,14 @@ class Venue:
         return self.client.place_order(
             self.symbol, OrderSide.BUY if side == "buy" else OrderSide.SELL,
             self.to_contracts(units), OrderType.LIMIT, price, params=params)
+
+    def place_market(self, side: str, units: float) -> Order:
+        """One MARKET order, sized in BASE UNITS (EXECUTION_MODE 'market'):
+        the connector's answer is the fill (``filled`` in the venue's
+        amount unit, ``price`` the deal price)."""
+        return self.client.place_order(
+            self.symbol, OrderSide.BUY if side == "buy" else OrderSide.SELL,
+            self.to_contracts(units), OrderType.MARKET, None)
 
     def edit_limit(self, order_id: str, side: str, price: float,
                    units: Optional[float] = None):

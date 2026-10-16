@@ -52,6 +52,7 @@ import ccxt
 
 from ..common import BOOK_LEVELS, book_payload, jsonable
 from .config import ContractSpec
+from .hedge_refs import is_hedge_ref
 
 ORDER_TIMEOUT_S = 10.0
 READ_TIMEOUT_S = 15.0
@@ -179,10 +180,36 @@ def market_from_details(cd, spec: ContractSpec) -> dict:
     }
 
 
+def market_from_commodity(cd, spec: ContractSpec) -> dict:
+    """A CCXT-shaped SPOT market from one CMDTY ``ContractDetails`` (IBKR's
+    XAUUSD on SMART): ``XAUUSD/USD``, no expiry, one unit per "contract".
+    Served as a price reference (the engine's PRICE_REFERENCE), not traded."""
+    c = cd.contract
+    sym = f"{c.symbol}/{c.currency}"
+    return {
+        "id": str(c.conId), "symbol": sym, "base": c.symbol, "quote": c.currency,
+        "settle": None, "baseId": c.symbol, "quoteId": c.currency, "settleId": None,
+        "type": "spot", "spot": True, "margin": False, "swap": False, "future": False,
+        "option": False, "contract": False, "linear": None, "inverse": None,
+        "active": True, "taker": None, "maker": None, "contractSize": 1.0,
+        "expiry": None, "expiryDatetime": None, "strike": None, "optionType": None,
+        "precision": {"amount": 1.0, "price": _num(cd.minTick) or 0.01},
+        "limits": {"amount": {"min": None, "max": None}, "price": {"min": None, "max": None},
+                   "cost": {"min": None, "max": None},
+                   "leverage": {"min": None, "max": None}},
+        "info": {"conId": c.conId, "localSymbol": c.localSymbol, "exchange": c.exchange,
+                 "primaryExchange": c.primaryExchange, "secType": c.secType,
+                 "minTick": cd.minTick, "longName": cd.longName,
+                 "lastTradeDate": None, "contractMonth": None, "firstDeliveryDate": None,
+                 "spec": spec.as_dict()},
+    }
+
+
 class IbkrUpstream:
     def __init__(self, accounts: dict[str, str], contracts: list[ContractSpec], *,
                  host: str = "127.0.0.1", port: int = 7497, client_id: int = 7,
                  network: str = "paper", reject_pause_s: float = REJECT_PAUSE_S,
+                 journal=None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         if not accounts:
             raise ValueError("the gateway needs at least one account")
@@ -213,7 +240,14 @@ class IbkrUpstream:
         self._paused: dict[str, tuple[float, str]] = {}   # symbol -> (until, why)
         self._im_rate: dict[str, tuple[float, float]] = {}   # symbol -> (t, rate)
         self._seen_fills: set[str] = set()
+        #: every execution seen, kept across restarts and days (journal.py);
+        #: None = the session's fills only
+        self._journal = journal
         self._t0_ms = int(time.time() * 1000)
+        #: the HEDGE side sharing this session (hedge.IbkrHedgeBackend), or
+        #: None: its ticks, market-data refusals and fills go to it, never
+        #: to a venue bot — and its orders and fills stay out of the venue's reads
+        self.hedge = None
         self._connected_once = False
         self.last_error = ""
         self.counters = {"tickers": 0, "fills": 0, "orders": 0, "errors": 0,
@@ -296,6 +330,23 @@ class IbkrUpstream:
                                f" ({len(managed)} account(s) on this login)")
         self.ib.reqMarketDataType(1)            # live: never quote off delayed data
         self._connected_once = True
+        await self._backfill_executions()
+
+    async def _backfill_executions(self) -> None:
+        """Keep every execution TWS still serves (today's; up to 7 days from
+        TWS with its Trade Log set so) in the journal — at start and after
+        each reconnect, so a fill made while this gateway was down is in its
+        history before any bot reads it."""
+        if self._journal is None:
+            return
+        try:
+            fills = await asyncio.wait_for(self.ib.reqExecutionsAsync(), READ_TIMEOUT_S)
+        except Exception as e:                      # noqa: BLE001 — history only
+            self._err("execution backfill", e)
+            return
+        new = self._journal.record(self._enrich(self.trade_dict(f)) for f in fills or [])
+        self._log(f"ib upstream: {len(fills or [])} execution(s) from TWS, {new} new or "
+                  f"updated in the journal ({len(self._journal)} kept)")
 
     async def _keep_connected(self) -> None:
         """Re-dial a lost session and re-make the subscriptions."""
@@ -308,6 +359,8 @@ class IbkrUpstream:
                 self.counters["reconnects"] += 1
                 for sym in list(self._symbols):
                     self._subscribe(sym)
+                if self.hedge is not None:
+                    self.hedge.resubscribe()
                 self._log(f"ib upstream: session to TWS restored")
                 self._event("connected")
             except Exception as e:                  # noqa: BLE001
@@ -336,23 +389,64 @@ class IbkrUpstream:
 
     # ── markets ──────────────────────────────────────────────────────────────
     async def _load_markets(self) -> None:
-        from ib_async import Future
         for spec in self._specs:
-            cds = await self.ib.reqContractDetailsAsync(
-                Future(symbol=spec.symbol, exchange=spec.exchange, currency=spec.currency))
-            if not cds:
-                raise RuntimeError(f"TWS lists no {spec.sec_type} contract for "
-                                   f"{spec.symbol} on {spec.exchange} ({spec.currency})")
-            for cd in sorted(cds, key=lambda d: d.contract.lastTradeDateOrContractMonth):
-                m = market_from_details(cd, spec)
-                self._markets[m["symbol"]] = m
-                self._contracts[m["symbol"]] = cd.contract
-                self._sym_of[cd.contract.conId] = m["symbol"]
+            self._install(await self._list_spec(spec))
+
+    async def _list_spec(self, spec: ContractSpec) -> list[tuple[dict, Any]]:
+        """``(market, ib Contract)`` for every expiry TWS lists for one spec;
+        raises when it lists none."""
+        from ib_async import Commodity, Future
+        cmdty = spec.sec_type == "CMDTY"
+        asked = (Commodity(symbol=spec.symbol, exchange=spec.exchange,
+                           currency=spec.currency) if cmdty else
+                 Future(symbol=spec.symbol, exchange=spec.exchange, currency=spec.currency))
+        cds = await self.ib.reqContractDetailsAsync(asked)
+        if not cds:
+            raise RuntimeError(f"TWS lists no {spec.sec_type} contract for "
+                               f"{spec.symbol} on {spec.exchange} ({spec.currency})")
+        return [((market_from_commodity if cmdty else market_from_details)(cd, spec),
+                 cd.contract)
+                for cd in sorted(cds, key=lambda d: d.contract.lastTradeDateOrContractMonth or "")]
+
+    def _install(self, listed: list[tuple[dict, Any]]) -> None:
+        """Add listed markets. Each table is rebound whole, never grown in
+        place: the gateway's threads iterate them while a running gateway
+        adds contracts (:meth:`add_contracts`)."""
+        markets, contracts, sym_of = dict(self._markets), dict(self._contracts), dict(self._sym_of)
+        for m, contract in listed:
+            markets[m["symbol"]] = m
+            contracts[m["symbol"]] = contract
+            sym_of[contract.conId] = m["symbol"]
+        self._markets, self._contracts, self._sym_of = markets, contracts, sym_of
+
+    def add_contracts(self, specs: list[ContractSpec],
+                      timeout_s: float = 60.0) -> tuple[list[str], dict[str, str]]:
+        """List the specs this session does not have yet and add their
+        markets, while running — ``gateway.json`` gained a contract. Never
+        removes one: a bot may trade it until the gateway restarts.
+        Returns ``(new market symbols, {spec: why it failed})``."""
+        known = {(s.symbol, s.exchange, s.currency, s.sec_type) for s in self._specs}
+        new = [s for s in specs if (s.symbol, s.exchange, s.currency, s.sec_type) not in known]
+        added: list[str] = []
+        failed: dict[str, str] = {}
+        for spec in new:
+            label = f"{spec.symbol}@{spec.exchange}"
+            try:
+                listed = self._call(self._list_spec(spec), timeout_s)
+            except Exception as e:                      # noqa: BLE001 — reported per spec
+                failed[label] = f"{type(e).__name__}: {e}"
+                continue
+            fresh = [m["symbol"] for m, _c in listed if m["symbol"] not in self._markets]
+            self._install(listed)
+            self._specs = [*self._specs, spec]
+            added += fresh
+        return added, failed
 
     def market_rows(self) -> list[dict]:
         """The loaded contracts, flat, for the gateway folder's
         ``markets.json`` (the panel's catalogue reads it)."""
-        return [{"symbol": s, "base": m["base"], "quote": m["quote"], "kind": "future",
+        return [{"symbol": s, "base": m["base"], "quote": m["quote"],
+                 "kind": "spot" if m.get("spot") else "future",
                  "contract_size": m["contractSize"], "active": True,
                  "venue_name": str(m["info"].get("localSymbol") or ""),
                  "expiry": m["info"].get("lastTradeDate"),
@@ -368,7 +462,8 @@ class IbkrUpstream:
             if sym == symbol:
                 m = dict(m)
                 m["limits"] = {**m["limits"], "leverage": {"min": None, "max": None}}
-                rate = self._im_rate_of(sym)
+                # a spot reference (CMDTY) is not traded: no margin to probe
+                rate = None if m.get("spot") else self._im_rate_of(sym)
                 if rate:
                     m["limits"]["leverage"] = {"min": None, "max": 1.0 / rate}
                 out[sym] = jsonable(m)
@@ -456,6 +551,13 @@ class IbkrUpstream:
         text = str(errorString or "")
         if code in _CONN_INFO_CODES:
             return
+        if self.hedge is not None:
+            c = next((r for r in rest if hasattr(r, "conId")), None)
+            try:
+                if self.hedge.on_error(reqId, code, text, c):
+                    return
+            except Exception:                       # noqa: BLE001 — never the venue's
+                self.counters["errors"] += 1
         if reqId is not None and int(reqId) in self._depth_reqs:
             # the DEPTH request's answer: never the symbol's quotes (a depth
             # refusal is no market-data refusal); 21xx are notices
@@ -589,6 +691,12 @@ class IbkrUpstream:
 
     def _on_tickers(self, tickers) -> None:
         for t in tickers:
+            if self.hedge is not None:
+                try:
+                    if self.hedge.on_ticker(t):
+                        continue
+                except Exception:                   # noqa: BLE001
+                    self.counters["errors"] += 1
             d = self.ticker_dict(t)
             if d is None:
                 continue
@@ -654,6 +762,8 @@ class IbkrUpstream:
                 # average cost (reporting.venue_realized_pnl)
                 "info": {"permId": ex.permId, "orderRef": ex.orderRef, "account": ex.acctNumber,
                          "exchange": ex.exchange, "lastLiquidity": liq,
+                         "conId": getattr(fill.contract, "conId", None),
+                         "currency": getattr(fill.contract, "currency", None),
                          "ib_realized_pnl_net": (_qty(rep.realizedPNL) if rep is not None
                                                  else None)}}
 
@@ -742,8 +852,29 @@ class IbkrUpstream:
         raise ccxt.NotSupported("Interactive Brokers has no venue-side cancel-all timer")
 
     # ── the session's pushes ─────────────────────────────────────────────────
+    def _enrich(self, d: dict) -> dict:
+        """A HEDGE fill as the journal keeps it: with the FX rates of its
+        moment (the hedge book books PnL in the account's currency)."""
+        if self.hedge is not None and is_hedge_ref((d.get("info") or {}).get("orderRef")):
+            try:
+                return self.hedge.enrich(d)
+            except Exception:                       # noqa: BLE001 — kept without them
+                self.counters["errors"] += 1
+        return d
+
     def _on_exec(self, trade, fill) -> None:
-        d = self.trade_dict(fill)
+        d = self._enrich(self.trade_dict(fill))
+        if self._journal is not None:
+            self._journal.record([d])
+        if is_hedge_ref(d["info"].get("orderRef")):
+            # a hedge's fill: the hedge side's (its order waits on the trade
+            # itself); never pushed to a venue bot as one of its own fills
+            if self.hedge is not None:
+                try:
+                    self.hedge.on_fill(d)
+                except Exception:                   # noqa: BLE001
+                    self.counters["errors"] += 1
+            return
         if d["id"] in self._seen_fills:
             return
         self._seen_fills.add(d["id"])
@@ -766,9 +897,13 @@ class IbkrUpstream:
         its id) and takes the fee for its report record. Once per fill; a
         fill this session never pushed (a replay) is left to the reads."""
         eid = getattr(fill.execution, "execId", "")
+        d = self._enrich(self.trade_dict(fill))
+        if self._journal is not None and d["fee"] is not None:
+            self._journal.record([d])               # a replayed fill's fee too
+        if is_hedge_ref(d["info"].get("orderRef")):
+            return
         if self._pushed_fills.get(eid) is not False:
             return
-        d = self.trade_dict(fill)
         if d["fee"] is None:
             return
         self._pushed_fills[eid] = True
@@ -780,6 +915,8 @@ class IbkrUpstream:
             self.counters["errors"] += 1
 
     def _on_order_status(self, trade) -> None:
+        if is_hedge_ref(getattr(trade.order, "orderRef", "")):
+            return                                  # the hedge side waits on it
         self.counters["orders"] += 1
         try:
             self._h["order"](self._account_of(trade.order), self.order_dict(trade))
@@ -877,6 +1014,8 @@ class IbkrUpstream:
         for t in pool:
             if t.order.account and t.order.account != aid:
                 continue
+            if is_hedge_ref(t.order.orderRef):
+                continue                            # the hedge side's, not a venue order
             d = self.order_dict(t)
             if symbol and d["symbol"] != symbol:
                 continue
@@ -887,11 +1026,20 @@ class IbkrUpstream:
 
     def _my_trades(self, account: str, symbol: Optional[str], since, limit) -> list[dict]:
         aid = self.account_id(account)
+        session = [self._enrich(self.trade_dict(f)) for f in self.ib.fills() or []]
+        if self._journal is not None:
+            self._journal.record([d for d in session if d["fee"] is not None])
+        # the journal's history under the session's copies (same execId)
+        merged = {d["id"]: d for d in (self._journal.trades() if self._journal else [])}
+        for d in session:
+            if d["fee"] is not None or d["id"] not in merged:
+                merged[d["id"]] = d
         out = []
-        for f in self.ib.fills() or []:
-            if f.execution.acctNumber and f.execution.acctNumber != aid:
+        for d in merged.values():
+            if d["info"].get("account") and d["info"]["account"] != aid:
                 continue
-            d = self.trade_dict(f)
+            if is_hedge_ref(d["info"].get("orderRef")):
+                continue                            # a hedge fill: the hedge book's
             if symbol and d["symbol"] != symbol:
                 continue
             if since and (d["timestamp"] or 0) < int(since):

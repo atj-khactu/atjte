@@ -14,9 +14,13 @@ key; it leases a gateway (:mod:`atjte.gateways`) over loopback:
   reads, prices and fills too);
 - ``MT5GatewayClient`` — the MT5 hedge through the terminal's MT5 gateway;
 - ``CTraderGatewayClient`` — the hedge on cTrader through the account's
-  cTrader gateway (the MT5 wire, an MT5GatewayClient subclass).
+  cTrader gateway (the MT5 wire, an MT5GatewayClient subclass);
+- ``IbkrHedgeGatewayClient`` — the hedge on Interactive Brokers through the
+  IBKR gateway's hedge side (the MT5 wire, an MT5GatewayClient subclass);
+- ``MT5VenueClient`` — an MT5 symbol as the QUOTE leg, through its
+  terminal's MT5 gateway (market orders only: ``EXECUTION_MODE = 'market'``).
 
-All but the last two share :class:`~.base.GatewayConnector`.
+All but the MT5-wire ones (the hedges and the MT5 quote leg) share :class:`~.base.GatewayConnector`.
 """
 from __future__ import annotations
 
@@ -28,7 +32,9 @@ _LAZY = {"CcxtGatewayClient": ".ccxt_gateway",
          "LighterGatewayClient": ".lighter_gateway",
          "IbkrGatewayClient": ".ibkr_gateway",
          "MT5GatewayClient": ".mt5_gateway",
-         "CTraderGatewayClient": ".ctrader_gateway"}
+         "CTraderGatewayClient": ".ctrader_gateway",
+         "IbkrHedgeGatewayClient": ".ibkr_hedge_gateway",
+         "MT5VenueClient": ".mt5_venue"}
 
 __all__ = [*_LAZY]
 

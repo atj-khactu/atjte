@@ -25,7 +25,11 @@ does. This module is the fast path that takes its place when
   by the one hedge that reads both legs, and a stale read right after a
   fast hedge can never double it;
 - a failed order latches ``hedge_ok = False`` through ``on_failure`` exactly
-  as the parity hedge does: quotes come down, the reconciler repairs.
+  as the parity hedge does: quotes come down, the reconciler repairs. The
+  residue keeps what did NOT fill (the whole delta on a refusal, the rest
+  when a split stops half-way: ``hedge_orders.send_split`` sends a hedge
+  above ``volume_max`` as several orders), so the reconciler's relative
+  ``parity_sent`` lands it on zero.
 
 Dedupe is by the venue's trade id, plus the pre-start rule the booking path
 uses (a snapshot replay on reconnect carries old fills): a fill is hedged
@@ -65,6 +69,7 @@ from typing import Callable, Optional
 
 from ...clients.base import OrderSide, Trade
 from ..common.grid_model import round_to_step
+from ..common.hedge_orders import HedgeTooLarge, send_split
 
 #: how long the hedger must have seen no fill before a parity read may
 #: REBASE its residue (a fill's push and the REST position read can cross
@@ -92,6 +97,7 @@ class EventHedger:
                  symbol_venue: str, to_units: Callable[[float], float],
                  contract_size: float, volume_step: float, volume_min: float,
                  threshold_units: float, live: bool,
+                 volume_max: float = 0.0,
                  started_utc: Optional[datetime] = None,
                  on_result: Optional[Callable] = None,
                  on_failure: Optional[Callable[[Exception], None]] = None,
@@ -104,6 +110,7 @@ class EventHedger:
         self.contract_size = float(contract_size)
         self.volume_step = float(volume_step)
         self.volume_min = float(volume_min)
+        self.volume_max = float(volume_max or 0.0)    # one order's cap; 0 = none
         self.threshold_units = float(threshold_units)
         self.live = bool(live)
         self.started_utc = started_utc
@@ -126,7 +133,8 @@ class EventHedger:
         self.last_latency_ms: Optional[float] = None
         self.counters = {"submitted": 0, "duplicates": 0, "hedges": 0, "coalesced": 0,
                          "residue_holds": 0, "failures": 0, "dry": 0,
-                         "rebases": 0, "parity_sent": 0}
+                         "rebases": 0, "parity_sent": 0, "split_orders": 0,
+                         "partial": 0}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -251,7 +259,10 @@ class EventHedger:
         for tr in fills:
             units = self._to_units(float(tr.amount))
             signed += units if tr.side is OrderSide.BUY else -units
-        delta = self.residue_units - signed
+        # rounded: fill sizes summed in floating point land a hair under a
+        # whole lot (0.99999999 for 1 oz), which read as 'under one lot' and
+        # was never hedged (PAXG perp 2026-10-15 02:20: 1 oz unhedged)
+        delta = round(self.residue_units - signed, 8)
         if len(fills) > 1:
             self.counters["coalesced"] += len(fills) - 1
         lots = round_to_step(abs(delta) / self.contract_size, self.volume_step)
@@ -272,29 +283,49 @@ class EventHedger:
             return
         t0 = self._clock()
         try:
-            order = self._place(side, lots)
-        except Exception as e:
-            self.counters["failures"] += 1
-            self._log(f"ERROR: event hedge failed: {side.value} {lots:g} lot "
-                      f"(delta {delta:+.4f} units): {e} -- quotes down; the "
-                      f"reconciler re-checks parity and fixes it")
-            if self._on_failure is not None:
-                self._on_failure(e)
-            return
+            res = send_split(self._place, side, lots, self.volume_max, self.volume_step,
+                             self.volume_min)
+        except HedgeTooLarge as e:
+            res = None
+            err: Optional[Exception] = e
+        else:
+            err = res.error
         latency_ms = (self._clock() - t0) * 1000.0
-        self.last_latency_ms = latency_ms
-        self.last_hedge_t = self._clock()
-        self.counters["hedges"] += 1
-        self.residue_units = delta - sent_units
-        self._log(f"HEDGE (event) {side.value} {lots:g} lot (delta {delta:+.4f} units, "
-                  f"{len(fills)} fill(s), order_send {latency_ms:.0f} ms)")
-        if self._on_result is not None:
-            self._on_result(side, lots, order, delta, latency_ms, len(fills))
-        if self._after_place is not None:
-            try:
-                self._after_place()
-            except Exception as e:
-                self._log(f"warning: after the event hedge: {type(e).__name__}: {e}")
+        sign = 1 if delta > 0 else -1
+        filled = res.filled_lots if res is not None else 0.0
+        # the residue owes exactly what did NOT fill: a refusal before the
+        # first order leaves the whole delta owed (these fills included), a
+        # refusal half-way the unfilled rest -- never the requested size
+        self.residue_units = delta - filled * self.contract_size * sign
+        if res is not None and len(res.chunks) > 1:
+            self.counters["split_orders"] += len(res.orders)
+        if filled > 1e-9:
+            self.last_latency_ms = latency_ms
+            self.last_hedge_t = self._clock()
+            self.counters["hedges"] += 1
+            split = (f", {len(res.orders)} of {len(res.chunks)} orders <= "
+                     f"{self.volume_max:g} lot" if len(res.chunks) > 1 else "")
+            self._log(f"HEDGE (event) {side.value} {filled:g} lot (delta {delta:+.4f} units, "
+                      f"{len(fills)} fill(s), order_send {latency_ms:.0f} ms{split})")
+            if self._on_result is not None:
+                for got, order in res.orders:
+                    self._on_result(side, got, order, delta, latency_ms, len(fills))
+            if self._after_place is not None:
+                try:
+                    self._after_place()
+                except Exception as e:
+                    self._log(f"warning: after the event hedge: {type(e).__name__}: {e}")
+        if err is not None:
+            self.counters["failures"] += 1
+            if filled > 1e-9:
+                self.counters["partial"] += 1
+            self._log(f"ERROR: event hedge failed: {side.value} {lots:g} lot "
+                      f"(delta {delta:+.4f} units"
+                      + (f", {filled:g} lot filled before it stopped" if filled > 1e-9 else "")
+                      + f"): {err} -- quotes down; the reconciler re-checks parity and "
+                        f"fixes it (residue {self.residue_units:+.4f} units)")
+            if self._on_failure is not None:
+                self._on_failure(err)
 
     def status(self) -> dict:
         q = self.quiet_s()

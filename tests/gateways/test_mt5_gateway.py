@@ -45,9 +45,12 @@ class FakeTerminal:
         return Ticker(exchange="mt5", symbol=symbol, bid=self.bid, ask=self.ask, last=None,
                       timestamp=datetime.now(timezone.utc), raw={"time_msc": self.t_ms})
 
+    netting = False
+
     def get_account(self):
         self._check()
-        return Account(exchange="mt5", currency="USD", balance=5000.0, equity=5000.5)
+        return Account(exchange="mt5", currency="USD", balance=5000.0, equity=5000.5,
+                       raw={"margin_mode": 0 if self.netting else 2})
 
     def get_margin(self):
         self._check()
@@ -84,6 +87,13 @@ class FakeTerminal:
             self.orders.append({"symbol": symbol, "side": side, "amount": amount,
                                 "type": order_type, **kwargs})
             n = len(self.orders)
+            pid = kwargs.get("position")
+            if pid is not None:                 # a close: shrink / drop that ticket
+                for p in list(self.positions):
+                    if p.position_id == str(pid):
+                        p.size = round(p.size - amount, 8)
+                        if p.size <= 1e-9:
+                            self.positions.remove(p)
         return Order(exchange="mt5", order_id=str(4610404640 + n), symbol=symbol, side=side,
                      type=order_type, amount=amount, filled=amount, remaining=0.0,
                      status=OrderStatus.FILLED, raw={"retcode": 10009, "price": self.ask})
@@ -229,6 +239,82 @@ class HedgeTest(Case):
             c.close_by("1", "3")                                # another magic's position
         with self.assertRaises(ccxt.OrderNotFound):
             c.close_by("1", "9")
+
+
+class NettingTest(Case):
+    """A netting account: one position per symbol, so one trader per symbol."""
+
+    def setUp(self):
+        super().setUp()
+        self.term.netting = True
+
+    def test_a_second_bot_on_the_symbol_is_refused(self):
+        a = self.client(magic=77015, name="xau247")
+        b = self.client(magic=77008, name="paxg_spot")
+        a.place_order("XAUUSD", OrderSide.BUY, 0.01, OrderType.MARKET)
+        with self.assertRaises(ccxt.InvalidOrder):
+            b.place_order("XAUUSD", OrderSide.SELL, 0.01, OrderType.MARKET)
+        self.assertEqual(len(self.term.orders), 1)
+        b.place_order("EURUSD", OrderSide.SELL, 0.01, OrderType.MARKET)   # another symbol
+        a.place_order("XAUUSD", OrderSide.SELL, 0.01, OrderType.MARKET)  # its own: fine
+
+    def test_another_magics_position_blocks_the_symbol(self):
+        self.term.positions = [Position(exchange="mt5", symbol="XAUUSD", side=PositionSide.LONG,
+                                        size=0.03, entry_price=4000.0, position_id="1",
+                                        raw={"magic": 0})]          # a manual trade
+        c = self.client(magic=77015, name="xau247")
+        with self.assertRaises(ccxt.InvalidOrder):
+            c.place_order("XAUUSD", OrderSide.SELL, 0.01, OrderType.MARKET)
+        self.assertEqual(self.term.orders, [])
+
+    def test_a_hedging_account_is_not_guarded(self):
+        self.term.netting = False
+        self.gw._netting_cache = None
+        a = self.client(magic=77015, name="xau247")
+        b = self.client(magic=77008, name="paxg_spot")
+        a.place_order("XAUUSD", OrderSide.BUY, 0.01, OrderType.MARKET)
+        b.place_order("XAUUSD", OrderSide.SELL, 0.01, OrderType.MARKET)
+        self.assertEqual(len(self.term.orders), 2)
+
+
+class CloseFirstTest(Case):
+    """A hedging account: a reducing order CLOSES the caller's opposite
+    tickets (no margin needed) instead of opening a new one."""
+
+    @staticmethod
+    def _short(ticket, lots, magic=77012):
+        return Position(exchange="mt5", symbol="XAUUSD", side=PositionSide.SHORT, size=lots,
+                        entry_price=4100.0, position_id=str(ticket), raw={"magic": magic})
+
+    def test_a_reducing_buy_closes_a_short_ticket(self):
+        self.term.positions = [self._short(1, 1.0), self._short(2, 1.0)]
+        c = self.client(magic=77012, name="gc")
+        o = c.place_order("XAUUSD", OrderSide.BUY, 1.0, OrderType.MARKET, deviation=20)
+        self.assertEqual(o.filled, 1.0)
+        self.assertEqual(self.term.orders[-1]["position"], "1")     # oldest ticket closed
+        self.assertEqual([p.position_id for p in self.term.positions], ["2"])
+        self.assertEqual(o.raw["closed_tickets"], ["1"])
+
+    def test_a_partial_close_then_the_rest_opens_a_ticket(self):
+        self.term.positions = [self._short(1, 0.5)]
+        c = self.client(magic=77012, name="gc")
+        o = c.place_order("XAUUSD", OrderSide.BUY, 1.0, OrderType.MARKET)
+        self.assertEqual([x.get("position") for x in self.term.orders], ["1", None])
+        self.assertEqual([x["amount"] for x in self.term.orders], [0.5, 0.5])
+        self.assertAlmostEqual(o.filled, 1.0)
+
+    def test_another_magics_tickets_are_never_closed(self):
+        self.term.positions = [self._short(1, 1.0, magic=99999)]
+        c = self.client(magic=77012, name="gc")
+        c.place_order("XAUUSD", OrderSide.BUY, 1.0, OrderType.MARKET)
+        self.assertNotIn("position", self.term.orders[-1])          # a new ticket
+        self.assertEqual(len(self.term.positions), 1)
+
+    def test_an_order_that_adds_opens_a_ticket_as_before(self):
+        self.term.positions = [self._short(1, 1.0)]
+        c = self.client(magic=77012, name="gc")
+        c.place_order("XAUUSD", OrderSide.SELL, 1.0, OrderType.MARKET)
+        self.assertNotIn("position", self.term.orders[-1])
 
 
 class HealthTest(Case):

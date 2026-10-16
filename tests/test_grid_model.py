@@ -366,6 +366,39 @@ class TestLevelFills(unittest.TestCase):
         self.assertEqual(level_fills(-3.0, 3, 1.0)[1], [1.0, 1.0, 1.0])
 
 
+class TestGridFirstOffset(unittest.TestCase):
+    """GRID_FIRST_OFFSET: the first level of each side that far from the
+    center, every further one a step beyond — step 1, offset 0.5: buy at
+    -0.5, -1.5 ..., sell at +0.5, +1.5 ... (no step skipped)."""
+
+    def levels(self, orders, side, purpose):
+        return sorted(o.level for o in orders if o.side == side and o.purpose == purpose)
+
+    def test_flat_the_first_entries_sit_half_a_step_out(self):
+        o = grid_two_sided(0.0, 1.0, 3, 1.0, center=10.0, take_profit=1.0, first_offset=0.5)
+        self.assertEqual(self.levels(o, "buy", "entry")[-1], 9.5)
+        self.assertEqual(self.levels(o, "sell", "entry")[0], 10.5)
+
+    def test_every_further_level_is_one_step_beyond(self):
+        o = grid_two_sided(0.0, 1.0, 3, 1.0, center=0.0, first_offset=0.5)
+        self.assertEqual(self.levels(o, "buy", "entry"), [-2.5, -1.5, -0.5])
+        self.assertEqual(self.levels(o, "sell", "entry"), [0.5, 1.5, 2.5])
+
+    def test_exits_keep_their_take_profit_from_the_entry(self):
+        o = grid_two_sided(1.0, 1.0, 3, 1.0, center=0.0, take_profit=0.75, first_offset=0.5)
+        self.assertEqual(self.levels(o, "sell", "exit"), [0.25])      # -0.5 + 0.75
+        self.assertEqual(self.levels(o, "buy", "entry")[-1], -1.5)     # next long level
+        o = grid_two_sided(-1.0, 1.0, 3, 1.0, center=0.0, take_profit=0.75, first_offset=0.5)
+        self.assertEqual(self.levels(o, "buy", "exit"), [-0.25])      # +0.5 - 0.75
+
+    def test_none_is_todays_layout_and_zero_is_refused(self):
+        a = grid_two_sided(0.0, 1.0, 3, 1.0, center=0.0)
+        b = grid_two_sided(0.0, 1.0, 3, 1.0, center=0.0, first_offset=1.0)
+        self.assertEqual([(o.side, o.level) for o in a], [(o.side, o.level) for o in b])
+        with self.assertRaises(ValueError):
+            grid_two_sided(0.0, 1.0, 3, 1.0, first_offset=0.0)
+
+
 class TestGridLongOrders(unittest.TestCase):
     """Long side: oz #k bought at center − step·k, take-profit one level UP
     (center − step·(k−1)); sizes hard-clamped to the long and the cap."""

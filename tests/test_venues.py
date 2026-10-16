@@ -10,16 +10,17 @@ from atjte import venues as V
 
 
 class TestVenues(unittest.TestCase):
-    def test_the_six_venues(self):
+    def test_the_seven_venues(self):
         self.assertEqual(V.FAMILIES, ("kraken", "coinbase", "binance", "hyperliquid", "lighter",
-                                      "ibkr"))
+                                      "ibkr", "mt5"))
         self.assertEqual({v.family for v in V.SUPPORTED.values()}, set(V.FAMILIES))
         for v in V.SUPPORTED.values():
             self.assertIn(v.kind, ("spot", "perp", "future", "both"))
             self.assertEqual(v.id, V.normalise(v.id))
-        # the one that is not a CCXT exchange is named as such
-        self.assertEqual(V.NON_CCXT, ("ibkr",))
+        # the ones that are not CCXT exchanges are named as such
+        self.assertEqual(V.NON_CCXT, ("ibkr", "mt5"))
         self.assertEqual(V.venue("ibkr").kind, "future")
+        self.assertEqual(V.venue("mt5").kind, "perp")
 
     def test_lookup_and_normalisation(self):
         self.assertTrue(V.is_supported("kraken_futures"))
@@ -59,6 +60,7 @@ class TestVenues(unittest.TestCase):
         self.assertEqual(V.gateway_connector("ibkr"), "atjte.clients.gateway.IbkrGatewayClient")
         with self.assertRaises(ValueError):
             V.gateway_connector("ibkr", fix=True)
+        self.assertEqual(V.gateway_connector("mt5"), "atjte.clients.gateway.MT5VenueClient")
 
     def test_the_connectors_refuse_other_exchanges(self):
         from atjte.clients.ccxt_client import CCXTClient

@@ -119,6 +119,27 @@ class GridWiringTest(unittest.TestCase):
         d = by_key(make_bot(3.0)._desired_orders())
         self.assertEqual(set(d), {"grid-exit-L3"})
 
+    def test_short_only_drops_the_buy_entries_and_keeps_every_exit(self):
+        orig = grid_bot.GRID_DIRECTION
+        try:
+            grid_bot.GRID_DIRECTION = "short only"
+            self.assertEqual(set(by_key(make_bot(0.0)._desired_orders())), {"grid-entry-S1"})
+            self.assertEqual(set(by_key(make_bot(-1.0)._desired_orders())),
+                             {"grid-exit-S1", "grid-entry-S2"})
+            # a long held from before still takes its profit
+            self.assertEqual(set(by_key(make_bot(1.0)._desired_orders())), {"grid-exit-L1"})
+        finally:
+            grid_bot.GRID_DIRECTION = orig
+
+    def test_long_only_drops_the_sell_entries(self):
+        orig = grid_bot.GRID_DIRECTION
+        try:
+            grid_bot.GRID_DIRECTION = "long only"
+            self.assertEqual(set(by_key(make_bot(0.0)._desired_orders())), {"grid-entry-L1"})
+            self.assertEqual(set(by_key(make_bot(-1.0)._desired_orders())), {"grid-exit-S1"})
+        finally:
+            grid_bot.GRID_DIRECTION = orig
+
     def test_clip_is_one_order_volume(self):
         self.assertEqual(make_bot(0.0)._clip_units(), grid_bot.ORDER_VOLUME_EFFECTIVE)
 

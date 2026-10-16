@@ -377,6 +377,10 @@ class MT5Client(UniversalClient):
             "comment": kwargs.get("comment", "universal-client"),
             "type_time": mt5.ORDER_TIME_GTC,
         }
+        if kwargs.get("position"):
+            # close THAT ticket (a hedging account): no new position, so no
+            # new margin — the broker takes it even with no free margin
+            req["position"] = int(kwargs["position"])
         if order_type is OrderType.MARKET:
             tick = self._tick(symbol)
             req.update(action=mt5.TRADE_ACTION_DEAL,
@@ -450,6 +454,24 @@ class MT5Client(UniversalClient):
         if result is None:
             raise ConnectionError(f"order_send failed: {mt5.last_error()}")
         return result.retcode == mt5.TRADE_RETCODE_DONE
+
+    @_serialised
+    def calc_margin(self, symbol: str, side: str, lots: float,
+                    price: Optional[float] = None) -> Optional[float]:
+        """The margin, in the ACCOUNT currency, that ``lots`` of ``symbol`` on
+        ``side`` ('buy' / 'sell') would take at ``price`` (None = the current
+        tick) — the terminal's own ``order_calc_margin``, so a symbol whose
+        margin ignores the account leverage (a fixed-rate CFD: Blueberry's
+        XAUUSD247.i takes 10 % at 1:100) is priced as the broker prices it.
+        None when the terminal cannot say."""
+        mt5.symbol_select(symbol, True)
+        buy = str(side).lower() == "buy"
+        if price is None:
+            tick = self._tick(symbol)
+            price = float(tick.ask if buy else tick.bid)
+        m = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
+                                  symbol, float(lots), float(price))
+        return None if m is None else float(m)
 
     @_serialised
     def get_symbol_specs(self, symbol: str) -> dict:

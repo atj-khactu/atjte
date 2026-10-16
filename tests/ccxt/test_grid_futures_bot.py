@@ -91,6 +91,22 @@ class PureTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gc.parse_expiry("29/12/2026")
 
+    def test_next_update_in_a_named_timezone_follows_daylight_saving(self):
+        # 23:05 Prague = 21:05 UTC in summer (CEST), 22:05 UTC in winter (CET)
+        summer = datetime(2026, 10, 13, 20, 0, tzinfo=UTC)
+        self.assertEqual(gc.next_update(summer, "23:05 Europe/Prague"),
+                         datetime(2026, 10, 13, 21, 5, tzinfo=UTC))
+        after = datetime(2026, 10, 13, 21, 6, tzinfo=UTC)
+        self.assertEqual(gc.next_update(after, "23:05 Europe/Prague"),
+                         datetime(2026, 10, 14, 21, 5, tzinfo=UTC))
+        # the clocks go back on Sun 2026-10-25: from then on it is 22:05 UTC
+        self.assertEqual(gc.next_update(datetime(2026, 10, 25, 12, 0, tzinfo=UTC),
+                                        "23:05 Europe/Prague"),
+                         datetime(2026, 10, 25, 22, 5, tzinfo=UTC))
+        self.assertEqual(gc.next_update(T0, "00:05 UTC"), gc.next_update(T0, "00:05"))
+        with self.assertRaises(ValueError):
+            gc.parse_update("23:05 Mars/Olympus")
+
     def test_next_update_is_the_first_hhmm_after_now(self):
         self.assertEqual(gc.next_update(T0, "00:05"), datetime(2026, 9, 21, 0, 5, tzinfo=UTC))
         self.assertEqual(gc.next_update(T0, "12:00"), datetime(2026, 9, 21, 12, 0, tzinfo=UTC))

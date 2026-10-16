@@ -81,7 +81,16 @@ from strategy_settings import (                                           # noqa
 # Optional tunables (defensive: a settings file written before one of these
 # existed simply runs the default).
 GRID_CENTER = float(getattr(_S, "GRID_CENTER", 0.0) or 0.0)
-GRID_SHORT = bool(getattr(_S, "GRID_SHORT", True))
+# which side the grid ENTERS: 'both' | 'long only' | 'short only'. Exits are
+# never withheld — a position the other side holds (from before the switch)
+# still takes its profit. It replaced GRID_SHORT (2026-10-14): a file that
+# still says GRID_SHORT = False and names no direction is 'long only'.
+GRID_DIRECTIONS = ("both", "long only", "short only")
+_LEGACY_SHORT = getattr(_S, "GRID_SHORT", None)
+GRID_DIRECTION = str(getattr(_S, "GRID_DIRECTION", None)
+                     or ("long only" if _LEGACY_SHORT is False else "both")).strip().lower()
+#: whether the grid has a short side at all (derived; was a setting)
+GRID_SHORT = GRID_DIRECTION != "long only"
 MAX_SHORT_UNITS = getattr(_S, "MAX_SHORT_UNITS", None)
 MAX_SHORT_EFFECTIVE = MAX_POSITION_UNITS if MAX_SHORT_UNITS is None else MAX_SHORT_UNITS
 # units per resting ORDER, entries and exits alike; None = GRID_LEVEL_UNITS
@@ -94,6 +103,27 @@ ORDER_VOLUME_EFFECTIVE = GRID_LEVEL_UNITS if ORDER_VOLUME is None else ORDER_VOL
 GRID_TAKE_PROFIT = getattr(_S, "GRID_TAKE_PROFIT", None)
 TAKE_PROFIT_EFFECTIVE = (GRID_STEP if GRID_TAKE_PROFIT is None
                          else GRID_TAKE_PROFIT)
+# how far the FIRST level of each side sits from the center (spread points);
+# None = one GRID_STEP. Half a step (step 1 -> 0.5) puts the first buy at
+# center - 0.5 and the first sell at center + 0.5, every further level one
+# step beyond: no step skipped around the center (grid_model.grid_two_sided)
+GRID_FIRST_OFFSET = getattr(_S, "GRID_FIRST_OFFSET", None)
+
+
+def _direction_allows(o) -> bool:
+    """GRID_DIRECTION: an ENTRY on the side it switches off is dropped; an
+    exit always stays."""
+    if o.purpose != "entry" or GRID_DIRECTION == "both":
+        return True
+    return o.side == ("buy" if GRID_DIRECTION == "long only" else "sell")
+
+
+def _long_on() -> bool:
+    return GRID_DIRECTION != "short only"
+
+
+def _short_on() -> bool:
+    return GRID_DIRECTION != "long only"
 
 
 def _check_settings() -> None:
@@ -108,6 +138,9 @@ def _check_settings() -> None:
     if not (num(GRID_LEVEL_UNITS) and GRID_LEVEL_UNITS > 0):
         raise RuntimeError("GRID_LEVEL_UNITS must be a number > 0 — got "
                            f"{GRID_LEVEL_UNITS!r}")
+    if GRID_DIRECTION not in GRID_DIRECTIONS:
+        raise RuntimeError(f"GRID_DIRECTION must be one of {', '.join(GRID_DIRECTIONS)} — got "
+                           f"{GRID_DIRECTION!r}")
     if ORDER_VOLUME is not None and not (num(ORDER_VOLUME) and ORDER_VOLUME > 0):
         raise RuntimeError("ORDER_VOLUME must be None (= GRID_LEVEL_UNITS) or a "
                            f"number > 0 — got {ORDER_VOLUME!r}")
@@ -119,15 +152,27 @@ def _check_settings() -> None:
                                                  and GRID_TAKE_PROFIT > 0):
         raise RuntimeError("GRID_TAKE_PROFIT must be None (= GRID_STEP) "
                            f"or a number > 0 — got {GRID_TAKE_PROFIT!r}")
+    if GRID_FIRST_OFFSET is not None and not (num(GRID_FIRST_OFFSET)
+                                              and GRID_FIRST_OFFSET > 0):
+        raise RuntimeError("GRID_FIRST_OFFSET must be None (= GRID_STEP) or a number "
+                           f"> 0 (at 0 both sides rest at the center) — got "
+                           f"{GRID_FIRST_OFFSET!r}")
 
 
 _check_settings()
 
 
+def _shift() -> float:
+    """How far each side's levels sit nearer the center than whole steps
+    (GRID_FIRST_OFFSET; 0 = the first level one step out)."""
+    return 0.0 if GRID_FIRST_OFFSET is None else GRID_STEP - float(GRID_FIRST_OFFSET)
+
+
 def _lvl(k: int, sign: int) -> float:
-    """Spread level of grid index ``k`` on the long (sign −1) or short
-    (sign +1) side — k = 0 is the center itself."""
-    return round(GRID_CENTER + sign * GRID_STEP * k, 4) + 0.0
+    """Spread level of grid index ``k`` (>= 1) on the long (sign −1) or
+    short (sign +1) side: GRID_FIRST_OFFSET from the center for k = 1, one
+    step further for each next one."""
+    return round(GRID_CENTER + sign * (GRID_STEP * k - _shift()), 4) + 0.0
 
 
 def _tp_lvl(k: int, sign: int) -> float:
@@ -135,8 +180,8 @@ def _tp_lvl(k: int, sign: int) -> float:
     (sign +1) side: its entry level pulled ``TAKE_PROFIT_EFFECTIVE`` back
     towards the center (and through it, when the take-profit is wider than
     k steps)."""
-    return round(GRID_CENTER
-                 + sign * (GRID_STEP * k - TAKE_PROFIT_EFFECTIVE), 4) + 0.0
+    return round(GRID_CENTER + sign * (GRID_STEP * k - _shift()
+                                       - TAKE_PROFIT_EFFECTIVE), 4) + 0.0
 
 
 class GridBot(ArbBot):
@@ -230,7 +275,8 @@ class GridBot(ArbBot):
                                 max_pos=MAX_POSITION_UNITS, short=GRID_SHORT,
                                 max_short=MAX_SHORT_EFFECTIVE,
                                 center=center,
-                                take_profit=TAKE_PROFIT_EFFECTIVE)
+                                take_profit=TAKE_PROFIT_EFFECTIVE,
+                                first_offset=GRID_FIRST_OFFSET)
         if unit is None:                    # no dynamic level size yet: exits only
             orders = [o for o in orders if o.purpose == "exit"]
         # ORDER_VOLUME: a resting order carries at most this much, entries and
@@ -238,7 +284,7 @@ class GridBot(ArbBot):
         # sized to what the level still lacks (the caps above already bound
         # the whole set, so the cut can only shrink an order)
         ov = self._order_volume(geom)
-        return [replace(o, size=min(o.size, ov)) for o in orders]
+        return [replace(o, size=min(o.size, ov)) for o in orders if _direction_allows(o)]
 
     # ── startup ──────────────────────────────────────────────────────────────
     def _banner(self) -> None:
@@ -276,6 +322,11 @@ class GridBot(ArbBot):
                  + (f" — a {GRID_LEVEL_UNITS:g} {u} level fills in several orders"
                     if ORDER_VOLUME_EFFECTIVE < GRID_LEVEL_UNITS
                     else " (>= the level size: one level = one order)"))
+        if GRID_DIRECTION != "both":
+            _log(f"direction: {GRID_DIRECTION.upper()} — "
+                 + ("buy" if GRID_DIRECTION == "short only" else "sell")
+                 + " entries are off; exits always run (a position held from before "
+                   "still takes its profit)")
         if GRID_SHORT and not self.is_perp:
             _log(f"note: spot market — the short side can only sell the base "
                  f"inventory, so keep MAX_SHORT_UNITS ({scap:g} {u}) at or below "
@@ -301,7 +352,9 @@ class GridBot(ArbBot):
             "level_units_dynamic": _dyn_alloc_on(),
             "order_volume_units": self._order_volume(unit),
             "take_profit_usd": TAKE_PROFIT_EFFECTIVE,
-            "short": GRID_SHORT,
+            "first_offset_usd": GRID_STEP - _shift(),
+            "short": _short_on(),
+            "direction": GRID_DIRECTION,
             "max_position_units": MAX_POSITION_UNITS,
             "max_short_units": MAX_SHORT_EFFECTIVE if GRID_SHORT else 0.0,
             "pos_units_signed": round(pos, 6),
@@ -309,10 +362,10 @@ class GridBot(ArbBot):
             "long_fills": [round(v, 4) for v in long_f],
             "short_fills": [round(v, 4) for v in short_f] if GRID_SHORT else [],
             # the static level geometry: entry of unit #k and its take-profit
-            "long_entries": [_lvl(k, -1) for k in ks],
-            "long_exits": [_tp_lvl(k, -1) for k in ks],
-            "short_entries": [_lvl(k, 1) for k in ks] if GRID_SHORT else [],
-            "short_exits": [_tp_lvl(k, 1) for k in ks] if GRID_SHORT else [],
+            "long_entries": [_lvl(k, -1) for k in ks] if _long_on() else [],
+            "long_exits": [_tp_lvl(k, -1) for k in ks] if _long_on() else [],
+            "short_entries": [_lvl(k, 1) for k in ks] if _short_on() else [],
+            "short_exits": [_tp_lvl(k, 1) for k in ks] if _short_on() else [],
         }}
 
 

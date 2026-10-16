@@ -4,7 +4,7 @@
         gateway.json       what it connects to and which contracts it lists
         gateway.env        the account id and the loopback token — never anywhere else
         slots.json         client -> slot (the owners the order references carry)
-        markets.json       the contracts loaded at the last start (for the panel's catalogue)
+        markets.json       the contracts the running session lists (for the panel's catalogue)
         gateway_state.json the heartbeat the panel reads (while running)
         stop.signal        written by the panel to stop it cleanly
         logs/
@@ -18,7 +18,15 @@
      "contracts": [{"symbol": "MGC", "exchange": "COMEX", "currency": "USD",
                     "sec_type": "FUT"}],  # every listed expiry becomes a market
      "msgs_per_min": 2400, "max_inflight": 20,
-     "clients": []}                       # allowlist; empty = any client with the token
+     "clients": [],                       # allowlist; empty = any client with the token
+     "hedge": {"listen_port": 5663,       # OPTIONAL: also serve the HEDGE leg (hedge.py)
+               "account": "main", "fill_timeout_s": 10,
+               "symbols": [{"sec_type": "CASH", "symbol": "USDJPY"},
+                           {"sec_type": "STK", "symbol": "SPY"},
+                           {"sec_type": "FUT", "symbol": "MGC", "exchange": "COMEX",
+                            "expiry": "202612"}]}}
+
+``contracts`` may be empty when the gateway only hedges.
 
 ``network`` is ``live`` or ``paper`` — which TWS login this gateway is for.
 Nothing on the API socket says which one it is (a paper account id merely
@@ -70,14 +78,34 @@ TWS_PORTS = {"live": 7496, "paper": 7497}
 DEFAULT_CLIENT_ID = 7
 TOKEN_NAME = "ib_gateway_token"
 ACCOUNT_NAME = "ibkr_account"
-#: what a contract spec may be. Options (``FOP``) are not listed yet: a
-#: chain is hundreds of contracts, and the engine trades futures first
-SEC_TYPES = ("FUT",)
+#: what a contract spec may be: futures (every expiry TWS lists becomes a
+#: market) and CMDTY — IBKR's spot commodities (XAUUSD on SMART), one market
+#: each, served as a price reference (PRICE_REFERENCE). Options (``FOP``) are
+#: not listed yet: a chain is hundreds of contracts
+SEC_TYPES = ("FUT", "CMDTY")
+
+#: the HEDGE side (``hedge`` in gateway.json): what a hedge symbol may be —
+#: FX on IDEALPRO, stocks / ETFs, CFDs, ONE dated future (its expiry named:
+#: a hedge never rolls by itself) and spot commodities
+HEDGE_SEC_TYPES = ("CASH", "STK", "CFD", "FUT", "CMDTY")
+#: the hedge listener's default port by network (the venue side's + 2)
+HEDGE_LISTEN_PORTS = {"live": 5662, "paper": 5663}
+#: the exchange a hedge symbol is routed to when the config names none
+HEDGE_EXCHANGES = {"CASH": "IDEALPRO", "STK": "SMART", "CFD": "SMART", "CMDTY": "SMART"}
+#: a market hedge not filled in this long is CANCELLED (a closed market)
+HEDGE_FILL_TIMEOUT_S = 10.0
+#: the hedge symbols the running gateway resolved, for the panel's catalogue
+HEDGE_SYMBOLS_NAME = "hedge_symbols.json"
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+_HEDGE_NAME_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,29}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "host", "port", "client_id",
           "accounts", "contracts", "msgs_per_min", "max_inflight", "clients", "_comment",
-          "reject_pause_s"}
+          "reject_pause_s", "hedge"}
+_HEDGE_KEYS = {"listen_port", "account", "symbols", "fill_timeout_s", "_comment"}
+_HEDGE_SYMBOL_KEYS = {"name", "sec_type", "symbol", "exchange", "currency",
+                      "primary_exchange", "expiry", "contract_size", "qty_per_lot",
+                      "volume_min", "volume_step", "volume_max"}
 _KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 _CONTRACT_KEYS = {"symbol", "exchange", "currency", "sec_type"}
 
@@ -110,6 +138,149 @@ class ContractSpec:
                 "currency": self.currency, "sec_type": self.sec_type}
 
 
+@dataclass(frozen=True)
+class HedgeSymbol:
+    """One line of ``hedge.symbols``: an IBKR contract a bot hedges on, by
+    the NAME its ``SYMBOL_MT5`` uses. A lot is ``qty_per_lot`` of IB's
+    quantity (units of FX base, shares, contracts) and is worth
+    ``contract_size`` × the price — MT5's own meaning, so the engine sizes
+    an IBKR hedge exactly as an MT5 one. None = from the contract
+    (:func:`atjte.gateways.ibkr.hedge.hedge_spec`)."""
+    name: str
+    sec_type: str
+    symbol: str
+    exchange: str
+    currency: str = "USD"
+    primary_exchange: str = ""
+    expiry: str = ""
+    contract_size: Optional[float] = None
+    qty_per_lot: Optional[float] = None
+    volume_min: Optional[float] = None
+    volume_step: Optional[float] = None
+    volume_max: Optional[float] = None
+
+    def as_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items() if v not in (None, "")}
+
+
+@dataclass
+class HedgeConfig:
+    """``hedge`` in gateway.json: the gateway ALSO serves the hedge leg — a
+    second listener on the MT5 wire (``listen_port``), market hedges on
+    ``account`` for the ``symbols`` listed."""
+    listen_port: int
+    account: str = MAIN
+    symbols: list = field(default_factory=list)        # [HedgeSymbol]
+    fill_timeout_s: float = HEDGE_FILL_TIMEOUT_S
+
+    def status(self) -> dict:
+        return {"listen_port": self.listen_port, "account": self.account,
+                "symbols": [s.name for s in self.symbols],
+                "fill_timeout_s": self.fill_timeout_s}
+
+
+def _pos(raw: dict, key: str, label: str) -> Optional[float]:
+    v = raw.get(key)
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ConfigError(f"hedge symbol {label}: {key} must be a number") from None
+    if not f > 0:
+        raise ConfigError(f"hedge symbol {label}: {key} must be more than 0")
+    return f
+
+
+def parse_hedge_symbol(raw) -> HedgeSymbol:
+    """One ``hedge.symbols`` entry. ``{"sec_type": "CASH", "symbol":
+    "USDJPY"}`` is USD.JPY on IDEALPRO; a FUT names its ``expiry``
+    (``YYYYMM`` or ``YYYYMMDD``) and its exchange; the name defaults to the
+    pair (CASH), the ticker (STK, CFD, CMDTY) or ticker + expiry (FUT)."""
+    if not isinstance(raw, dict):
+        raise ConfigError(f"hedge symbol {raw!r}: a dict with sec_type and symbol")
+    unknown = sorted(set(raw) - _HEDGE_SYMBOL_KEYS)
+    if unknown:
+        raise ConfigError(f"hedge symbol: unknown key(s) {', '.join(unknown)}")
+    sec = str(raw.get("sec_type") or "").strip().upper()
+    if sec not in HEDGE_SEC_TYPES:
+        raise ConfigError(f"hedge symbol {raw.get('symbol')!r}: sec_type must be one of "
+                          f"{', '.join(HEDGE_SEC_TYPES)}")
+    sym = str(raw.get("symbol") or "").strip().upper()
+    if not sym:
+        raise ConfigError("hedge symbol: symbol is required (e.g. USDJPY, SPY, MGC)")
+    ccy = str(raw.get("currency") or "").strip().upper()
+    if sec == "CASH":
+        if len(sym) == 6 and sym.isalpha() and not ccy:
+            sym, ccy = sym[:3], sym[3:]
+        if len(sym) != 3 or len(ccy) != 3:
+            raise ConfigError(f"hedge symbol {sym}: an FX pair is symbol 'USDJPY' (or "
+                              f"symbol 'USD' with currency 'JPY')")
+    ccy = ccy or "USD"
+    exch = str(raw.get("exchange") or HEDGE_EXCHANGES.get(sec, "")).strip().upper()
+    if not exch:
+        raise ConfigError(f"hedge symbol {sym}: a {sec} needs its exchange (e.g. COMEX)")
+    expiry = str(raw.get("expiry") or "").strip()
+    if sec == "FUT":
+        if not (expiry.isdigit() and len(expiry) in (6, 8)):
+            raise ConfigError(f"hedge symbol {sym}: a future names its expiry, YYYYMM or "
+                              f"YYYYMMDD — a hedge never rolls to the next contract by "
+                              f"itself")
+    elif expiry:
+        raise ConfigError(f"hedge symbol {sym}: only a FUT has an expiry")
+    default = (sym + ccy if sec == "CASH" else sym + expiry if sec == "FUT" else sym)
+    name = str(raw.get("name") or default).strip().upper()
+    if not _HEDGE_NAME_RE.match(name):
+        raise ConfigError(f"hedge symbol name {name!r}: letters, digits, . _ -, up to 30")
+    label = name
+    return HedgeSymbol(
+        name=name, sec_type=sec, symbol=sym, exchange=exch, currency=ccy,
+        primary_exchange=str(raw.get("primary_exchange") or "").strip().upper(),
+        expiry=expiry,
+        contract_size=_pos(raw, "contract_size", label),
+        qty_per_lot=_pos(raw, "qty_per_lot", label),
+        volume_min=_pos(raw, "volume_min", label),
+        volume_step=_pos(raw, "volume_step", label),
+        volume_max=_pos(raw, "volume_max", label))
+
+
+def parse_hedge(raw, *, network: str, accounts: list, listen_port: int
+                ) -> Optional[HedgeConfig]:
+    """``hedge`` in gateway.json, or None when absent / listing no symbol."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{CONFIG_NAME}: hedge must be an object")
+    unknown = sorted(set(raw) - _HEDGE_KEYS)
+    if unknown:
+        raise ConfigError(f"{CONFIG_NAME}: hedge: unknown key(s) {', '.join(unknown)}")
+    symbols = [parse_hedge_symbol(s) for s in (raw.get("symbols") or [])]
+    if not symbols:
+        return None
+    names = [s.name for s in symbols]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise ConfigError(f"{CONFIG_NAME}: hedge symbol(s) listed twice: {', '.join(dup)}")
+    account = str(raw.get("account") or MAIN)
+    if account not in accounts:
+        raise ConfigError(f"{CONFIG_NAME}: hedge account {account!r} is not among the "
+                          f"accounts ({', '.join(accounts)})")
+    try:
+        port = int(raw.get("listen_port") or HEDGE_LISTEN_PORTS[network])
+        timeout = float(raw.get("fill_timeout_s") or HEDGE_FILL_TIMEOUT_S)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{CONFIG_NAME}: hedge listen_port and fill_timeout_s are "
+                          f"numbers") from None
+    if port == listen_port:
+        raise ConfigError(f"{CONFIG_NAME}: hedge listen_port {port} is the venue side's "
+                          f"own — give the hedge its own port "
+                          f"({HEDGE_LISTEN_PORTS[network]} by default)")
+    if not 1.0 <= timeout <= 60.0:
+        raise ConfigError(f"{CONFIG_NAME}: hedge fill_timeout_s is 1 to 60 seconds")
+    return HedgeConfig(listen_port=port, account=account, symbols=symbols,
+                       fill_timeout_s=timeout)
+
+
 @dataclass
 class GatewayConfig:
     name: str
@@ -133,6 +304,8 @@ class GatewayConfig:
     #: account name -> IB account id (raw text; never returned in a message)
     account_ids: dict = field(default_factory=dict)
     token: str = ""
+    #: the hedge side (``hedge`` in gateway.json), None = venue side only
+    hedge: Optional[HedgeConfig] = None
 
     @property
     def missing(self) -> list[str]:
@@ -146,7 +319,7 @@ class GatewayConfig:
             elif self.network == "live" and is_paper_account(aid):
                 out.append(f"{env_name(a)} (a live account on a live gateway — this "
                            f"one is a paper account)")
-        if not self.contracts:
+        if not self.contracts and self.hedge is None:
             out.append("contracts in gateway.json")
         return out
 
@@ -162,7 +335,8 @@ class GatewayConfig:
                 "contracts": [c.as_dict() for c in self.contracts],
                 "complete": self.complete, "missing": self.missing,
                 "token_set": bool(self.token), "clients_allowed": list(self.clients),
-                "msgs_per_min": self.msgs_per_min}
+                "msgs_per_min": self.msgs_per_min,
+                "hedge": self.hedge.status() if self.hedge is not None else None}
 
 
 def gateways_dir() -> Path:
@@ -212,7 +386,7 @@ def parse_contract(raw) -> ContractSpec:
     sec = str(raw.get("sec_type") or "FUT").strip().upper()
     if sec not in SEC_TYPES:
         raise ConfigError(f"contract {sym}: sec_type {sec!r} — only {', '.join(SEC_TYPES)} "
-                          f"yet (options come later)")
+                          f"(e.g. XAUUSD SMART USD CMDTY; options come later)")
     return ContractSpec(sym, exch, str(raw.get("currency") or "USD").strip().upper(), sec)
 
 
@@ -255,6 +429,8 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         reject_pause_s=float(60.0 if raw.get("reject_pause_s") is None
                              else raw["reject_pause_s"]),
         clients=[str(c) for c in (raw.get("clients") or [])])
+    cfg.hedge = parse_hedge(raw.get("hedge"), network=network, accounts=accounts,
+                            listen_port=cfg.listen_port)
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -196,5 +197,58 @@ def run_strategy(strategy_dir: Path, type_name: Optional[str] = None,
     main = getattr(mod, "main", None)
     if main is None:
         return _refuse(f"strategy type {type_name!r} has no main()")
+    tee_terminal_log(d)
     rc = main()
     return int(rc or 0)
+
+
+class _Tee:
+    """A console stream that also writes every line to a log file."""
+
+    def __init__(self, stream, logf) -> None:
+        self._stream, self._logf = stream, logf
+
+    def write(self, text):
+        # the console first: a character it cannot encode raises here, and
+        # the caller's retry (arb_bot._log) then writes both once
+        n = self._stream.write(text)
+        try:
+            self._logf.write(text)
+        except (OSError, ValueError):
+            pass                        # the log file must never stop the bot
+        return n
+
+    def flush(self) -> None:
+        try:
+            self._logf.flush()
+        except (OSError, ValueError):
+            pass
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def tee_terminal_log(strategy_dir: Path) -> Optional[Path]:
+    """A bot launched by hand in a terminal logs into the strategy's
+    ``logs/`` folder too, as one the panel starts does (the panel shows the
+    newest file there for a bot it did not start). Only when the output IS
+    a console: the panel already sends it to a file. Returns the path."""
+    try:
+        if not sys.stdout.isatty():
+            return None
+    except (AttributeError, ValueError):
+        return None
+    log_dir = Path(strategy_dir) / "logs"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = log_dir / f"{Path(strategy_dir).parent.parent.name}_{Path(strategy_dir).name}_"                      f"{stamp}_terminal.log"
+    try:
+        log_dir.mkdir(exist_ok=True)
+        logf = open(path, "a", encoding="utf-8", buffering=1)
+    except OSError as e:
+        print(f"note: no log file ({e}) -- this terminal is the only log", flush=True)
+        return None
+    sys.stdout = _Tee(sys.stdout, logf)
+    sys.stderr = _Tee(sys.stderr, logf)
+    print(f"logging to {path} as well as this terminal", flush=True)
+    return path

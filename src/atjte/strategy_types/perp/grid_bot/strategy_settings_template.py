@@ -74,6 +74,7 @@ GRID_TAKE_PROFIT = None
 # −5.5 USD/oz measured 2026-09-01) — set this to the structural mean to sit
 # the grid around it instead of around zero.
 GRID_CENTER = 0.0
+GRID_DIRECTION = 'both'      # which side ENTERS: 'both' | 'long only' | 'short only' (exits always run)
 
 # Hard caps on the perp position (oz), each side. Entries are trimmed
 # deepest level first so resting orders can never fill past a cap — set
@@ -82,7 +83,6 @@ GRID_CENTER = 0.0
 # uncapped (GRID_LEVELS x GRID_UNIT_OZ). The collateral pool is shared with
 # the PAXG / BTC base-inventory shorts on the same account.
 MAX_POSITION_UNITS = 3          # long cap
-GRID_SHORT = True            # quote the short side too (a perp is short outright)
 MAX_SHORT_UNITS = None          # short cap; None = MAX_POSITION_OZ
 
 # --- Engine overrides (optional) ---

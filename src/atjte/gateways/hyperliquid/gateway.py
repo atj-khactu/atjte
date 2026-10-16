@@ -927,8 +927,16 @@ class HlGateway:
                                      f"{self._clock() - last:.0f}s ago — one purchase per "
                                      f"{RESERVE_COOLDOWN_S:g}s")
             # only at the limit, judged on a FRESH read: a stale page or a
-            # second click after the first one freed the account buys nothing
+            # second click after the first one freed the account buys nothing.
+            # A read that FAILS leaves the last verdict in place, so it buys
+            # nothing either (poll_quota only logs a failed read)
+            prev = self._quota.pop(account, None)
             self.poll_quota(force=True)
+            if account not in self._quota:
+                if prev is not None:
+                    self._quota.setdefault(account, prev)
+                raise GatewayRefusal(f"refused: the request quota of {account} could not "
+                                     f"be read just now — nothing bought")
             if account not in self._over_cap:
                 q = self._quota.get(account) or {}
                 raise GatewayRefusal(f"refused: {account} is not at its request limit"

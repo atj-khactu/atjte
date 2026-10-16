@@ -135,5 +135,54 @@ class TestCheckSubprocess(unittest.TestCase):
                 self.assertTrue((d / "strategy_settings.py").is_file())
 
 
+class TestTerminalLog(unittest.TestCase):
+    """A bot launched by hand in a terminal logged nowhere but the console."""
+
+    class _Console:
+        def __init__(self, tty):
+            self.tty, self.text, self.encoding = tty, [], "utf-8"
+
+        def isatty(self):
+            return self.tty
+
+        def write(self, s):
+            self.text.append(s)
+            return len(s)
+
+        def flush(self):
+            pass
+
+    def _run(self, tty):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        d = tmp / "proj" / "strategies" / "grid_bot"
+        d.mkdir(parents=True)
+        out, err = sys.stdout, sys.stderr
+        con = self._Console(tty)
+        sys.stdout, sys.stderr = con, self._Console(tty)
+        try:
+            path = R.tee_terminal_log(d)
+            print("hello from the bot", flush=True)
+            if path is not None:
+                sys.stdout._logf.close()
+                sys.stderr._logf.close()
+        finally:
+            sys.stdout, sys.stderr = out, err
+        return d, path, con
+
+    def test_a_console_is_teed_into_the_strategy_logs(self):
+        d, path, con = self._run(tty=True)
+        self.assertIsNotNone(path)
+        self.assertEqual(path.parent, d / "logs")
+        self.assertTrue(path.name.startswith("proj_grid_bot_") and path.suffix == ".log")
+        self.assertIn("hello from the bot", path.read_text(encoding="utf-8"))
+        self.assertIn("hello from the bot", "".join(con.text))      # the console still gets it
+
+    def test_output_already_going_to_a_file_is_left_alone(self):
+        d, path, con = self._run(tty=False)                 # the panel's redirect
+        self.assertIsNone(path)
+        self.assertFalse((d / "logs").exists())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

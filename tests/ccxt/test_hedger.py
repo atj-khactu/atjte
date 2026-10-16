@@ -61,11 +61,11 @@ def wait_for(cond, timeout=2.0):
 
 
 class EventHedgerTest(unittest.TestCase):
-    def hedger(self, mt5, live=True, to_units=lambda c: c):
+    def hedger(self, mt5, live=True, to_units=lambda c: c, volume_max=0.0):
         results, failures, logs = [], [], []
         h = EventHedger(place=mt5.place, symbol_venue="XAUT/USD:USD", to_units=to_units,
                         contract_size=100.0, volume_step=0.01, volume_min=0.01,
-                        threshold_units=1.0, live=live, started_utc=NOW - timedelta(seconds=5),
+                        threshold_units=1.0, live=live, volume_max=volume_max, started_utc=NOW - timedelta(seconds=5),
                         on_result=lambda *a: results.append(a),
                         on_failure=failures.append, log=logs.append)
         h.start()
@@ -86,6 +86,17 @@ class EventHedgerTest(unittest.TestCase):
         self.assertEqual(h.counters["hedges"], 1)
         self.assertAlmostEqual(h.residue_units, 0.0)
         self.assertTrue(any("HEDGE (event) sell 0.04 lot" in l for l in logs), logs)
+
+    def test_a_whole_lot_reached_by_float_sums_is_hedged(self):
+        """PAXG perp 2026-10-15 02:20: a 0.227 residue plus fills summed in
+        floating point reached 0.99999999 units for a whole 1 oz lot; read
+        as 'under one lot' it was carried and never hedged."""
+        mt5 = FakeMt5()
+        h, _r, _f, _l = self.hedger(mt5)
+        h.rebase(0.1 + 0.2 + 0.7 - 2.0, "test")     # -1.0000000000000002 + float noise
+        h.submit(fill("t1", "sell", 1e-12))         # a sliver of a fill wakes it
+        self.assertTrue(wait_for(lambda: mt5.orders))
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.01)])
 
     def test_one_mgc_contract_is_hedged_as_ten_oz(self):
         """A venue fill counts contracts (MGC: 10 oz each); at HEDGE_RATIO 1
@@ -187,10 +198,48 @@ class EventHedgerTest(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertEqual(h.counters["failures"], 1)
         self.assertTrue(any("quotes down" in l for l in logs))
+        # the refused delta stays OWED: the residue keeps it (it used to be
+        # dropped, and a reconciler hedge's parity_sent then left the
+        # residue off by the refused fill)
+        self.assertAlmostEqual(h.residue_units, -2.0)
         mt5.fail = False                        # the broker is back: the next fill hedges
-        h.submit(fill("t2", "buy", 2.0))
+        h.submit(fill("t2", "buy", 2.0))        # ... with what the refusal left owed
         self.assertTrue(wait_for(lambda: mt5.orders))
-        self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.02)])
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.04)])
+
+    def test_a_hedge_over_volume_max_is_split_into_orders_the_broker_takes(self):
+        mt5 = FakeMt5()
+        h, results, failures, logs = self.hedger(mt5, volume_max=1.0)
+        h.submit(fill("t1", "buy", 250.0))                  # 2.5 lot, max 1 lot an order
+        self.assertTrue(wait_for(lambda: len(results) == 3))
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 1.0), (OrderSide.SELL, 1.0),
+                                      (OrderSide.SELL, 0.5)])
+        self.assertEqual([r[1] for r in results], [1.0, 1.0, 0.5])   # each booked
+        self.assertEqual(failures, [])
+        self.assertAlmostEqual(h.residue_units, 0.0)
+        self.assertEqual(h.counters["split_orders"], 3)
+
+    def test_a_refusal_mid_split_books_only_what_filled_and_owes_the_rest(self):
+        mt5 = FakeMt5()
+        sent = []
+
+        def place(side, lots):
+            if len(sent) == 1:
+                raise RuntimeError("order rejected: retcode=10014 'Invalid volume'")
+            sent.append(lots)
+            return real(side, lots)
+        real, mt5.place = mt5.place, place
+        h, results, failures, logs = self.hedger(mt5, volume_max=1.0)
+        h.submit(fill("t1", "buy", 250.0))
+        self.assertTrue(wait_for(lambda: failures))
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 1.0)])
+        self.assertEqual([r[1] for r in results], [1.0])    # the hedge book: 1 lot, not 2.5
+        self.assertAlmostEqual(h.residue_units, -150.0)     # 1.5 lot still owed
+        self.assertEqual(h.counters["partial"], 1)
+        self.assertTrue(any("1 lot filled before it stopped" in l for l in logs), logs)
+        # the reconciler sends the rest by parity: the residue lands on zero
+        h.parity_sent(-150.0, "reconcile hedge")
+        self.assertTrue(wait_for(lambda: abs(h.residue_units) < 1e-9))
 
     def test_dry_run_sends_nothing_but_says_what_it_would(self):
         mt5 = FakeMt5()

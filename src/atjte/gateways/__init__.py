@@ -60,19 +60,34 @@ def template_dir(kind: str) -> Path:
     return Path(__file__).resolve().parent / "templates" / kind
 
 
-#: the gateway kinds that serve the HEDGE leg (``MT5_CLIENT``), all on the MT5 wire
-HEDGE_KINDS = ("mt5", "ctrader")
+#: the gateway kinds that serve the HEDGE leg (``MT5_CLIENT``), all on the MT5
+#: wire — an IBKR gateway serves it on its ``hedge`` port
+HEDGE_KINDS = ("mt5", "ctrader", "ibkr")
+
+
+def _ibkr_hedge_port(raw: dict) -> int:
+    """An IBKR gateway.json's hedge port (0 = it serves no hedge)."""
+    h = raw.get("hedge")
+    if not isinstance(h, dict) or not h.get("symbols"):
+        return 0
+    from .ibkr.config import HEDGE_LISTEN_PORTS
+    return int(h.get("listen_port")
+               or HEDGE_LISTEN_PORTS.get(str(raw.get("network") or "paper"), 0))
 
 
 def hedge_kind_of_port(port: int) -> str:
-    """``"ctrader"`` when a cTrader gateway instance listens on ``port``, else
-    ``"mt5"`` — for a caller that knows only a hedge gateway's port."""
+    """``"ctrader"`` when a cTrader gateway instance listens on ``port``,
+    ``"ibkr"`` when it is an IBKR gateway's hedge port, else ``"mt5"`` — for
+    a caller that knows only a hedge gateway's port."""
     import json
-    d = instances_root() / "ctrader"
-    for cfg in (sorted(d.glob("*/gateway.json")) if d.is_dir() else ()):
-        try:
-            if int(json.loads(cfg.read_text(encoding="utf-8")).get("listen_port") or 0) == int(port):
-                return "ctrader"
-        except (OSError, ValueError, TypeError):
-            continue
+    for kind in ("ctrader", "ibkr"):
+        d = instances_root() / kind
+        for cfg in (sorted(d.glob("*/gateway.json")) if d.is_dir() else ()):
+            try:
+                raw = json.loads(cfg.read_text(encoding="utf-8"))
+                p = _ibkr_hedge_port(raw) if kind == "ibkr" else int(raw.get("listen_port") or 0)
+                if p and p == int(port):
+                    return kind
+            except (OSError, ValueError, TypeError):
+                continue
     return "mt5"

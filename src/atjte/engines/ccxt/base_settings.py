@@ -187,7 +187,9 @@ MT5_TICK_POLL_S = 0.01          # MT5 tick poll between events (s, local IPC)
 # size ORDER_OPS_PER_S below, and a gateway's ops_per_s, for the tick rate.
 REQUOTE_MIN_MOVE = 0.25
 ORDER_OPS_BURST = 10.0       # token bucket: max burst of order API calls
-ORDER_OPS_PER_S = 1.5        # sustained order-call rate (amend=1, cancel/replace=2)
+# sustained order-call rate (amend=1, cancel/replace=2). None = by venue:
+# 20/s on IBKR and on a Kraken FIX gateway, 10/s elsewhere; a number wins.
+ORDER_OPS_PER_S = None
 ORDERS_SAFETY_POLL_S = 30.0  # REST open-orders backstop for missed ws fills
 SETTLE_GRACE_S = 2.0         # wait this long for the ws fill before REST-settling
                              # an order that left the book (avoids double booking)
@@ -235,6 +237,22 @@ PANEL_LEASE_S = 60.0
 # min lot (read from the terminal at start, in base units).
 # MT5_MAGIC (the hedge book's tag, unique per PROJECT) is identity: it is
 # in project_settings.py, allocated by the control panel.
+# A hedge bigger than the symbol's volume_max is sent as several orders of
+# at most volume_max lots; one needing more than 20 is refused unsent (a
+# sizing error, not a fill). A refusal whose retcode says the request itself
+# is wrong (10014 invalid volume, ...) is not resent unchanged: the same
+# hedge is held for MT5_REFUSED_HOLD_S and the refusal is the bot's error.
+MT5_REFUSED_HOLD_S = 600.0
+# Startup refuses a LIVE start when SYMBOL_MT5 holds positions of ANOTHER
+# magic on the side this bot's startup hedge would add to: that is how an
+# inherited hedge book looks (a project whose MT5_MAGIC changed, tickets
+# opened by hand) -- the bot cannot see it and would hedge on top of it.
+# Close or re-tag those tickets, or list their magics here: their positions
+# then COUNT as this bot's hedge book (parity, reconcile, the risk ledger).
+# The bot never closes them (the gateway closes only its own magic's tickets;
+# on a hedging account a reducing hedge opens a new opposite ticket), and a
+# NETTING account still refuses another magic. e.g. [77001].
+MT5_ADOPT_MAGICS = []
 MT5_DEVIATION_POINTS = 20
 HEDGE_THRESHOLD_UNITS = 1.0
 # HOW the fill is hedged:
@@ -256,6 +274,48 @@ HEDGE_THRESHOLD_UNITS = 1.0
 #               between the fill and the MT5 order.
 # Startup and the reconciler always hedge by parity, whichever mode.
 HEDGE_MODE = 'event'
+
+# --- Execution: resting limit quotes, or a MARKET PAIR ---
+# 'limit' (the default) rests post-only quotes on the venue and hedges each
+# fill on MT5. 'market' rests nothing: when an order's basis trigger arms,
+# the bot fires a MARKET order on the venue AND the opposite MT5 market
+# order AT THE SAME TIME (the hedge goes through the event hedger the moment
+# the venue order is sent, not when its fill comes back). The basis it
+# judges is the EXECUTABLE one: a buy pays the venue ask and sells MT5 at
+# the bid, a sell takes the venue bid and buys MT5 at the ask. If one leg is
+# refused, the other stands: quotes come down (hedge_ok) and the
+# reconciler's re-check (RECONCILE_RECHECK_DELAY_S) fixes the exposure from
+# both legs' real positions. Needs a venue connector that trades market
+# orders (atjte.clients.gateway.MT5VenueClient) and HEDGE_MODE = 'event'.
+# Dry run (LIVE_TRADING = False) PAPER-TRADES: each fire is simulated at both
+# legs' touch, the paper position drives the grid, and every paper pair is
+# logged and appended to report/paper_trades.jsonl.
+EXECUTION_MODE = 'limit'
+
+# --- End-of-day close (EXECUTION_MODE 'market'; None = off) ---
+# At this time every day ('HH:MM' UTC, or 'HH:MM Area/City' in that zone's
+# clock, e.g. '22:30 Europe/Prague') the bot closes its position in ROUNDS:
+# one market pair per round (the venue leg and the opposite MT5 leg), each
+# the order size (ORDER_VOLUME / one grid level), regardless of the basis.
+# After EVERY round it re-reads both legs and goes on only when the venue
+# position moved by the round's size and the MT5 hedge still matches it; a
+# round that does not check out within EOD_ROUND_TIMEOUT_S stops the close
+# (the reconciler repairs the hedge, a person looks). From the close time
+# no new entries are opened until the MT5 symbol's daily break is over (the
+# first reopen after the close; EOD_RESUME_MAX_H at the latest). Choose a
+# time that leaves the rounds room before the hedge market's daily break
+# (IC XAUUSD: about 22:58-00:01 Prague).
+EOD_CLOSE_AT = None
+EOD_ROUND_TIMEOUT_S = 10.0
+EOD_ROUND_DELAY_S = 5.0    # at least this long between two rounds' orders (s)
+EOD_RESUME_MAX_H = 3.0
+# The hedge market's daily ROLLOVER (same format; None = the close time +
+# 30 min) - what the close exists to avoid. Closing rounds run from
+# EOD_CLOSE_AT until the rollover, also on a bot started late (22:45 still
+# closes); past the rollover nothing is closed. Entries are held from the
+# close time until the hedge symbol TICKS after the rollover (its daily
+# break is over), which a freshly started bot sees on its first tick.
+EOD_ROLLOVER_AT = None
 # What the hedge writes in the MT5 order's comment field — what you read in
 # the terminal's Trade/History tabs beside each ticket. Empty = "hedge
 # <market> <strategy key>" ("hedge XYZ-EUR grid"). MT5 truncates the comment at 31 characters, and some
@@ -270,7 +330,10 @@ MT5_COMMENT = ""
 # fixing hedge. Then wait a full interval before the next check.
 RECONCILE_INTERVAL_S = 900.0     # 15 minutes
 RECONCILE_RECHECK_DELAY_S = 15.0
-RECONCILE_TOLERANCE_UNITS = 1.0  # >= one broker min lot in base units; None = one MT5 min lot
+# In VENUE units, so a fixed number means very different exposure per
+# market: 1 unit is one XAUUSD min lot but ~157 JP225 lots. None (the
+# default) = one MT5 min lot, read from the terminal at start.
+RECONCILE_TOLERANCE_UNITS = None  # >= one broker min lot in base units; None = one MT5 min lot
 
 # --- Basis trigger (ON by default; sample_project-style signal entries) ---
 # True (the default) = an order is SUBMITTED only while
@@ -286,6 +349,26 @@ RECONCILE_TOLERANCE_UNITS = 1.0  # >= one broker min lot in base units; None = o
 BASIS_TRIGGER = True
 BASIS_WINDOW_S = 5.0        # rolling basis-average window (s)
 BASIS_RELEASE = 0.25    # pull the quote once avg is this far back inside
+# What ARMS an order: 'avg' = the window's average is through the level (as
+# above); 'min/max' = the WHOLE window is - a buy only when the HIGHEST bid
+# basis of the last BASIS_WINDOW_S is at/below its level, a sell only when
+# the LOWEST ask basis is at/above it. A blip (a stale MT5 quote while CME
+# moves: GC 2026-10-14 07:48, IC 1.9 s old) can drag an average through the
+# level; it never holds the whole window. Stricter, so fewer and later
+# fills. Once armed, the order is released on the AVERAGE as before
+# (BASIS_RELEASE back inside), so it does not flicker on one tick.
+BASIS_TRIGGER_MODE = 'avg'
+# Which prices the basis trigger's samples are made of — what the trigger
+# compares with each level (k = HEDGE_RATIO, "hedge" = the MT5 leg):
+#   'limit-market'  (the default) a resting LIMIT quote hedged at market:
+#                   buy  basis = venue bid - k * hedge bid
+#                   sell basis = venue ask - k * hedge ask
+#   'market-market' a MARKET order on both legs (EXECUTION_MODE 'market'):
+#                   buy  basis = venue ask - k * hedge bid
+#                   sell basis = venue bid - k * hedge ask
+#                   -- the spread a pair actually executes at
+#   'mid-mid'       both sides = venue mid - k * hedge mid
+BASIS_MODE = 'limit-market'
 
 # --- Limit-price optimisation off the basis average (None = off) ---
 # An order (entry or exit) whose spread level the rolling BASIS_WINDOW_S
@@ -308,6 +391,43 @@ OPTIMIZE_LIMIT_OFFSET = None
 # the average's better price and waiting for the spread to come back to it.
 # Maker orders are optimised either way.
 OPTIMIZE_LIMIT_TAKER = True
+# Minimum distance (venue PRICE points, not spread points) a resting maker
+# order keeps from the OPPOSITE side's top of book: a sell never below
+# best bid + this, a buy never above best ask − this. A level already
+# through the market is clamped here instead of to one tick inside the
+# opposite side (e.g. a sell priced at 3,500 with the best bid at 3,550 and
+# MIN_TOB_SPREAD = 0.2 rests at 3,550.2, not 3,550.1). Rounded UP to the
+# venue's tick; never less than one tick. A level further from the book
+# than this is left where it is. Taker orders and the de-risk exit (priced
+# at the touch) are not affected. None = one tick (the old behaviour).
+MIN_TOB_SPREAD = None
+# Seconds after ANY fill during which NO order is quoted - entries and exits
+# alike (resting ones are cancelled, none placed); the margin de-risk exit is
+# exempt. Stops the bot re-offering into the sweep that just filled it (GC
+# 2026-10-14 12:13: an exit and the next entry rest at the same price; a
+# buyer took the exit, the bot re-offered the entry at the pre-move price and
+# was swept again 0.17 below its level). None/0 = off.
+MIN_ORDER_INTERVAL_S = None
+
+# --- Price reference (EXPERIMENTAL) ---
+# What the quotes are PRICED off: 'mt5' (default) = the MT5 tick, as always;
+# 'ibkr' = IBKR's own quote for the hedge instrument (REF_SYMBOL, e.g. IBKR's
+# spot XAUUSD), which updates more often and earlier than the MT5 broker's
+# feed on this server. The HEDGE is always MT5 - only the price the levels
+# are measured against changes. The IBKR mid is put in MT5 terms by a rolling
+# median of (MT5 mid - IBKR mid) over REF_OFFSET_WINDOW_S, and the MT5 half
+# spread is added back side-aware (a buy is hedged at the MT5 bid, a sell at
+# the ask). Nothing is quoted until REF_OFFSET_MIN_S of that offset has been
+# measured, nor while the reference is down or unchanged for REF_STALE_S -
+# quotes come down, never a silent fall-back to MT5 pricing. Needs an IBKR
+# venue (EXCHANGE_ID 'ibkr') whose gateway lists REF_SYMBOL (gateway.json
+# contracts: {"symbol": "XAUUSD", "exchange": "SMART", "sec_type": "CMDTY"}).
+# Back to the normal behaviour: PRICE_REFERENCE = 'mt5' and restart the bot.
+PRICE_REFERENCE = 'mt5'
+REF_SYMBOL = 'XAUUSD/USD'
+REF_OFFSET_WINDOW_S = 300.0
+REF_OFFSET_MIN_S = 60.0
+REF_STALE_S = 30.0
 
 # --- Spread entry window (absolute; None on an edge = that edge open) ---
 # NEW entries on BOTH sides rest only while the live mid-spread (venue mid −
@@ -579,7 +699,9 @@ ERROR_BACKOFF_S = 30.0
 # resumes once a re-check is clean.
 POSITION_RECONCILE_INTERVAL_S = 300.0      # slow-cadence pos_units-vs-venue check
 POSITION_RECHECK_S = 5.0                   # re-check sooner while a divergence is open
-POSITION_RECONCILE_TOLERANCE_UNITS = 0.5   # |pos_units - venue position| above this = diverged
+# In VENUE units like the hedge gates (warned about the same way when it is
+# worth more than a few MT5 min lots); None = half an MT5 min lot.
+POSITION_RECONCILE_TOLERANCE_UNITS = None  # |pos_units - venue position| above this = diverged
 
 # --- Account (optional) ---
 # The GATEWAY ACCOUNT this project trades: one of the accounts its gateway

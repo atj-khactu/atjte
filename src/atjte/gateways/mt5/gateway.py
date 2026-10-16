@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from atjte.clients.base import OrderType
+from atjte.clients.base import Order, OrderSide, OrderStatus, OrderType, PositionSide
 
 from . import protocol as P
 
@@ -75,6 +75,8 @@ class _Client:
     ready_sent: Optional[bool] = None
     #: reads only (a backfill): no hedges, no closes
     readonly: bool = False
+    #: the symbols this client has TRADED (a netting account allows one)
+    traded: set = field(default_factory=set)
     send_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def overdue(self, now: float) -> bool:
@@ -353,6 +355,51 @@ class MT5Gateway:
             raise Refusal(f"the terminal cannot hedge: {self.session()['reason']}",
                           "unavailable")
 
+    #: how long the account's margin mode is cached (it never changes while
+    #: the terminal stays on one account)
+    NETTING_TTL_S = 300.0
+
+    def _netting(self) -> bool:
+        """Whether the account NETS positions (one position per symbol:
+        MT5 retail netting / exchange). Unknown (a backend whose account
+        says no margin mode) = hedging, the safe reading for the others."""
+        now = self._clock()
+        cached = getattr(self, "_netting_cache", None)
+        if cached is not None and now - cached[0] < self.NETTING_TTL_S:
+            return cached[1]
+        raw = getattr(self._backend("get_account"), "raw", None)
+        mode = raw.get("margin_mode") if isinstance(raw, dict) else None
+        netting = mode in (0, 1)
+        self._netting_cache = (now, netting)
+        return netting
+
+    def _netting_guard(self, c: _Client, symbol: str) -> None:
+        """A NETTING account holds ONE position per symbol, tagged with the
+        magic of the order that opened it: two bots trading one symbol there
+        would each read the shared position as someone else's, and each
+        re-hedge on top of the other in a loop. So on a netting account a
+        symbol has ONE trader: an order is refused when another client has
+        traded the symbol on this gateway, or when the symbol's position
+        carries another magic (a bot not attached right now, a manual trade)."""
+        if not self._netting():
+            return
+        with self._lock:
+            other = next((o.name for o in self._clients.values()
+                          if o is not c and not o.readonly and o.magic != c.magic
+                          and symbol in o.traded), None)
+        if other:
+            raise Refusal(f"{symbol} on this NETTING account is already traded by {other} "
+                          f"— one position per symbol, so one bot per symbol: hedge "
+                          f"{c.name} on a hedging account", "invalid_order")
+        for p in self._backend("get_positions", symbol) or ():
+            magic = (p.raw or {}).get("magic") if isinstance(getattr(p, "raw", None), dict) \
+                else None
+            if magic is not None and int(magic) != c.magic:
+                raise Refusal(f"{symbol} on this NETTING account holds a position of magic "
+                              f"{magic}, not {c.name}'s ({c.magic}) — an order would net "
+                              f"into it; close it or hedge {c.name} on a hedging account",
+                              "invalid_order")
+
     def _place(self, c: _Client, args: list, kwargs: dict) -> Any:
         order_type = kwargs.get("order_type", args[3] if len(args) > 3 else OrderType.MARKET)
         if order_type is not OrderType.MARKET:
@@ -360,10 +407,83 @@ class MT5Gateway:
                           f"{getattr(order_type, 'value', order_type)}) — the engine never "
                           f"rests an MT5 order, and nothing here would pull one")
         self._refuse_if_unfit()
+        symbol = str(args[0] if args else kwargs.get("symbol"))
+        self._netting_guard(c, symbol)
+        c.traded.add(symbol)
         # the order is the CALLER's, whatever the call said
         kwargs["magic"] = c.magic
         self.counters["hedges"] += 1
+        if self._hedging():
+            return self._place_closing_first(c, symbol, args, kwargs)
         return self._backend("place_order", *args, **kwargs)
+
+    def _hedging(self) -> bool:
+        """Whether the account HEDGES (one ticket per order: MT5 retail
+        hedging, margin mode 2). Unknown = no (the order goes as it is)."""
+        now = self._clock()
+        cached = getattr(self, "_hedging_cache", None)
+        if cached is not None and now - cached[0] < self.NETTING_TTL_S:
+            return cached[1]
+        raw = getattr(self._backend("get_account"), "raw", None)
+        hedging = (raw.get("margin_mode") == 2) if isinstance(raw, dict) else False
+        self._hedging_cache = (now, hedging)
+        return hedging
+
+    def _place_closing_first(self, c: _Client, symbol: str, args: list,
+                             kwargs: dict) -> Any:
+        """A hedging account books an order against the caller's position as
+        a NEW opposite ticket — which needs free margin, so a hedge that only
+        REDUCES exposure was refused 'No money' on an account short of margin
+        (2026-10-15 05:13, GC: the IBKR leg sold, the IC buy could not follow,
+        100 oz unhedged). So an order first CLOSES the caller's opposite
+        tickets on the symbol, oldest first (a partial close where the last
+        is larger than what is left) — closing frees margin instead of using
+        it — and only what is left over opens a new ticket."""
+        side = args[1] if len(args) > 1 else kwargs.get("side")
+        amount = float(args[2] if len(args) > 2 else kwargs.get("amount") or 0.0)
+        opposite = PositionSide.SHORT if side is OrderSide.BUY else PositionSide.LONG
+        tickets = sorted(
+            (p for p in (self._backend("get_positions", symbol) or ())
+             if p.side is opposite and isinstance(p.raw, dict)
+             and int(p.raw.get("magic") or 0) == c.magic),
+            key=lambda p: int(p.position_id))
+        left = round(amount, 8)
+        done, cost, last = 0.0, 0.0, None
+        closed = []
+        base = {k: v for k, v in kwargs.items() if k not in ("order_type", "price")}
+        for p in tickets:
+            if left <= 1e-9:
+                break
+            vol = round(min(left, float(p.size)), 8)
+            o = self._backend("place_order", symbol, side, vol, OrderType.MARKET,
+                              **{**base, "position": p.position_id})
+            filled = float(o.filled or 0.0)
+            px = (o.raw or {}).get("price") if isinstance(o.raw, dict) else None
+            done += filled
+            cost += filled * float(px or 0.0)
+            left = round(left - filled, 8)
+            closed.append(p.position_id)
+            last = o
+            if filled <= 0:
+                break
+        if left > 1e-9:
+            o = self._backend("place_order", symbol, side, left, OrderType.MARKET, **base)
+            filled = float(o.filled or 0.0)
+            px = (o.raw or {}).get("price") if isinstance(o.raw, dict) else None
+            done += filled
+            cost += filled * float(px or 0.0)
+            last = o
+        if not closed:
+            return last
+        self.counters["closes"] = self.counters.get("closes", 0) + len(closed)
+        avg = (cost / done) if done else None
+        raw = dict(last.raw) if isinstance(last.raw, dict) else {}
+        raw.update({"price": avg, "closed_tickets": closed})
+        return Order(exchange=last.exchange, order_id=last.order_id, symbol=symbol, side=side,
+                     type=OrderType.MARKET, amount=amount, filled=done,
+                     remaining=max(0.0, amount - done),
+                     status=OrderStatus.FILLED if done >= amount - 1e-9 else last.status,
+                     timestamp=last.timestamp, raw=raw)
 
     def _close_by(self, c: _Client, args: list, kwargs: dict) -> Any:
         ids = [str(args[i]) if len(args) > i else str(kwargs.get(k))

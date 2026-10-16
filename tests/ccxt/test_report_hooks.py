@@ -236,6 +236,58 @@ class ReportHooksTest(unittest.TestCase):
         bot._report(now + 3, final=True)
         self.assertFalse(json.loads(rep.snapshot_file.read_text())["alive"])
 
+    def _catch_up(self, trades, seed_ts=1_800_000_000.0, live=True):
+        """The start-up catch-up against a venue whose history is ``trades``
+        (CCXT dicts), with the report's seed at ``seed_ts``."""
+        bot = bot_with_reporter(self.tmp)
+        (self.tmp / "report").mkdir(exist_ok=True)
+        if seed_ts is not None:
+            (self.tmp / "report" / R.SEED_FILE).write_text(json.dumps(
+                {"schema": R.SCHEMA, "ts": seed_ts, "venue": {"pos": 0.0, "avg_price": None},
+                 "mt5": {"lots": 0.0, "avg_price": None, "contract": None}}), encoding="utf-8")
+        calls = []
+
+        def fetch_my_trades(symbol, since=None, limit=None, params=None):
+            calls.append(since)
+            return [t for t in trades if since is None or t["timestamp"] >= since]
+        bot.venue = types.SimpleNamespace(
+            exchange=types.SimpleNamespace(fetch_my_trades=fetch_my_trades),
+            base="BTC", quote="USDT")
+        orig = (pb.STRATEGY_DIR, pb.LIVE_TRADING)
+        pb.STRATEGY_DIR, pb.LIVE_TRADING = self.tmp, live
+        try:
+            bot._catch_up_fills() if live else bot._start_fill_catch_up()
+        finally:
+            pb.STRATEGY_DIR, pb.LIVE_TRADING = orig
+        return calls, [r for r in R.Report(self.tmp).fills()]
+
+    @staticmethod
+    def _t(tid, ts_s, side="buy"):
+        return {"id": tid, "order": "o9", "symbol": pb.SYMBOL_VENUE, "side": side,
+                "amount": 1.0, "price": 4450.0, "timestamp": int(ts_s * 1000),
+                "fee": {"cost": 0.1, "currency": "USDT"}, "info": {}}
+
+    def test_start_up_books_the_fills_made_while_the_bot_was_down(self):
+        seed = 1_800_000_000.0
+        calls, fills = self._catch_up([self._t("before-seed", seed - 60),
+                                       self._t("down-1", seed + 3600),
+                                       self._t("down-2", seed + 7200, "sell")], seed)
+        self.assertEqual(calls[0], int(seed * 1000))             # from the seed, not before
+        self.assertEqual([(f["id"], f["source"]) for f in fills],
+                         [("down-1", "catchup"), ("down-2", "catchup")])
+        # a second start reads from the newest fill on file, books nothing twice
+        calls, fills = self._catch_up([self._t("down-1", seed + 3600),
+                                       self._t("down-2", seed + 7200, "sell"),
+                                       self._t("down-3", seed + 9000)], seed)
+        self.assertEqual(calls[0], int((seed + 7200 - pb.ArbBot.FILL_CATCHUP_OVERLAP_S) * 1000))
+        self.assertEqual([f["id"] for f in fills], ["down-1", "down-2", "down-3"])
+
+    def test_no_catch_up_without_a_seed_or_in_a_dry_run(self):
+        calls, fills = self._catch_up([self._t("x", 1_800_000_100.0)], seed_ts=None)
+        self.assertEqual((calls, fills), ([], []))               # a first start: nothing
+        calls, fills = self._catch_up([self._t("x", 1_800_000_100.0)], live=False)
+        self.assertEqual((calls, fills), ([], []))               # dry run: never real fills
+
     def test_no_reporter_is_a_no_op(self):
         bot = T.make_bot()
         bot._report(time.time())

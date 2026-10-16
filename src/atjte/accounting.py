@@ -134,6 +134,11 @@ def inferred_fill(f: dict) -> bool:
     The engine ids those ``<order>:<reason>:<quantity>`` because the venue
     never reported one, so they can never carry the venue's realized PnL
     and must not be read as a gap in what the venue served."""
+    if f.get("venue") == "mt5":
+        # an MT5 quote leg trades MARKET orders: the order's answer IS the
+        # fill, at the deal price — never a guess (2026-10-15: every
+        # XAUUSD247.i fill read as inferred and its realized PnL as 0)
+        return False
     if f.get("inferred"):
         return True
     order = f.get("order")

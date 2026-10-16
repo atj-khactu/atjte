@@ -15,7 +15,7 @@
   "heartbeat_s": 60,
   "rollover_utc": "22:00",
   "rollover_grace_s": 120,
-  "ops_per_s": 1.5,
+  "ops_per_s": 20,
   "market_data": true,
   "symbol_default": "",
   "tls_verify": true,

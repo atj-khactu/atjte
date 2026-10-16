@@ -266,7 +266,7 @@ def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
             reasons.append(f"daily loss limit hit (today {shown} USD <= -{cap:g})")
     for cap_raw, traded, flag, label in (
             (max_venue_volume_usd, day.venue_volume_usd,
-             "venue_volume_latched", "the crypto venue"),
+             "venue_volume_latched", "the quote exchange"),
             (max_mt5_volume_usd, day.mt5_volume_usd,
              "mt5_volume_latched", "MT5")):
         if not cap_raw or cap_raw <= 0:
@@ -274,6 +274,13 @@ def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
         cap = float(cap_raw)
         if traded >= cap:
             setattr(day, flag, True)
+        elif getattr(day, flag):
+            # traded volume never falls: a latch below the CURRENT cap was
+            # set under a lower one the operator has since raised (GC
+            # 2026-10-14: latched at a 2M cap, raised to 10M, still
+            # close-only at 5.4M). The volume latch follows the cap; the
+            # LOSS latch stays sticky, a PnL that recovers must not re-open
+            setattr(day, flag, False)
         if getattr(day, flag):
             reasons.append(f"daily {label} volume limit hit "
                            f"({traded:,.0f} USD >= {cap:,.0f})")

@@ -70,6 +70,11 @@ ORDER_VOLUME = 1.0
 # the position, untagged as an exit) is withheld until flat — so a
 # take-profit wider than 2 x step is honoured, not cut short by that entry.
 GRID_TAKE_PROFIT = None
+GRID_FIRST_OFFSET = None     # distance of each side's FIRST level from the center
+                             # (spread points); None = one GRID_STEP. Half a step
+                             # (step 1 -> 0.5): buy at center -0.5, -1.5, ... and sell
+                             # at +0.5, +1.5, ... -- no step skipped around the center.
+                             # Must be > 0 (at 0 both sides would meet at the center).
 
 # Center of the grid (spread points). 0.0 = the grid the task describes
 # (buy at −1 / sell at +1). A market that structurally trades at a premium or a discount to the CFD
@@ -84,7 +89,7 @@ GRID_CENTER = 0.0
 # uncapped (GRID_LEVELS x GRID_LEVEL_UNITS). The collateral pool is shared with
 # the PAXG / BTC base-inventory shorts on the same account.
 MAX_POSITION_UNITS = 3          # long cap
-GRID_SHORT = True            # quote the short side too (a perp is short outright)
+GRID_DIRECTION = 'both'      # which side ENTERS: 'both' | 'long only' | 'short only' (exits always run)
 MAX_SHORT_UNITS = None          # short cap; None = MAX_POSITION_UNITS
 
 # --- Engine overrides (optional) ---
@@ -101,6 +106,8 @@ MAX_SHORT_UNITS = None          # short cap; None = MAX_POSITION_UNITS
 BASIS_TRIGGER = True         # default ON (orders go in only when the basis average is through their level)
 BASIS_WINDOW_S = 5.0         # rolling basis-average window (s)
 BASIS_RELEASE = 0.25     # hysteresis before a live quote is pulled (spread points)
+BASIS_TRIGGER_MODE = 'avg'   # 'avg' | 'min/max' = the whole window through the level arms it
+BASIS_MODE = 'limit-market'  # basis prices: 'limit-market' | 'market-market' (market orders on both legs) | 'mid-mid'
 
 # Limit-price optimisation off the basis average (engine feature; None =
 # off). When the BASIS_WINDOW_S average is already THROUGH an order's grid

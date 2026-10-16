@@ -159,6 +159,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import queue
 import re
@@ -374,6 +375,14 @@ _WANTS_FIX = ORDER_TRANSPORT == "fix" or any(
 VENUE_CLIENT = (_aliases.connector_path(str(_cfg("VENUE_CLIENT") or "").strip())
                 or _venues.gateway_connector(EXCHANGE_ID, fix=_WANTS_FIX))
 VENUE_CLIENT_OPTIONS = dict(_cfg("VENUE_CLIENT_OPTIONS") or {})
+#: ORDER_OPS_PER_S = None: by venue (base_settings); the gateway's own budget
+#: (IBKR 40 msgs/s, a FIX gateway's ops_per_s) still applies on top
+ORDER_OPS_FAST_PER_S, ORDER_OPS_DEFAULT_PER_S = 20.0, 10.0
+if ORDER_OPS_PER_S is None:
+    ORDER_OPS_PER_S = (ORDER_OPS_FAST_PER_S
+                       if EXCHANGE_ID == "ibkr" or "FixClient" in VENUE_CLIENT
+                       else ORDER_OPS_DEFAULT_PER_S)
+ORDER_OPS_PER_S = float(ORDER_OPS_PER_S)
 # the named account (a gateway account), blank = the gateway's "main"
 ACCOUNT = str(_cfg("ACCOUNT") or "")
 if ACCOUNT and "account" not in VENUE_CLIENT_OPTIONS:
@@ -386,6 +395,11 @@ REDUCE_ONLY_EXITS = bool(_cfg("REDUCE_ONLY_EXITS"))
 ALLOW_TAKER_ENTRY = bool(_cfg("ALLOW_TAKER_ENTRY"))
 ALLOW_TAKER_EXIT = bool(_cfg("ALLOW_TAKER_EXIT"))
 MT5_MAGIC = _cfg("MT5_MAGIC")
+#: other magics whose SYMBOL_MT5 positions count as this bot's hedge book
+MT5_ADOPT_MAGICS = tuple(int(m) for m in (_cfg("MT5_ADOPT_MAGICS") or ()))
+if MT5_MAGIC is not None and int(MT5_MAGIC) in MT5_ADOPT_MAGICS:
+    raise RuntimeError(f"MT5_ADOPT_MAGICS lists this bot's own MT5_MAGIC ({MT5_MAGIC})")
+MT5_REFUSED_HOLD_S = float(_cfg("MT5_REFUSED_HOLD_S") or 0.0)
 MT5_DEVIATION_POINTS = _cfg("MT5_DEVIATION_POINTS")
 MT5_COMMENT = str(_cfg("MT5_COMMENT") or "").strip()
 #: MT5 truncates an order comment at 31 characters
@@ -397,6 +411,98 @@ HEDGE_THRESHOLD_UNITS = _cfg("HEDGE_THRESHOLD_UNITS")
 HEDGE_MODE = str(_cfg("HEDGE_MODE") or "parity").strip().lower()
 if HEDGE_MODE not in ("event", "parity"):
     raise RuntimeError(f"HEDGE_MODE = {HEDGE_MODE!r} is not 'event' or 'parity'")
+# 'limit' (resting quotes) | 'market' (a market PAIR on both legs at once)
+EXECUTION_MODE = str(_cfg("EXECUTION_MODE") or "limit").strip().lower()
+if EXECUTION_MODE not in ("limit", "market"):
+    raise RuntimeError(f"EXECUTION_MODE = {EXECUTION_MODE!r} is not 'limit' or 'market'")
+MARKET_PAIR = EXECUTION_MODE == "market"
+if MARKET_PAIR and HEDGE_MODE != "event":
+    raise RuntimeError("EXECUTION_MODE = 'market' sends the hedge alongside the venue "
+                       "order through the event hedger — set HEDGE_MODE = 'event'")
+# the prices the basis trigger's samples are made of (base_settings)
+BASIS_MODES = ("limit-market", "market-market", "mid-mid")
+BASIS_MODE = str(_cfg("BASIS_MODE") or "limit-market").strip().lower()
+if BASIS_MODE not in BASIS_MODES:
+    raise RuntimeError(f"BASIS_MODE must be one of {', '.join(BASIS_MODES)} — got "
+                       f"{BASIS_MODE!r}")
+#: after a market pair, the venue's position read can still miss the new
+#: ticket; the tracked position stands this long before a read may replace it
+PAIR_POSITION_SETTLE_S = 3.0
+#: the same order key is not fired twice within this long
+PAIR_REFIRE_S = 2.0
+#: a level whose quote leg the venue REFUSED is not fired again for this
+#: long (every refused pair still sends - and then unwinds - its hedge)
+PAIR_REFUSED_HOLD_S = 300.0
+#: this many refused quote legs in a row stop all ENTRY pairs until a
+#: restart (exits still fire)
+PAIR_REFUSED_LATCH = 3
+PAPER_FILE = STRATEGY_DIR / "paper_state.json"
+EOD_CLOSE_AT = _cfg("EOD_CLOSE_AT")
+EOD_ROUND_TIMEOUT_S = float(_cfg("EOD_ROUND_TIMEOUT_S") or 10.0)
+EOD_RESUME_MAX_H = float(_cfg("EOD_RESUME_MAX_H") or 3.0)
+EOD_ROUND_DELAY_S = float(_cfg("EOD_ROUND_DELAY_S") if _cfg("EOD_ROUND_DELAY_S") is not None
+                          else 5.0)
+EOD_ROLLOVER_AT = _cfg("EOD_ROLLOVER_AT")
+#: the last MT5 session reopen, on disk: a bot restarted after the daily
+#: break must know it is over (2026-10-15 00:24: a restart re-ran the close
+#: on five shorts opened after the 00:01 reopen)
+EOD_FILE = STRATEGY_DIR / "eod_state.json"
+#: the end-of-day close order's stable key
+EOD_KEY = "eod-close"
+#: a refused EOD round is retried after this long (not the 5 min of a level)
+EOD_REFUSED_HOLD_S = 30.0
+
+
+def _parse_eod(v) -> Optional[tuple[int, int, Any]]:
+    """``EOD_CLOSE_AT`` -> (hour, minute, tz); None when off. 'HH:MM' is UTC,
+    'HH:MM Area/City' that zone's clock (daylight saving followed)."""
+    if v in (None, ""):
+        return None
+    from zoneinfo import ZoneInfo
+    hhmm, _, zone = str(v).strip().partition(" ")
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+        if not (0 <= h < 24 and 0 <= m < 60):
+            raise ValueError
+        tz = timezone.utc if zone.strip() in ("", "UTC") else ZoneInfo(zone.strip())
+    except Exception as e:
+        raise RuntimeError(f"EOD_CLOSE_AT must be 'HH:MM' (UTC) or 'HH:MM Area/City' — got "
+                           f"{v!r}") from e
+    return h, m, tz
+
+
+_EOD = _parse_eod(EOD_CLOSE_AT)
+_ROLL = _parse_eod(EOD_ROLLOVER_AT) if EOD_ROLLOVER_AT not in (None, "") else None
+if _EOD is not None and not MARKET_PAIR:
+    raise RuntimeError("EOD_CLOSE_AT closes in market pairs: it needs EXECUTION_MODE = 'market'")
+
+
+def _eod_rollover(start: float) -> float:
+    """The first rollover at or after the close ``start`` (epoch): the
+    EOD_ROLLOVER_AT clock time that evening (or the next day when earlier
+    on the clock), else the close + 30 min."""
+    if _ROLL is None:
+        return start + 1800.0
+    from datetime import timedelta
+    h, m, tz = _ROLL
+    local = datetime.fromtimestamp(start, tz)
+    t = local.replace(hour=h, minute=m, second=0, microsecond=0)
+    if t.timestamp() < start:
+        t += timedelta(days=1)
+    return t.timestamp()
+
+
+def _eod_start(now: float) -> Optional[float]:
+    """The most recent EOD close time at or before ``now`` (epoch), or None."""
+    if _EOD is None:
+        return None
+    from datetime import timedelta
+    h, m, tz = _EOD
+    local = datetime.fromtimestamp(now, tz)
+    t = local.replace(hour=h, minute=m, second=0, microsecond=0)
+    if t > local:
+        t -= timedelta(days=1)
+    return t.timestamp()
 RECONCILE_INTERVAL_S = _cfg("RECONCILE_INTERVAL_S")
 RECONCILE_RECHECK_DELAY_S = _cfg("RECONCILE_RECHECK_DELAY_S")
 RECONCILE_TOLERANCE_UNITS = _cfg("RECONCILE_TOLERANCE_UNITS")
@@ -412,8 +518,31 @@ MT5_RECONNECT_S = 10.0          # a lost terminal channel is re-opened this ofte
 BASIS_TRIGGER = _cfg("BASIS_TRIGGER")
 BASIS_WINDOW_S = _cfg("BASIS_WINDOW_S")
 BASIS_RELEASE = _cfg("BASIS_RELEASE")
+BASIS_TRIGGER_MODE = str(_cfg("BASIS_TRIGGER_MODE") or "avg").strip().lower()
+if BASIS_TRIGGER_MODE not in ("avg", "min/max"):
+    raise RuntimeError(f"BASIS_TRIGGER_MODE must be 'avg' or 'min/max' - got "
+                       f"{BASIS_TRIGGER_MODE!r}")
 OPTIMIZE_LIMIT_OFFSET = _cfg("OPTIMIZE_LIMIT_OFFSET")
 OPTIMIZE_LIMIT_TAKER = bool(_cfg("OPTIMIZE_LIMIT_TAKER"))
+MIN_TOB_SPREAD = _cfg("MIN_TOB_SPREAD")
+MIN_ORDER_INTERVAL_S = _cfg("MIN_ORDER_INTERVAL_S")
+if MIN_ORDER_INTERVAL_S is not None and (isinstance(MIN_ORDER_INTERVAL_S, bool)
+                                         or not isinstance(MIN_ORDER_INTERVAL_S, (int, float))
+                                         or MIN_ORDER_INTERVAL_S < 0):
+    raise RuntimeError(f"MIN_ORDER_INTERVAL_S must be None or seconds >= 0 - got "
+                       f"{MIN_ORDER_INTERVAL_S!r}")
+PRICE_REFERENCE = str(_cfg("PRICE_REFERENCE") or "mt5").strip().lower()
+REF_SYMBOL = str(_cfg("REF_SYMBOL") or "").strip()
+REF_OFFSET_WINDOW_S = float(_cfg("REF_OFFSET_WINDOW_S") or 300.0)
+REF_OFFSET_MIN_S = float(_cfg("REF_OFFSET_MIN_S") or 60.0)
+REF_STALE_S = float(_cfg("REF_STALE_S") or 30.0)
+if PRICE_REFERENCE not in ("mt5", "ibkr"):
+    raise RuntimeError(f"PRICE_REFERENCE must be 'mt5' or 'ibkr' - got {PRICE_REFERENCE!r}")
+if MIN_TOB_SPREAD is not None and (isinstance(MIN_TOB_SPREAD, bool)
+                                   or not isinstance(MIN_TOB_SPREAD, (int, float))
+                                   or MIN_TOB_SPREAD < 0):
+    raise RuntimeError(f"MIN_TOB_SPREAD must be None or a price distance >= 0 — got "
+                       f"{MIN_TOB_SPREAD!r}")
 BALANCE_REFRESH_S = _cfg("BALANCE_REFRESH_S")
 REPORT_SNAPSHOT_S = float(_cfg("REPORT_SNAPSHOT_S"))
 REPORT_DEALS_S = float(_cfg("REPORT_DEALS_S"))
@@ -454,7 +583,8 @@ RISK_DAY_UTC = bool(_cfg("RISK_DAY_UTC"))
 
 #: the price-gap settings SPREAD_UNIT = "bps" converts (basis points of the
 #: quoting price -> the pair's price points)
-BPS_NAMES = ("GRID_STEP", "GRID_CENTER", "GRID_TAKE_PROFIT", "BUY_SPREAD", "SELL_SPREAD",
+BPS_NAMES = ("GRID_STEP", "GRID_CENTER", "GRID_TAKE_PROFIT", "GRID_FIRST_OFFSET",
+             "BUY_SPREAD", "SELL_SPREAD",
              "LONG_ENTRY_SPREAD", "SHORT_ENTRY_SPREAD", "LONG_EXIT_SPREAD",
              "SHORT_EXIT_SPREAD", "BASIS_RELEASE", "BUY_MAX_SPREAD", "SELL_MIN_SPREAD",
              "ORACLE_BASIS_MAX", "OPTIMIZE_LIMIT_OFFSET", "REQUOTE_MIN_MOVE")
@@ -716,6 +846,11 @@ del _legacy, _canon
 # the bot breaks its loop and runs the normal teardown (orders cancelled).
 # A supervisor writes it; a stale one is removed at startup.
 STOP_FILE = Path(os.environ.get("ATJ_STOP_FILE") or (STRATEGY_DIR / "stop.signal"))
+#: a LIVE close-only switch: while this file exists the bot opens nothing new
+#: (exits, hedging and the reconciler go on); its first line is the reason.
+#: Deleting it lifts the gate. The health monitor writes it instead of
+#: stopping a bot — a stopped bot also stops repairing its own hedge.
+CLOSE_ONLY_FILE = STRATEGY_DIR / "close_only.signal"
 # the control panel's heartbeat — set ONLY when the panel started this bot
 # (supervisor), so a bot started from a terminal never watches it
 PANEL_HEARTBEAT_FILE = (Path(os.environ["ATJ_PANEL_HEARTBEAT"])
@@ -749,6 +884,22 @@ def _mt5_gateway_class():
             f"platform connection does. Use {_venues.MT5_GATEWAY_CONNECTOR!r} "
             f"(atjte-gateway --new NAME --venue mt5)")
     return cls
+
+
+def _position_magic(p) -> Optional[int]:
+    raw = getattr(p, "raw", None)
+    m = raw.get("magic") if isinstance(raw, dict) else None
+    try:
+        return None if m is None else int(m)
+    except (TypeError, ValueError):
+        return None
+
+
+def _book_position(p) -> bool:
+    """An MT5 position of this bot's hedge book: its own MT5_MAGIC, or one
+    of MT5_ADOPT_MAGICS (an inherited book the operator handed it)."""
+    m = _position_magic(p)
+    return m is not None and (m == int(MT5_MAGIC or 0) or m in MT5_ADOPT_MAGICS)
 
 
 def _utcnow() -> str:
@@ -818,6 +969,8 @@ def _price_nd(*prices) -> int:
 # the hedge gates vs the broker's min lot: a WARNING at start (pure, shared
 # with the panel's Save check)
 from ..common.hedge_gate import HEDGE_GATE_MAX_LOTS, hedge_gate_verdict  # noqa: E402,F401
+from ..common.hedge_orders import (IB_PERMANENT_CODES, PERMANENT_RETCODES, HedgeTooLarge,  # noqa: E402
+                                   permanent_retcode, send_split)
 
 
 def _classify_order_error(exc: Exception) -> str:
@@ -895,11 +1048,56 @@ class OrderRec:
         return max(self.amount - self.booked, 0.0)
 
 
+def _basis_pair(v_bid: float, v_ask: float, r_bid: float,
+                r_ask: float) -> tuple[float, float]:
+    """``(buy basis, sell basis)`` under BASIS_MODE from the venue's top of
+    book and the reference's (already k x the hedge price): what the
+    trigger judges a buy and a sell against."""
+    if BASIS_MODE == "market-market":
+        return v_ask - r_bid, v_bid - r_ask
+    if BASIS_MODE == "mid-mid":
+        m = (v_bid + v_ask) / 2.0 - (r_bid + r_ask) / 2.0
+        return m, m
+    return v_bid - r_bid, v_ask - r_ask
+
+
 class ArbBot:
     """The shared engine. A strategy subclasses this in its own folder under
     ``strategies/`` and supplies the quoting logic through the hooks below;
     everything else — feed, fills, hedging, reconcile, margin gates,
     persistence, teardown — is inherited unchanged."""
+
+    # PRICE_REFERENCE 'ibkr' state, defaulted here too so a bot built without
+    # __init__ (tests, tools) reads "no reference" rather than failing
+    ref_client = None
+    ref_feed = None
+    ref_src_bid: Optional[float] = None
+    ref_src_ask: Optional[float] = None
+    ref_src_mid: Optional[float] = None
+    ref_offset: Optional[float] = None
+    _ref_sample_t = 0.0
+    _ref_seen = 0
+    #: when the last fill was booked (MIN_ORDER_INTERVAL_S); 0 = none yet
+    _last_fill_t = 0.0
+    #: EXECUTION_MODE 'market': when the last pair fired, per key and overall
+    _last_fire_t = 0.0
+    #: the end-of-day close: the round awaiting its check ({"t", "expected"}),
+    #: the rounds done and whether a failed check stopped it (per close day)
+    _eod_pending: Optional[dict] = None
+    _eod_rounds = 0
+    _eod_failed: Optional[str] = None
+    _eod_day: Optional[float] = None
+    #: refused quote legs in a row, and the latch they trip (no more pairs)
+    _pair_refusals = 0
+    _pair_latched: Optional[str] = None
+    #: dry run in 'market' mode: the paper position and its two ledgers
+    paper_pos_units = 0.0
+    paper_realized_usd = 0.0
+    paper_pairs = 0
+    #: the window's extremes (BASIS_TRIGGER_MODE 'min/max'): the highest bid
+    #: basis and the lowest ask basis; None until the window has coverage
+    basis_max_bid: Optional[float] = None
+    basis_min_ask: Optional[float] = None
 
     # ── strategy hooks (each strategy overrides) ─────────────────────────────
     STRATEGY_KEY = "bot"          # short id: the heartbeat's ``strategy`` field
@@ -995,6 +1193,9 @@ class ArbBot:
                                                # (mt5_contract_size = the broker's)
         self.volume_min = 0.01
         self.volume_step = 0.01
+        self.volume_max = 0.0                  # one MT5 order's cap (0 = none read)
+        #: the last hedge MT5 refused for the request itself (see _hedge)
+        self.hedge_refusal: Optional[dict] = None
 
         # per-tick market snapshot
         self.venue_ticker = None
@@ -1019,6 +1220,17 @@ class ArbBot:
         self.xau_bid: Optional[float] = None
         self.xau_ask: Optional[float] = None   # (the MT5 quote as quoted;
                                                # ref_* = in venue terms)
+        # PRICE_REFERENCE = 'ibkr': the IBKR reference quote, its offset to
+        # the MT5 mid (rolling median) and the read-only lease that serves it
+        self.ref_client = None
+        self.ref_feed = None
+        self.ref_src_bid: Optional[float] = None
+        self.ref_src_ask: Optional[float] = None
+        self.ref_src_mid: Optional[float] = None
+        self.ref_offset: Optional[float] = None
+        self._ref_offsets: deque = deque()
+        self._ref_sample_t = 0.0
+        self._ref_seen = 0
         self.spread_now: Optional[float] = None
         # the HEDGE_RATIO guard: what the prices imply, and why quotes are
         # down while the live prices disagree with k (None = they agree)
@@ -1224,6 +1436,11 @@ class ArbBot:
                  f"the venue's taker fee, which the levels do not include"
                  + ("" if ALLOW_TAKER_ENTRY and ALLOW_TAKER_EXIT else
                     f"; {'exits' if ALLOW_TAKER_ENTRY else 'entries'} stay post-only makers"))
+        if MIN_TOB_SPREAD is not None:
+            _log(f"min TOB spread: a maker quote rests at least {float(MIN_TOB_SPREAD):g} "
+                 f"(price, rounded up to the {float(self.price_tick):g} tick) from the "
+                 f"opposite top of book — a sell >= best bid + that, a buy <= best ask − "
+                 f"that")
         if OPTIMIZE_LIMIT_OFFSET is not None:
             _log(f"limit optimisation: an order (entry or exit) the {BASIS_WINDOW_S:g} s "
                  f"basis average is already through is priced "
@@ -1332,7 +1549,34 @@ class ArbBot:
         # (kind, precision, contract size, initial-margin rate) — see
         # atjte.engines.ccxt.venue
         self.venue.connect()
+        if MARKET_PAIR and not getattr(self.venue.client, "market_orders", False):
+            raise RuntimeError(
+                f"EXECUTION_MODE = 'market' needs a venue leg that fills market orders "
+                f"at once (atjte.clients.gateway.MT5VenueClient); "
+                f"{type(self.venue.client).__name__} rests limit orders")
+        self._check_same_platform()
+        if MARKET_PAIR and BASIS_MODE != "market-market":
+            _log(f"WARNING: EXECUTION_MODE 'market' with BASIS_MODE {BASIS_MODE!r} — the "
+                 f"trigger judges a spread the pair does not execute at (market-market "
+                 f"is: buy at the venue ask vs the hedge bid, sell the reverse)")
+        if (MARKET_PAIR and LIVE_TRADING
+                and getattr(self.venue.client, "margin_verified", True) is False):
+            raise RuntimeError(
+                f"{SYMBOL_VENUE}: the broker's margin could not be read (the quote "
+                f"gateway predates its calc_margin read — restart that gateway); the "
+                f"account leverage would be a guess, and an entry the broker then "
+                f"refuses still sends its hedge — refusing to start LIVE")
+        if MARKET_PAIR:
+            self._load_paper()
+            _log("execution: MARKET PAIR — when a level's basis trigger arms, a market "
+                 f"order on {SYMBOL_VENUE} and the opposite {SYMBOL_MT5} market order go out "
+                 f"AT THE SAME TIME; basis mode {BASIS_MODE}; a refused leg is left to the "
+                 f"reconciler ({RECONCILE_RECHECK_DELAY_S:g}s re-check)"
+                 + ("" if LIVE_TRADING else
+                    f" — DRY RUN: PAPER pairs at the touch, paper position "
+                    f"{self.paper_pos_units:+g} units, report/paper_trades.jsonl"))
         self.mt5.connect()
+        self._check_netting_hedge()
         self._apply_leverage()      # LEVERAGE / MARGIN_MODE, once, never fatal
         # the terminal must be able to take a hedge BEFORE anything can fill:
         # Algo Trading off (say) would otherwise surface as a refused hedge on
@@ -1348,6 +1592,8 @@ class ArbBot:
         # process opens no venue socket of its own
         self.feed = self.venue.client.make_feed(on_fill=self._on_ws_fill,
                                                 on_ticker=self._wake.set)
+        if PRICE_REFERENCE == "ibkr":
+            self._connect_ref()
 
         # MARKET_KIND is a guard, not a switch: a symbol typo that lands on
         # the wrong market kind must stop the bot, not quietly change what it
@@ -1375,6 +1621,7 @@ class ArbBot:
         self.contract_size = self._broker_contract / (HEDGE_RATIO * self.fx_rate)
         self.volume_min = specs["volume_min"]
         self.volume_step = specs["volume_step"]
+        self.volume_max = float(specs.get("volume_max") or 0.0)
         self._resolve_hedge_threshold()      # before the hedger starts
         # a hedge gate worth many MT5 lots leaves that much unhedged, with no
         # error anywhere: warn about it before the hedger thread starts
@@ -1386,7 +1633,9 @@ class ArbBot:
                 f"{self.contract_size:g} {UNIT_LABEL}/lot at HEDGE_RATIO {HEDGE_RATIO:g}"
                 + (f" x {FX_CONVERSION_SYMBOL} {self.fx_rate:g}" if self.fx_rate != 1.0 else "")
                 + ", ")
-             + f"min lot={self.volume_min:g}, step={self.volume_step:g}")
+             + f"min lot={self.volume_min:g}, step={self.volume_step:g}"
+             + (f", max lot={self.volume_max:g} (a bigger hedge is split)"
+                if self.volume_max > 0 else ""))
         if HEDGE_MODE == "event":
             self._start_event_hedger()       # needs the lot specs above
 
@@ -1418,10 +1667,11 @@ class ArbBot:
         while self.feed.get_ticker() is None and time.time() - t0 < 10.0:
             time.sleep(0.25)
         tk = self.feed.get_ticker()
-        _log(f"crypto venue feed (gateway): "
+        _log(f"quote exchange feed (gateway): "
              f"{'ticker live' if tk else 'no ticker yet — quoting waits for it'}"
              f"{'' if self.feed.private_ok else ', fills stream not confirmed yet (quoting waits for it too)'}"
              f", order ops: {self.venue.order_ops}")
+        self._start_fill_catch_up()
 
         self._refresh_balances(time.time(), force=True)
         mt5_units = self._read_mt5_net_units()
@@ -1435,7 +1685,7 @@ class ArbBot:
                 _log(f"WARNING: {POSITION_FILE.name} was missing/unreadable and the venue "
                      f"position is unknown — adopted pos {self.pos_units:+.4f} units from the "
                      f"MT5 hedge book rather than unwinding a live hedge")
-        drift = self._venue_exposure_units() + mt5_units
+        drift = round(self._venue_exposure_units() + mt5_units, 8)
         _log(f"startup: perp position={self._position_units():+.4f} units "
              f"({'venue' if self.venue_pos_units is not None else 'tracked, no venue read'}), "
              f"MT5 hedge={mt5_units:+.4f} units, tracked pos={self.pos_units:+.4f} units "
@@ -1445,6 +1695,9 @@ class ArbBot:
         # k must match the prices BEFORE anything is hedged at it: a k off by
         # a decimal place would size this very hedge 10x wrong
         self._verify_hedge_ratio()
+        # a hedge book under another magic is invisible to the parity read:
+        # the startup hedge would double it (2026-10-15) — refuse first
+        self._check_foreign_hedge_book(drift)
         self._hedge(source="startup")  # correct any startup drift immediately
         # resync pos_units to the venue position so the strategy never begins
         # from a diverged tracked position
@@ -1456,6 +1709,59 @@ class ArbBot:
         self._blackout_banner()
         self._next_check_at = time.time()   # first reconcile check on the first
         # slow tick: verify parity right at startup, not a full interval later
+
+    #: the start-up catch-up re-reads this far before the newest venue fill
+    #: on file (``record_fill`` drops what it already holds, by id)
+    FILL_CATCHUP_OVERLAP_S = 300.0
+
+    def _start_fill_catch_up(self) -> None:
+        """Book the venue fills the report missed while this bot was down —
+        on a thread, so the start is never held up by a slow venue history:
+        the report only, never the position or the hedge (both read the
+        venues). The live fills recorded meanwhile are deduped by id. A dry
+        run books simulated fills, never the account's real ones."""
+        if not LIVE_TRADING or self.reporter is None or not self.reporter.ok:
+            return
+        threading.Thread(target=self._catch_up_fills, name="fill-catch-up",
+                         daemon=True).start()
+
+    def _catch_up_fills(self) -> None:
+        """Every own fill on SYMBOL_VENUE from the newest venue fill on file
+        (less :data:`FILL_CATCHUP_OVERLAP_S`) — never before the seed, the
+        report's basis — read through the gateway like ``atjte backfill``
+        reads it, and recorded with ``source = "catchup"``. With no seed yet
+        (a first start) there is nothing to catch up."""
+        from atjte import accounting as _acc
+        from atjte import backfill as _bf
+
+        def say(m: str) -> None:
+            _log(f"fill catch-up: {m}")
+        try:
+            report = _reporting.Report(STRATEGY_DIR)
+            seed_ts = (report.seed() or {}).get("ts")
+            if seed_ts is None:
+                return
+            seed_ts = float(seed_ts)
+            last = max((float(r.get("ts") or 0.0) for r in report.fills()
+                        if r.get("venue") == EXCHANGE_ID and not _acc.inferred_fill(r)),
+                       default=None)
+            since = seed_ts if last is None else max(seed_ts, last - self.FILL_CATCHUP_OVERLAP_S)
+            note = ""
+            try:
+                trades = _bf.fetch_venue_trades(self.venue.exchange, EXCHANGE_ID,
+                                                SYMBOL_VENUE, since, log=say)
+            except _bf.Partial as p:
+                trades, note = p.trades, f" (history incomplete: {p})"
+            records = [{**r, "source": "catchup"} for r in _bf.to_fill_records(
+                trades, EXCHANGE_ID, SYMBOL_VENUE, self.venue.base, self.venue.quote)
+                if float(r["ts"]) >= seed_ts]
+            new = sum(1 for r in records if self.reporter.record_fill(r))
+            say(f"{len(records)} fill(s) since "
+                f"{datetime.fromtimestamp(since, tz=timezone.utc):%Y-%m-%d %H:%M} UTC, "
+                f"{new} not on file — booked{note}")
+        except Exception as e:                      # noqa: BLE001 — the report only
+            say(f"WARNING: not done ({type(e).__name__}: {e}); Reporting → Rebuild "
+                f"history repairs the report")
 
     def _recover_position(self) -> None:
         """Reload the persisted net position and settle any orders that were
@@ -1554,6 +1860,7 @@ class ArbBot:
         if delta <= POS_EPS:
             return
         rec.booked = target
+        self._last_fill_t = time.time()
         signed = delta if rec.side == "buy" else -delta
         self.pos_units = round(self.pos_units + signed, 8)
         if self.venue_pos_units is not None:   # keep the quoting anchor current
@@ -1907,17 +2214,134 @@ class ArbBot:
     # k x the raw quote: what one venue unit's hedge is worth. The spread,
     # every order price, the basis and the MT5 risk ledger use these; the raw
     # xau_* are what is displayed and reported. None while there is no quote.
+    # With PRICE_REFERENCE = 'ibkr' they are the IBKR reference instead
+    # (:meth:`_ref_quote`); the MT5 risk ledger and every hedge-side use read
+    # the MT5 quote itself (``mt5_mid_k``), whatever prices the quotes.
     @property
     def ref_bid(self) -> Optional[float]:
-        return None if self.xau_bid is None else HEDGE_RATIO * self.xau_bid
+        if PRICE_REFERENCE == "mt5":
+            return None if self.xau_bid is None else HEDGE_RATIO * self.xau_bid
+        q = self._ref_quote(self.xau_bid, self.xau_ask)
+        return None if q is None else HEDGE_RATIO * q[0]
 
     @property
     def ref_ask(self) -> Optional[float]:
-        return None if self.xau_ask is None else HEDGE_RATIO * self.xau_ask
+        if PRICE_REFERENCE == "mt5":
+            return None if self.xau_ask is None else HEDGE_RATIO * self.xau_ask
+        q = self._ref_quote(self.xau_bid, self.xau_ask)
+        return None if q is None else HEDGE_RATIO * q[1]
 
     @property
     def ref_mid(self) -> Optional[float]:
+        if PRICE_REFERENCE == "mt5":
+            return None if self.xau_mid is None else HEDGE_RATIO * self.xau_mid
+        q = self._ref_quote(self.xau_bid, self.xau_ask)
+        return None if q is None else HEDGE_RATIO * (q[0] + q[1]) / 2.0
+
+    @property
+    def mt5_mid_k(self) -> Optional[float]:
+        """k x the MT5 mid: the hedge's own mark, never the reference."""
         return None if self.xau_mid is None else HEDGE_RATIO * self.xau_mid
+
+    def _ref_quote(self, mt5_bid: Optional[float],
+                   mt5_ask: Optional[float]) -> Optional[tuple]:
+        """``(bid, ask)`` in MT5 price terms (before k) the quotes are priced
+        off: the MT5 quote itself, or (PRICE_REFERENCE 'ibkr') the IBKR mid
+        put in MT5 terms by the measured offset, with the MT5 half spread
+        added back side-aware. None while either part is unknown."""
+        if mt5_bid is None or mt5_ask is None:
+            return None
+        if PRICE_REFERENCE == "mt5":
+            return mt5_bid, mt5_ask
+        if self.ref_src_mid is None or self.ref_offset is None:
+            return None
+        half = (float(mt5_ask) - float(mt5_bid)) / 2.0
+        mid = self.ref_src_mid + self.ref_offset
+        return mid - half, mid + half
+
+    def _update_ref(self, now: float, sample: bool = True) -> None:
+        """Read the IBKR reference quote from its lease's cache and, with
+        ``sample`` (the loop, MT5 session open), add one (MT5 mid - IBKR mid)
+        sample a second to the offset window; the offset is that window's
+        median once it spans REF_OFFSET_MIN_S."""
+        f = self.ref_feed
+        if f is None:
+            return
+        tk = f.get_ticker()
+        if tk is None or tk.bid is None or tk.ask is None:
+            return
+        self.ref_src_bid, self.ref_src_ask = float(tk.bid), float(tk.ask)
+        self.ref_src_mid = (self.ref_src_bid + self.ref_src_ask) / 2.0
+        if not sample or self.xau_mid is None or f.ticker_age_s > REF_STALE_S:
+            return
+        if now - self._ref_sample_t < 1.0:
+            return
+        self._ref_sample_t = now
+        if "_ref_offsets" not in self.__dict__:
+            self._ref_offsets = deque()
+        self._ref_offsets.append((now, float(self.xau_mid) - self.ref_src_mid))
+        while self._ref_offsets and self._ref_offsets[0][0] < now - REF_OFFSET_WINDOW_S:
+            self._ref_offsets.popleft()
+        span = now - self._ref_offsets[0][0]
+        if self.ref_offset is not None or span >= REF_OFFSET_MIN_S:
+            vals = sorted(x[1] for x in self._ref_offsets)
+            n = len(vals)
+            self.ref_offset = (vals[n // 2] if n % 2
+                               else (vals[n // 2 - 1] + vals[n // 2]) / 2.0)
+
+    def _connect_ref(self) -> None:
+        """PRICE_REFERENCE 'ibkr': a READ-ONLY lease on the venue's own
+        gateway for REF_SYMBOL - it places nothing and never clashes with
+        the bot's own lease; its ticker pushes wake the loop like the
+        venue's."""
+        if EXCHANGE_ID != "ibkr":
+            raise RuntimeError(f"PRICE_REFERENCE = 'ibkr' needs an IBKR venue (EXCHANGE_ID "
+                               f"'ibkr', the reference comes from its gateway) - this "
+                               f"project trades {EXCHANGE_ID!r}")
+        if not REF_SYMBOL:
+            raise RuntimeError("PRICE_REFERENCE = 'ibkr' needs REF_SYMBOL (e.g. 'XAUUSD/USD')")
+        cls = self.venue._client_class()
+        kw: dict = {}
+        if getattr(cls, "NEEDS_EXCHANGE_ID", False):
+            kw["exchange_id"] = EXCHANGE_ID
+        kw.update({**VENUE_CLIENT_OPTIONS,
+                   "client_name": f"{PROJECT_DIR.name}_{STRATEGY_DIR.name}_ref",
+                   "symbol": REF_SYMBOL, "readonly": True, "log": _log})
+        self.ref_client = cls(**kw)
+        try:
+            self.ref_client.connect()
+        except RuntimeError as e:
+            raise RuntimeError(f"PRICE_REFERENCE = 'ibkr': {e} - add it to the IBKR gateway's "
+                               f"contracts (XAUUSD SMART USD CMDTY) and restart the "
+                               f"gateway") from e
+        self.ref_feed = self.ref_client.make_feed(on_fill=lambda _t: None,
+                                                  on_ticker=self._wake.set)
+        _log(f"PRICE REFERENCE (experimental): quotes priced off IBKR {REF_SYMBOL} + the "
+             f"measured offset to {SYMBOL_MT5} (rolling median, {REF_OFFSET_WINDOW_S:g} s) "
+             f"+ the MT5 half spread; hedges stay on MT5. No quotes until "
+             f"{REF_OFFSET_MIN_S:g} s of offset are measured, nor while the reference "
+             f"is down or unchanged >{REF_STALE_S:g} s")
+
+    def _ref_gate(self) -> Optional[str]:
+        """Why the IBKR price reference is unfit to quote on (None = fit).
+        Down or stale means quotes DOWN - never a silent switch to MT5."""
+        f = self.ref_feed
+        if f is None:
+            return f"price reference {REF_SYMBOL} not connected"
+        if f.get_ticker() is None:
+            return (f"price reference: no {REF_SYMBOL} ticker yet"
+                    + (f" ({f.ticker_error})" if f.ticker_error else ""))
+        if not f.public_ok:
+            return f"price reference {REF_SYMBOL} feed down - {f.public_reason}"
+        if f.ticker_age_s > REF_STALE_S:
+            return (f"price reference {REF_SYMBOL} unchanged for >{REF_STALE_S:g}s "
+                    f"(REF_STALE_S)")
+        if self.ref_offset is None:
+            offs = self.__dict__.get("_ref_offsets") or ()
+            span = offs[-1][0] - offs[0][0] if offs else 0.0
+            return (f"price reference: measuring the {REF_SYMBOL} -> {SYMBOL_MT5} offset "
+                    f"({span:.0f} of {REF_OFFSET_MIN_S:g} s)")
+        return None
 
     @property
     def mt5_contract_size(self) -> float:
@@ -1959,6 +2383,7 @@ class ArbBot:
         min lot in venue units (the lot specs are loaded) — the smallest
         hedge the broker takes. A value in the settings is used as written."""
         global HEDGE_THRESHOLD_UNITS, RECONCILE_TOLERANCE_UNITS
+        global POSITION_RECONCILE_TOLERANCE_UNITS
         lot_units = round(self.volume_min * self.contract_size, 10)
         if HEDGE_THRESHOLD_UNITS is None:
             HEDGE_THRESHOLD_UNITS = lot_units
@@ -1969,6 +2394,11 @@ class ArbBot:
             RECONCILE_TOLERANCE_UNITS = lot_units
             _log(f"reconcile tolerance: one {SYMBOL_MT5} min lot = "
                  f"{RECONCILE_TOLERANCE_UNITS:g} {UNIT_LABEL} (RECONCILE_TOLERANCE_UNITS None)")
+        if POSITION_RECONCILE_TOLERANCE_UNITS is None:
+            POSITION_RECONCILE_TOLERANCE_UNITS = lot_units / 2.0
+            _log(f"position reconcile tolerance: half a {SYMBOL_MT5} min lot = "
+                 f"{POSITION_RECONCILE_TOLERANCE_UNITS:g} {UNIT_LABEL} "
+                 f"(POSITION_RECONCILE_TOLERANCE_UNITS None)")
 
     def _check_hedge_thresholds(self, min_lot_units: float) -> None:
         """WARN (log + the report's ``market.hedge_gate_warnings``) when
@@ -1986,7 +2416,9 @@ class ArbBot:
         self.mt5_min_lot_units = min_lot_units
         self.hedge_gate_warnings = []
         for name, value in (("HEDGE_THRESHOLD_UNITS", HEDGE_THRESHOLD_UNITS),
-                            ("RECONCILE_TOLERANCE_UNITS", RECONCILE_TOLERANCE_UNITS)):
+                            ("RECONCILE_TOLERANCE_UNITS", RECONCILE_TOLERANCE_UNITS),
+                            ("POSITION_RECONCILE_TOLERANCE_UNITS",
+                             POSITION_RECONCILE_TOLERANCE_UNITS)):
             msg = hedge_gate_verdict(name, value, min_lot_units, unit_value,
                                      UNIT_LABEL, self.venue.quote or "")
             if msg:
@@ -2063,7 +2495,7 @@ class ArbBot:
         so parity is simply venue position + this = 0."""
         lots = 0.0
         for p in self.mt5.get_positions(SYMBOL_MT5):
-            if (p.raw or {}).get("magic") != MT5_MAGIC:
+            if not _book_position(p):
                 continue
             lots += p.size if p.side is PositionSide.LONG else -p.size
         return lots * self.contract_size
@@ -2081,7 +2513,7 @@ class ArbBot:
         legs: list[tuple[float, float]] = []      # (signed lots, open price)
         try:
             for p in self.mt5.get_positions(SYMBOL_MT5):
-                if (p.raw or {}).get("magic") != MT5_MAGIC:
+                if not _book_position(p):
                     continue
                 signed = p.size if p.side is PositionSide.LONG else -p.size
                 lots += signed
@@ -2129,7 +2561,7 @@ class ArbBot:
                      f"window <= {RECONCILE_INTERVAL_S / 60:g} min)")
                 return
         self.mt5_net_units = self._read_mt5_net_units()
-        delta_units = -self._venue_exposure_units() - self.mt5_net_units
+        delta_units = round(-self._venue_exposure_units() - self.mt5_net_units, 8)  # see hedger
         if abs(delta_units) < HEDGE_THRESHOLD_UNITS:
             self.hedge_ok = True
             self._hand_off_to_hedger(source, delta_units, 0.0)
@@ -2146,33 +2578,112 @@ class ArbBot:
                                     f"{lots:g} lot {SYMBOL_MT5} (delta {delta_units:+.4f} units)")
             self._hand_off_to_hedger(source, delta_units, sent_units)
             return
+        held = self._refusal_held(side, lots, time.time())
+        if held is not None:
+            self.hedge_ok = False
+            self._log_once(f"hedge_held_{held['t']:.0f}",
+                           f"hedge ({source}) HELD: {side.value} {lots:g} lot {SYMBOL_MT5} is "
+                           f"the order MT5 refused at {held['at']} ({held['why']}) — not "
+                           f"resent unchanged until {held['until_s']}; quotes stay down")
+            return
         try:
-            o = self.mt5.place_order(SYMBOL_MT5, side, lots, OrderType.MARKET,
-                                     deviation=MT5_DEVIATION_POINTS,
-                                     comment=self.hedge_comment)
-        except Exception as e:
+            res = send_split(self._mt5_market, side, lots, self.volume_max,
+                             self.volume_step, self.volume_min)
+            err = res.error
+        except HedgeTooLarge as e:
+            res, err = None, e
+        filled = res.filled_lots if res is not None else 0.0
+        if filled > 1e-9:
+            for got, o in res.orders:
+                self.counters["hedges"] += 1
+                self._book_hedge(side, got, o)
+            self._report_deals_dirty = True
+            sent_units = filled * self.contract_size * (1.0 if delta_units > 0 else -1.0)
+            ids = ", ".join(str(getattr(o, "order_id", "?")) for _g, o in res.orders)
+            _log(f"HEDGE ({source}) {side.value} {filled:g} lot {SYMBOL_MT5} "
+                 f"(delta {delta_units:+.4f} units, order {ids}"
+                 + (f"; {len(res.orders)} orders <= {self.volume_max:g} lot" if len(res.chunks) > 1
+                    else "") + ")")
+            # the hedger is told what FILLED, never what was asked: a refusal
+            # half-way leaves the rest owed, and the reconciler sends it
+            self._hand_off_to_hedger(source, delta_units, sent_units)
+            # the terminal lists the new ticket a moment AFTER order_send
+            # returns: wait for the net to move before it is cached and the
+            # book compacted (a read taken too early left a phantom drift and
+            # an unpaired ticket pair on 2026-09-22 16:27). The parity path is
+            # rare and already on the loop thread, so it waits here; the
+            # event path settles per tick.
+            self._arm_mt5_settle(self.mt5_net_units)
+            while self._mt5_settle_until:
+                self._settle_mt5_book(time.time())
+                if self._mt5_settle_until:
+                    time.sleep(MT5_SETTLE_POLL_S)
+        if err is not None:
             self.hedge_ok = False  # quotes come down until reconcile repairs parity
-            _log(f"ERROR: hedge ({source}) failed: {e} — quotes down; "
+            part = (f" after {filled:g} of {lots:g} lot filled" if filled > 1e-9 else "")
+            if self._note_refusal(side, lots, err, source):
+                return
+            _log(f"ERROR: hedge ({source}) failed{part}: {err} — quotes down; "
                  f"reconcile will re-check and fix (next window <= "
                  f"{RECONCILE_INTERVAL_S / 60:g} min)")
             return
-        self.counters["hedges"] += 1
-        self._report_deals_dirty = True
         self.hedge_ok = True
-        self._book_hedge(side, lots, o)
-        _log(f"HEDGE ({source}) {side.value} {lots:g} lot {SYMBOL_MT5} "
-             f"(delta {delta_units:+.4f} units, order {o.order_id})")
-        self._hand_off_to_hedger(source, delta_units, sent_units)
-        # the terminal lists the new ticket a moment AFTER order_send returns:
-        # wait for the net to move before it is cached and the book compacted
-        # (a read taken too early left a phantom drift and an unpaired ticket
-        # pair on 2026-09-22 16:27). The parity path is rare and already on
-        # the loop thread, so it waits here; the event path settles per tick.
-        self._arm_mt5_settle(self.mt5_net_units)
-        while self._mt5_settle_until:
-            self._settle_mt5_book(time.time())
-            if self._mt5_settle_until:
-                time.sleep(MT5_SETTLE_POLL_S)
+        self.hedge_refusal = None
+
+    def _mt5_market(self, side: OrderSide, lots: float):
+        """One MT5 market hedge order (the parity path's and the hedger's)."""
+        return self.mt5.place_order(SYMBOL_MT5, side, lots, OrderType.MARKET,
+                                    deviation=MT5_DEVIATION_POINTS,
+                                    comment=self.hedge_comment)
+
+    # ── refusals an unchanged resend cannot fix ─────────────────────────────
+    def _refusal_held(self, side: OrderSide, lots: float, now: float) -> Optional[dict]:
+        """The recorded permanent refusal when ``side`` / ``lots`` is the
+        very order it refused and its hold has not run out, else None. A
+        DIFFERENT hedge (the drift moved, the specs changed) goes out."""
+        r = self.hedge_refusal
+        if r is None or now >= r["until"] or r["side"] != side.value:
+            return None
+        if abs(float(r["lots"]) - float(lots)) > max(self.volume_step, 1e-9) / 2.0:
+            return None
+        return r
+
+    def _note_refusal(self, side: OrderSide, lots: float, err: BaseException,
+                      source: str) -> bool:
+        """Record and ESCALATE a refusal of the request itself (a retcode in
+        :data:`PERMANENT_RETCODES`, or a hedge too large to split): the same
+        order is held for MT5_REFUSED_HOLD_S instead of being resent every
+        re-check (2026-10-15: 10014 ~35 times in 25 min, quotes down, a
+        repeating log line the only sign). Returns False for any other error
+        — those stay one attempt per re-check, as before."""
+        rc = permanent_retcode(err)
+        if rc is None and not isinstance(err, HedgeTooLarge):
+            return False
+        now = time.time()
+        prev = self.hedge_refusal
+        same = (prev is not None and prev["side"] == side.value
+                and abs(float(prev["lots"]) - float(lots)) <= max(self.volume_step, 1e-9) / 2.0)
+        count = (prev["count"] + 1) if same else 1
+        why = ("too large" if rc is None else
+               f"retcode {rc}, {PERMANENT_RETCODES[rc]}" if rc in PERMANENT_RETCODES else
+               f"IBKR code {rc}, {IB_PERMANENT_CODES.get(rc, 'refused')}")
+        until = now + MT5_REFUSED_HOLD_S
+        self.hedge_refusal = {
+            "side": side.value, "lots": float(lots), "retcode": rc, "why": why,
+            "error": str(err), "count": count, "source": source, "t": now,
+            "at": datetime.now().strftime("%H:%M:%S"), "until": until,
+            "until_s": datetime.fromtimestamp(until).strftime("%H:%M:%S"),
+        }
+        self.counters["hedge_refusals"] = self.counters.get("hedge_refusals", 0) + 1
+        self.last_error = (f"hedge: MT5 refused {side.value} {lots:g} lot {SYMBOL_MT5} "
+                           f"({why}) — held, quotes down")
+        _log(f"ERROR: HEDGE REFUSED ({source}): {side.value} {lots:g} lot {SYMBOL_MT5}: {err} "
+             f"— {why}: the same order would be refused again, so it is NOT resent before "
+             f"{self.hedge_refusal['until_s']} (MT5_REFUSED_HOLD_S {MT5_REFUSED_HOLD_S:g}s"
+             + (f"; refused {count} times" if count > 1 else "")
+             + f"). Quotes stay down; the exposure is unhedged until an operator acts "
+               f"— check the symbol's lot limits and the MT5 hedge book (another magic?)")
+        return True
 
     def _hand_off_to_hedger(self, source: str, delta_units: float,
                             sent_units: float) -> None:
@@ -2221,16 +2732,11 @@ class ArbBot:
         the MT5 client serialises the two threads."""
         from .hedger import EventHedger
 
-        def place(side: OrderSide, lots: float):
-            return self.mt5.place_order(SYMBOL_MT5, side, lots, OrderType.MARKET,
-                                        deviation=MT5_DEVIATION_POINTS,
-                                        comment=self.hedge_comment)
-
         self.hedger = EventHedger(
-            place=place, symbol_venue=SYMBOL_VENUE, to_units=self.venue.to_units,
+            place=self._mt5_market, symbol_venue=SYMBOL_VENUE, to_units=self.venue.to_units,
             contract_size=self.contract_size, volume_step=self.volume_step,
-            volume_min=self.volume_min, threshold_units=HEDGE_THRESHOLD_UNITS,
-            live=LIVE_TRADING, started_utc=self._started_utc,
+            volume_min=self.volume_min, volume_max=self.volume_max,
+            threshold_units=HEDGE_THRESHOLD_UNITS, live=LIVE_TRADING, started_utc=self._started_utc,
             on_result=self._on_event_hedge, on_failure=self._on_event_hedge_failed,
             log=_log)
         # no after_place: the ticket pairing runs on the loop thread once the
@@ -2309,12 +2815,13 @@ class ArbBot:
             if units <= 0 or px <= 0:
                 return
             self._roll_day()
-            # px is in the CFD's currency (JPY on USDJPY / JP225); the day's
-            # realized PnL and volume are in the venue's (USD): convert both
-            # through the hedge's FX rate (1 on a USD-quoted CFD)
-            fx = getattr(self, "fx_rate", 1.0) or 1.0
-            self.day.realized_mt5_usd += self.mt5_ledger.apply(side.value, units, px) / fx
-            self.day.mt5_volume_usd += units * px / fx
+            # Already in the venue's currency (USD): ``units`` are VENUE units
+            # (contract_size = broker contract / (k x fx) carries the FX rate)
+            # and k x the MT5 price is the venue's price NUMBER, as in the
+            # unrealized mark. Dividing by fx again made the MT5 leg's volume
+            # and realized PnL ~157x too small on USDJPY / JP225 (2026-10-15).
+            self.day.realized_mt5_usd += self.mt5_ledger.apply(side.value, units, px)
+            self.day.mt5_volume_usd += units * px
         except Exception as e:      # accounting must never break the hedge path
             self._log_once("book_hedge", f"warning: hedge not booked into the "
                                          f"risk ledger: {type(e).__name__}: {e}")
@@ -2371,6 +2878,8 @@ class ArbBot:
           None, and free base/quote are refreshed for the sizing path.
 
         Raises on venue error (callers decide how to degrade)."""
+        if MARKET_PAIR and time.time() - self._last_fire_t < PAIR_POSITION_SETTLE_S:
+            return      # the terminal may not list the new ticket yet
         self.venue.read_position()
         self.venue_pos_units = self.venue.position_units
         self.venue_entry_px, self.venue_upnl = self.venue.entry_px, self.venue.upnl
@@ -2426,7 +2935,10 @@ class ArbBot:
     def _position_units(self) -> float:
         """The SIGNED position the strategies quote around and MT5 hedges:
         the venue's figure when read, else (keyless dry run) the bot's own
-        tracked position."""
+        tracked position. A dry run in EXECUTION_MODE 'market' paper-trades:
+        the paper position."""
+        if MARKET_PAIR and not LIVE_TRADING:
+            return self.paper_pos_units
         return self.venue_pos_units if self.venue_pos_units is not None else self.pos_units
 
     def _venue_exposure_units(self) -> float:
@@ -2440,7 +2952,7 @@ class ArbBot:
         if LIVE_TRADING:
             self._read_venue_position()
         self.mt5_net_units = self._read_mt5_net_units()
-        return self._venue_exposure_units() + self.mt5_net_units
+        return round(self._venue_exposure_units() + self.mt5_net_units, 8)
 
     def _parity_watch(self, now: float) -> None:
         """On every venue position read (BALANCE_REFRESH_S): the venue
@@ -2458,7 +2970,7 @@ class ArbBot:
             mt5_units = self._read_mt5_net_units()
         except Exception:                                   # noqa: BLE001
             return                       # the reconciler's own cycle stays the backstop
-        drift = self._venue_exposure_units() + mt5_units
+        drift = round(self._venue_exposure_units() + mt5_units, 8)
         if abs(drift) < RECONCILE_TOLERANCE_UNITS:
             return
         self.mt5_net_units = mt5_units
@@ -2591,6 +3103,13 @@ class ArbBot:
         changes. No refresh may drop another's reasons, which is why they
         are kept apart and merged here."""
         reasons = list(self._margin_reasons) + list(self.risk_reasons)
+        try:
+            if CLOSE_ONLY_FILE.exists():
+                why = (CLOSE_ONLY_FILE.read_text(encoding="utf-8").strip().splitlines()
+                       or ["no reason given"])[0][:200]
+                reasons.append(f"close-only signal ({CLOSE_ONLY_FILE.name}): {why}")
+        except OSError:
+            pass
         if self.derisk_active:
             reasons.append("margin de-risk latch (sticky until restart): "
                            + "; ".join(self.derisk_reasons))
@@ -2631,7 +3150,7 @@ class ArbBot:
             limits.append(f"max daily loss {float(MAX_DAILY_LOSS_USD):g}"
                           + ("% of capital" if RISK_PCT else " USD"))
         if MAX_DAILY_VENUE_VOLUME_USD:
-            limits.append(f"max daily crypto-venue volume "
+            limits.append(f"max daily quote-exchange volume "
                           f"{float(MAX_DAILY_VENUE_VOLUME_USD):,.0f} USD")
         if MAX_DAILY_MT5_VOLUME_USD:
             limits.append(f"max daily MT5 volume "
@@ -2698,7 +3217,7 @@ class ArbBot:
         mt5_units, mt5_px = self._read_mt5_book()
         if abs(self.mt5_ledger.inv_units - mt5_units) > tol:
             rebased.append(f"MT5 {self.mt5_ledger.inv_units:+.4f} -> {mt5_units:+.4f} units")
-            self.mt5_ledger.seed(mt5_units, mt5_px or self.ref_mid)
+            self.mt5_ledger.seed(mt5_units, mt5_px or self.mt5_mid_k)
         if rebased:
             _log(f"risk ledgers re-seeded from the venues ({'; '.join(rebased)}) — "
                  f"realized PnL from here is measured against the venue basis "
@@ -2823,14 +3342,14 @@ class ArbBot:
         # price when it was seeded) would mis-book the realized PnL of its
         # next closing fill: give it the live mark once
         for ledger, px, what in ((self.venue_ledger, mark, "perp"),
-                                 (self.mt5_ledger, self.ref_mid, "MT5")):
+                                 (self.mt5_ledger, self.mt5_mid_k, "MT5")):
             if abs(ledger.inv_units) > POS_EPS and ledger.avg_cost <= 0 and px:
                 ledger.seed(ledger.inv_units, px)
                 _log(f"risk: {what} ledger had no basis for its "
                      f"{ledger.inv_units:+.4f} units — marked at {px:g}")
         # reporting only (the loss limit is realized-only, as in sample_project)
         self.risk_unrealized_usd = combined_unrealized(
-            self.venue_ledger, mark, self.mt5_ledger, self.ref_mid, self.venue_ufunding)
+            self.venue_ledger, mark, self.mt5_ledger, self.mt5_mid_k, self.venue_ufunding)
         self.risk_pnl_usd = self.day.pnl()
         reasons = daily_limit_reasons(self.day, self.risk_pnl_usd,
                                       self._max_daily_loss(),
@@ -2996,8 +3515,8 @@ class ArbBot:
         out-ranks the calendar — never an unfit terminal."""
         if not getattr(self, "mt5_ok", True):
             return True
-        if self.derisk_active:
-            return False
+        if self.derisk_active or (_EOD is not None and self._eod_closing(now)):
+            return False          # getting out out-ranks the calendar
         return self._blackout_reason(now) is not None or self.ratio_reason is not None
 
     def _check_mt5_health(self, now: float, force: bool = False) -> dict:
@@ -3061,15 +3580,26 @@ class ArbBot:
         implied = self._safe_tick(side, implied)
         if implied is None:
             return None
+        gap = self._tob_gap()
         if side == "buy":
-            p = px(min(implied, k.ask - self.price_tick))
-            if p >= k.ask:
-                p = px(k.ask - 2 * self.price_tick)
+            p = px(min(implied, k.ask - gap))
+            if p > k.ask - gap + 1e-9:          # rounded up past the gap
+                p = px(k.ask - gap - self.price_tick)
             return p if 0 < p < k.ask else None
-        p = px(max(implied, k.bid + self.price_tick))
-        if p <= k.bid:
-            p = px(k.bid + 2 * self.price_tick)
+        p = px(max(implied, k.bid + gap))
+        if p < k.bid + gap - 1e-9:              # rounded down past the gap
+            p = px(k.bid + gap + self.price_tick)
         return p if p > k.bid else None
+
+    def _tob_gap(self) -> float:
+        """How far a maker quote stays from the OPPOSITE top of book (a sell
+        from the best bid, a buy from the best ask): ``MIN_TOB_SPREAD``
+        rounded UP to the tick, never less than one tick (None = one tick)."""
+        tick = float(self.price_tick)
+        if MIN_TOB_SPREAD is None or tick <= 0:
+            return tick
+        n = math.ceil(float(MIN_TOB_SPREAD) / tick - 1e-9)
+        return max(1, n) * tick
 
     def _taker_allowed(self, d: DesiredOrder) -> bool:
         """Whether this order may take liquidity (``ALLOW_TAKER_ENTRY`` /
@@ -3189,6 +3719,10 @@ class ArbBot:
         # nothing to do with getting out.
         if self.derisk_active:
             return self._flatten_orders()
+        now_ = time.time()
+        if _EOD is not None and self._eod_window(now_) is not None:
+            # end of day: close in checked rounds; no entries until reopen
+            return self._eod_orders(now_)
         desired = self._target_orders()
         # exits always survive; entries are gated by the soft risk reasons AND
         # by a known position divergence (don't open new exposure while the
@@ -3202,7 +3736,7 @@ class ArbBot:
         # user rule: at most 1 buy + 1 sell order resting on the venue —
         # quote only the level nearest the market per side; the next level
         # goes up in the quote pass that follows the fill (at once, unthrottled)
-        return self._basis_gate(one_per_side(desired))
+        return self._order_interval_gate(self._basis_gate(one_per_side(desired)))
 
     def _spread_window_banner(self) -> None:
         """Startup line for the spread window (``BUY_MAX_SPREAD`` /
@@ -3444,6 +3978,10 @@ class ArbBot:
         position open, a venue without the operation) is logged."""
         if LEVERAGE is None or not self.is_perp:
             return
+        if getattr(getattr(self.venue, "client", None), "broker_margin", False):
+            _log(f"leverage: the broker's — {SYMBOL_VENUE} margin "
+                 f"{self.venue.im_rate * 100:.2f}% of notional (LEVERAGE not used)")
+            return
         fn = getattr(self.venue.client, "set_leverage", None)
         if fn is None:
             _log(f"LEVERAGE {LEVERAGE} not applied: this venue connector cannot set it")
@@ -3480,8 +4018,13 @@ class ArbBot:
                         key=lambda d: (0 if d.purpose == "exit" else 1, d.level_index)):
             taker = self._taker_allowed(d)
             level = self._quote_level(d, taker)
-            price = (self._taker_price(d.side, level) if taker
-                     else self._maker_price(d.side, level))
+            if MARKET_PAIR:
+                k = self.venue_ticker
+                price = None if k is None else (k.ask if d.side == "buy" else k.bid)
+                level = d.level
+            else:
+                price = (self._taker_price(d.side, level) if taker
+                         else self._maker_price(d.side, level))
             if price is None:
                 continue
             amount = self.venue.amount_to_precision(d.size)
@@ -3491,6 +4034,21 @@ class ArbBot:
                               "level_index": d.level_index, "level": level,
                               "grid_level": d.level,
                               "price": price, "amount": amount, "taker": taker}
+        if MARKET_PAIR:
+            self.intents = targets
+            # ONE pair per pass: the next level waits for the next pass, and
+            # so for MIN_ORDER_INTERVAL_S after this fill when it is set
+            # (2026-10-15 00:38: four levels went out inside one second)
+            fired = self.__dict__.setdefault("_fired_t", {})
+            for key, t in targets.items():
+                before = fired.get(key)
+                if not LIVE_TRADING:
+                    self._paper_fire(key, t)
+                elif self.hedge_ok:
+                    self._fire_pair(key, t)
+                if fired.get(key) != before:
+                    break
+            return
         if not LIVE_TRADING:
             self.intents = targets
             return
@@ -3544,6 +4102,412 @@ class ArbBot:
                 continue
             self._place(key, t)          # re-priced off a fresh tick inside
 
+    def _check_netting_hedge(self) -> None:
+        """A NETTING hedge account keeps ONE position per symbol, tagged with
+        the magic that opened it: if SYMBOL_MT5's position there carries
+        another magic (another bot, a manual trade), this bot would read its
+        hedge as missing and hedge on top of it forever. Refuses to start
+        then; the gateway refuses the orders too. Hedging accounts pass."""
+        try:
+            raw = getattr(self.mt5.get_account(), "raw", None)
+            mode = raw.get("margin_mode") if isinstance(raw, dict) else None
+            if mode not in (0, 1):
+                return
+            foreign = sorted({int((p.raw or {}).get("magic") or 0)
+                              for p in self.mt5.get_positions(SYMBOL_MT5)
+                              if isinstance(p.raw, dict)
+                              and int(p.raw.get("magic") or 0) != int(MT5_MAGIC)})
+        except Exception as e:                              # noqa: BLE001
+            _log(f"netting check skipped: {type(e).__name__}: {e}")
+            return
+        if foreign:
+            raise RuntimeError(
+                f"the MT5 hedge account NETS positions and its {SYMBOL_MT5} position "
+                f"carries magic {', '.join(map(str, foreign))}, not this bot's "
+                f"({MT5_MAGIC}) — the two would hedge on top of each other. Close that "
+                f"position, or hedge this strategy on a hedging account")
+        _log(f"MT5 hedge account: NETTING — {SYMBOL_MT5} must be traded by this bot "
+             f"alone (the gateway refuses a second trader)")
+
+    def _other_project_magics(self) -> dict[int, str]:
+        """``{magic: project}`` for the OTHER projects of this workspace's
+        catalogue that hedge SYMBOL_MT5 — their tickets are their own book,
+        not one this bot inherited. Read as literals, never executed."""
+        from atjte import settings_io as _sio
+        out: dict[int, str] = {}
+        try:
+            files = sorted(PROJECT_DIR.parent.glob("*/project_settings.py"))
+        except OSError:
+            return out
+        for f in files:
+            if f.parent.resolve() == PROJECT_DIR.resolve():
+                continue
+            v = _sio.read_values(f)
+            try:
+                magic = int(v.get("MT5_MAGIC"))
+            except (TypeError, ValueError):
+                continue
+            if str(v.get("SYMBOL_MT5") or "") in ("", str(SYMBOL_MT5)):
+                out[magic] = f.parent.name
+        return out
+
+    def _check_foreign_hedge_book(self, drift: float) -> None:
+        """Refuse a LIVE start when the startup hedge would land on top of
+        a hedge book this bot cannot see.
+
+        The parity read counts only this bot's magic (and MT5_ADOPT_MAGICS).
+        A book left under another magic — the project's MT5_MAGIC changed,
+        tickets opened by hand — reads as "no hedge", and the startup hedge
+        sends all of it again: on 2026-10-15 a 316.6-lot startup hedge for a
+        book already held under another magic was stopped only because it
+        exceeded the symbol's volume_max — sent, MT5 would have held twice
+        the venue position (+633 lots). So: when the
+        drift needs a hedge, and SYMBOL_MT5 holds positions of an UNKNOWN
+        magic on the side that hedge would add to, the start is refused. A
+        magic of another project in this catalogue that hedges the same
+        symbol is that project's book, and is only named."""
+        need = -float(drift)                     # the hedge, in venue units
+        if abs(need) < HEDGE_THRESHOLD_UNITS:
+            return
+        try:
+            positions = self.mt5.get_positions(SYMBOL_MT5)
+        except Exception as e:                              # noqa: BLE001
+            _log(f"foreign hedge book check skipped: {type(e).__name__}: {e}")
+            return
+        by_magic: dict[int, float] = {}
+        for p in positions:
+            m = _position_magic(p)
+            if m is None or _book_position(p):
+                continue
+            lots = p.size if p.side is PositionSide.LONG else -p.size
+            by_magic[m] = by_magic.get(m, 0.0) + lots
+        same_side = {m: q for m, q in by_magic.items()
+                     if abs(q) > 1e-9 and (q > 0) == (need > 0)}
+        if not same_side:
+            return
+        known = self._other_project_magics()
+        theirs = {m: q for m, q in same_side.items() if m in known}
+        unknown = {m: q for m, q in same_side.items() if m not in known}
+        if theirs:
+            _log("note: " + ", ".join(f"magic {m} ({known[m]}) holds {q:+g} lot {SYMBOL_MT5}"
+                                      for m, q in sorted(theirs.items()))
+                 + " — another project's hedge book, not counted here")
+        if not unknown:
+            return
+        lots_need = round_to_step(abs(need) / self.contract_size, self.volume_step)
+        held = ", ".join(f"magic {m}: {q:+g} lot" for m, q in sorted(unknown.items()))
+        held_units = sum(unknown.values()) * self.contract_size
+        msg = (f"{SYMBOL_MT5} holds positions of a magic that is not this bot's "
+               f"({MT5_MAGIC}) nor another project's — {held} ({held_units:+.4f} "
+               f"{UNIT_LABEL}) — on the side the startup hedge would add to "
+               f"({'buy' if need > 0 else 'sell'} {lots_need:g} lot for a drift of "
+               f"{drift:+.4f} {UNIT_LABEL}). That looks like this strategy's own hedge "
+               f"book under an old magic: hedging now would double it. Close or re-tag "
+               f"those tickets, or set MT5_ADOPT_MAGICS = "
+               f"{sorted(unknown)} to count them as this bot's book")
+        if LIVE_TRADING:
+            raise RuntimeError(msg + " — refusing to start LIVE")
+        _log(f"WARNING: {msg} (dry run: starting anyway)")
+
+    def _check_same_platform(self) -> None:
+        """An MT5 quote leg on the SAME gateway as the hedge (one account,
+        two symbols): the two leases need different magics and the legs
+        different symbols, or the gateway refuses the second lease / each
+        leg would count the other's tickets. Refuses to start otherwise."""
+        if not getattr(self.venue.client, "market_orders", False):
+            return
+        v_port = (VENUE_CLIENT_OPTIONS or {}).get("gateway_port")
+        h_port = (MT5_CLIENT_OPTIONS or {}).get("gateway_port")
+        if not v_port or str(v_port) != str(h_port):
+            return
+        v_magic = int((VENUE_CLIENT_OPTIONS or {}).get("magic") or 0)
+        if v_magic == int(MT5_MAGIC or 0):
+            raise RuntimeError(
+                f"same platform (both legs on the MT5 gateway at port {v_port}): the quote "
+                f"leg's VENUE_CLIENT_OPTIONS['magic'] must differ from MT5_MAGIC "
+                f"({MT5_MAGIC}) — each leg is its own magic's tickets")
+        if SYMBOL_VENUE == SYMBOL_MT5:
+            raise RuntimeError(f"same platform: SYMBOL_VENUE and SYMBOL_MT5 are both "
+                               f"{SYMBOL_MT5!r} — the two legs must be different symbols")
+        _log(f"same platform: one MT5 account (gateway port {v_port}) carries both legs — "
+             f"{SYMBOL_VENUE} on magic {v_magic}, {SYMBOL_MT5} on magic {MT5_MAGIC}")
+
+    # ── EXECUTION_MODE 'market': both legs at once ──────────────────────────
+    def _fire_pair(self, key: str, t: dict) -> None:
+        """One MARKET PAIR: the MT5 hedge is handed to the event hedger
+        FIRST (its thread sends it at once) and the venue market order goes
+        out on this thread at the same time; its answer is the venue fill,
+        booked here. The hedger saw a synthetic fill of the ORDERED size: if
+        the venue filled a different size (or nothing), the hedger's residue
+        is corrected by the difference, quotes come down and the reconciler's
+        re-check fixes the real exposure — the user's rule: a refused leg is
+        never chased here."""
+        now = time.time()
+        if self._pair_latched and t["purpose"] != "exit":
+            # entries stay blocked until a restart; EXITS still go: they
+            # close risk, and on a margin refusal they free the margin
+            self._log_once("pair_latched", f"ENTRIES STOPPED: {self._pair_latched} — exits "
+                                           f"still fire; restart the bot once the cause "
+                                           f"is fixed")
+            return
+        held = self.__dict__.setdefault("_pair_held", {})
+        if now < held.get(key, 0.0):
+            return              # its quote leg was refused: not again for a while
+        fired = self.__dict__.setdefault("_fired_t", {})
+        if now - fired.get(key, 0.0) < PAIR_REFIRE_S:
+            return
+        amount = self._placeable_amount(key, t)
+        if amount is None or self.hedger is None:
+            return
+        fired[key] = now
+        self._last_fire_t = now
+        side = t["side"]
+        signed = amount if side == "buy" else -amount
+        k = self.venue_ticker
+        syn = Trade(exchange="pair", trade_id=f"pair-{key}-{int(now * 1000)}",
+                    symbol=SYMBOL_VENUE,
+                    side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                    amount=self.venue.to_contracts(amount), price=float(t["price"] or 0.0),
+                    order_id=f"pair-{key}", timestamp=datetime.now(timezone.utc))
+        self.hedger.submit(syn)                # the MT5 leg leaves now, on its thread
+        basis_seen = None
+        if k is not None and self.ref_bid is not None and self.ref_ask is not None:
+            basis_seen = (k.ask - self.ref_bid) if side == "buy" else (k.bid - self.ref_ask)
+        o = None
+        err = ""
+        try:
+            o = self.venue.place_market(side, amount)
+        except Exception as e:                              # noqa: BLE001
+            err = f"{type(e).__name__}: {e}"
+        filled = self.venue.to_units(o.filled) if o is not None and o.filled else 0.0
+        if filled <= POS_EPS:
+            why = err or (((o.raw or {}) if o is not None and isinstance(o.raw, dict) else {})
+                          .get("comment") or "no fill")
+            self.hedger.parity_sent(-signed, f"{key}: venue leg refused")
+            self.hedge_ok = False
+            self._recheck_at = now + RECONCILE_RECHECK_DELAY_S
+            self._bal_dirty = True
+            # never straight back at it: the hedge latch clears as soon as
+            # the hedge is booked, and each retry costs a hedge and its unwind
+            # (2026-10-14: 130 refused 'No money' pairs in 19 minutes)
+            held[key] = now + (EOD_REFUSED_HOLD_S if key == EOD_KEY else PAIR_REFUSED_HOLD_S)
+            low = why.lower()
+            if any(w in low for w in ("no money", "10019", "insufficient", "margin")):
+                self._pause_entries(t)
+            self._pair_refusals += 1
+            if self._pair_refusals >= PAIR_REFUSED_LATCH:
+                self._pair_latched = (f"{self._pair_refusals} quote legs refused in a row "
+                                      f"(last: {why})")
+            _log(f"ERROR: PAIR {key}: the {SYMBOL_VENUE} {side} {amount:g} market order was "
+                 f"refused ({why}) while the {SYMBOL_MT5} leg went out — quotes down; the "
+                 f"reconciler re-checks in {RECONCILE_RECHECK_DELAY_S:g}s and fixes the "
+                 f"exposure")
+            return
+        self._pair_refusals = 0
+        f_signed = filled if side == "buy" else -filled
+        if abs(f_signed - signed) > POS_EPS:
+            self.hedger.parity_sent(f_signed - signed, f"{key}: venue filled {filled:g} of "
+                                                       f"{amount:g}")
+            self._recheck_at = now + RECONCILE_RECHECK_DELAY_S
+        px = float(o.price) if o.price else float(t["price"] or 0.0)
+        self._last_fire_t = time.time()
+        rec = OrderRec(key=key, side=side, purpose=t["purpose"],
+                       level_index=t["level_index"], level=t["level"],
+                       grid_level=t.get("grid_level"), order_id=o.order_id, price=px,
+                       amount=filled, placed_t=now, taker=True)
+        rec.rest_cum = filled
+        self.orders[key] = rec
+        self.counters["quotes_placed"] += 1
+        nd = _price_nd(px)
+        _log(f"PAIR {key}: {SYMBOL_VENUE} {side} {filled:g} {UNIT_LABEL} @ {px} "
+             f"({(time.time() - now) * 1000:.0f} ms), {SYMBOL_MT5} "
+             f"{'sell' if side == 'buy' else 'buy'} sent alongside — basis seen "
+             + (f"{basis_seen:+.{nd}f}" if basis_seen is not None else "n/a")
+             + f" vs level {t['level']:+g}")
+        self._book(rec, source="place")
+        self._retire_rec(rec)
+        if key == EOD_KEY:
+            self._eod_round_sent(now)
+
+    # ── the end-of-day close (EOD_CLOSE_AT) ─────────────────────────────────
+    def _eod_window(self, now: float) -> Optional[float]:
+        """The close time of the EOD window ``now`` is in, else None. The
+        window runs from the close time until the MT5 symbol reopens after
+        its daily break (the first session reopen seen after the close), or
+        EOD_RESUME_MAX_H at the latest — so a bot restarted the next morning
+        is not held."""
+        start = _eod_start(now)
+        if start is None or now - start > EOD_RESUME_MAX_H * 3600.0:
+            return None
+        reopen = getattr(self, "_session_reopen_t", None)
+        saved = self.__dict__.get("_eod_saved_reopen")
+        if saved is None:
+            try:
+                saved = float(json.loads(EOD_FILE.read_text(encoding="utf-8")).get("reopen_t") or 0.0)
+            except (OSError, ValueError, TypeError):
+                saved = 0.0
+            self._eod_saved_reopen = saved
+        if max(reopen or 0.0, saved) > start:
+            return None
+        # the hedge symbol ticked after the rollover: its break is over (a
+        # freshly started bot sees it on its first live tick)
+        if self.__dict__.get("_mt5_tick_t", 0.0) > _eod_rollover(start):
+            return None
+        if self._eod_day != start:             # a new close: fresh round state
+            self._eod_day, self._eod_rounds = start, 0
+            self._eod_pending, self._eod_failed = None, None
+            self._eod_last_t = None
+        return start
+
+    def _eod_closing(self, now: float) -> bool:
+        """In the EOD window with a position left to close (and no failed
+        check): the close bypasses the calendar blackouts and every gate."""
+        start = self._eod_window(now)
+        return (start is not None and self._eod_failed is None
+                and now < _eod_rollover(start)
+                and abs(self._position_units()) >= max(self.amount_min, POS_EPS))
+
+    def _eod_orders(self, now: float) -> list[DesiredOrder]:
+        """The EOD close's next round: ONE exit of the order size against
+        the position — only once the previous round has checked out."""
+        # the last round is checked too: "flat" in the books is not flat on
+        # both legs until the check says so
+        if self._eod_failed is not None or not self._eod_round_checked(now):
+            return []
+        start = self._eod_day or now
+        if now >= _eod_rollover(start) and self._eod_pending is None:
+            # past the rollover: the close has nothing left to avoid -
+            # nothing is closed; entries wait for the market to tick again
+            self._log_once("eod_late", f"EOD window ({EOD_CLOSE_AT}) but past the rollover "
+                                       f"- nothing is closed; no new entries until "
+                                       f"{SYMBOL_MT5} trades again")
+            return []
+        pos = self._position_units()
+        if abs(pos) < max(self.amount_min, POS_EPS):
+            self._log_once("eod_flat", "EOD CLOSE: flat — no new entries until "
+                                       f"{SYMBOL_MT5} reopens after its daily break")
+            return []
+        # EOD_ROUND_DELAY_S between two rounds' orders (the check above runs
+        # as soon as it can; only the NEXT order waits)
+        last = getattr(self, "_eod_last_t", None)
+        if last is not None and now - last < EOD_ROUND_DELAY_S:
+            return []
+        size = min(abs(pos), self._clip_units() or abs(pos))
+        if self._eod_rounds == 0 and self._eod_pending is None:
+            _log(f"EOD CLOSE: {EOD_CLOSE_AT} — closing {pos:+g} {UNIT_LABEL} in rounds of "
+                 f"{size:g} at least {EOD_ROUND_DELAY_S:g}s apart, each checked on both "
+                 f"legs before the next; no new entries "
+                 f"until {SYMBOL_MT5} reopens")
+        return [DesiredOrder(key=EOD_KEY, side="buy" if pos < 0 else "sell", purpose="exit",
+                             level_index=0, level=0.0, size=round(size, 8))]
+
+    def _eod_round_checked(self, now: float) -> bool:
+        """True when the last round (if any) has checked out on BOTH legs:
+        the venue position is where the round left it, and the MT5 net
+        matches it (parity within RECONCILE_TOLERANCE_UNITS). Re-read, not
+        trusted from the books; a round that does not check out within
+        EOD_ROUND_TIMEOUT_S stops the close."""
+        p = self._eod_pending
+        if p is None:
+            return True
+        if now - p["t"] < 1.0:
+            return False                       # give both terminals a moment
+        if not LIVE_TRADING:
+            venue, mt5 = self.paper_pos_units, -self.paper_pos_units
+        else:
+            try:
+                self.venue.read_position()
+                venue = float(self.venue.position_units or 0.0)
+                mt5 = self._read_mt5_net_units()
+            except Exception as e:                          # noqa: BLE001
+                venue = mt5 = None
+                self._log_once("eod_read", f"EOD CLOSE: round check read failed: {e}")
+        if venue is not None and abs(venue - p["expected"]) <= max(self.amount_min, POS_EPS) / 2 \
+                and abs(venue + mt5) < RECONCILE_TOLERANCE_UNITS:
+            self._eod_pending = None
+            self.venue_pos_units = venue
+            _log(f"EOD CLOSE: round {self._eod_rounds} checked — {SYMBOL_VENUE} {venue:+g}, "
+                 f"{SYMBOL_MT5} hedge {mt5:+g} {UNIT_LABEL}")
+            return True
+        if now - p["t"] > EOD_ROUND_TIMEOUT_S:
+            self._eod_failed = (f"round {self._eod_rounds} did not check out in "
+                                f"{EOD_ROUND_TIMEOUT_S:g}s (venue {venue}, expected "
+                                f"{p['expected']:+g}; MT5 {mt5})")
+            self._recheck_at = now
+            _log(f"ERROR: EOD CLOSE stopped: {self._eod_failed} — the reconciler re-checks "
+                 f"the hedge now; no new entries until {SYMBOL_MT5} reopens")
+        return False
+
+    def _eod_round_sent(self, now: float) -> None:
+        """A round filled: its check is due before the next one."""
+        self._eod_rounds += 1
+        self._eod_last_t = now
+        self._eod_pending = {"t": now, "expected": self._position_units()}
+
+    def _load_paper(self) -> None:
+        """The paper book of a market-mode dry run survives restarts."""
+        try:
+            d = json.loads(PAPER_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            d = {}
+        self.paper_pos_units = float(d.get("pos_units") or 0.0)
+        self.paper_realized_usd = float(d.get("realized_usd") or 0.0)
+        self.paper_pairs = int(d.get("pairs") or 0)
+        self._paper_vl = Ledger.from_dict(d.get("venue_ledger"))
+        self._paper_hl = Ledger.from_dict(d.get("mt5_ledger"))
+
+    def _paper_fire(self, key: str, t: dict) -> None:
+        """A market pair on paper: the venue at its touch, MT5 at its touch
+        (the opposite side), both ledgers booked, the paper position moved —
+        so the grid walks exactly as it would live."""
+        now = time.time()
+        fired = self.__dict__.setdefault("_fired_t", {})
+        if now - fired.get(key, 0.0) < PAIR_REFIRE_S:
+            return
+        k = self.venue_ticker
+        if k is None or self.xau_bid is None or self.xau_ask is None:
+            return
+        fired[key] = now
+        if not hasattr(self, "_paper_vl"):
+            self._load_paper()
+        side, units = t["side"], float(t["amount"])
+        hedge_side = "sell" if side == "buy" else "buy"
+        v_px = float(k.ask if side == "buy" else k.bid)
+        h_px = float(self.xau_bid if side == "buy" else self.xau_ask)
+        basis = v_px - HEDGE_RATIO * h_px
+        realized = (self._paper_vl.apply(side, units, v_px)
+                    + self._paper_hl.apply(hedge_side, units * HEDGE_RATIO, h_px))
+        self.paper_realized_usd += realized
+        self.paper_pairs += 1
+        self._last_fill_t = now           # MIN_ORDER_INTERVAL_S paces paper pairs too
+        self.paper_pos_units = round(self.paper_pos_units + (units if side == "buy" else -units), 8)
+        if key == EOD_KEY:
+            self._eod_round_sent(now)
+        edge = (t["level"] - basis) if side == "buy" else (basis - t["level"])
+        nd = _price_nd(v_px)
+        _log(f"PAPER PAIR {key}: {SYMBOL_VENUE} {side} {units:g} @ {v_px} | {SYMBOL_MT5} "
+             f"{hedge_side} @ {h_px} -> basis {basis:+.{nd}f} vs level {t['level']:+g} "
+             f"({edge:+.{nd}f} through) | paper pos {self.paper_pos_units:+g}, realized "
+             f"{realized:+.2f} (total {self.paper_realized_usd:+.2f} USD, "
+             f"{self.paper_pairs} pairs)")
+        row = {"ts": now, "key": key, "purpose": t["purpose"], "side": side, "units": units,
+               "venue_px": v_px, "mt5_side": hedge_side, "mt5_px": h_px,
+               "basis": round(basis, 6), "level": t["level"], "edge": round(edge, 6),
+               "realized_usd": round(realized, 4), "paper_pos": self.paper_pos_units,
+               "paper_realized_usd": round(self.paper_realized_usd, 4)}
+        try:
+            REPORT_DIR_PAPER = STRATEGY_DIR / "report"
+            REPORT_DIR_PAPER.mkdir(exist_ok=True)
+            with (REPORT_DIR_PAPER / "paper_trades.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row) + "\n")
+            _atomic_write(PAPER_FILE, {"pos_units": self.paper_pos_units,
+                                       "realized_usd": self.paper_realized_usd,
+                                       "pairs": self.paper_pairs, "updated_utc": _utcnow(),
+                                       "venue_ledger": self._paper_vl.to_dict(),
+                                       "mt5_ledger": self._paper_hl.to_dict()})
+        except OSError as e:
+            self._log_once("paper_io", f"warning: paper book not written: {e}")
+
     def _fresh_target(self, key: str, t: dict) -> Optional[dict]:
         """Re-price ``t`` off the MT5 tick and venue book as they are NOW,
         just before the order call. The pass priced every target up front,
@@ -3568,6 +4532,8 @@ class ArbBot:
             self._last_msgs.pop("fresh_tick", None)
             if xau.bid and xau.ask:
                 self.xau_bid, self.xau_ask, self.xau_mid = xau.bid, xau.ask, xau.mid
+        if PRICE_REFERENCE == "ibkr":
+            self._update_ref(time.time(), sample=False)
         feed = getattr(self, "feed", None)
         if feed is not None:
             tk = feed.get_ticker()
@@ -3683,8 +4649,14 @@ class ArbBot:
         """The margin a perpetual ENTRY needs: notional / leverage x
         ``PLACE_MARGIN_SAFETY`` — the strategy's ``LEVERAGE``, else the
         market's initial-margin rate (1 / its max leverage). None when
-        neither is known."""
-        if LEVERAGE:
+        neither is known. A venue whose margin is the BROKER's (an MT5 quote
+        leg: the bot cannot set it, and a fixed-rate CFD ignores even the
+        account's) is judged on the market's rate alone — LEVERAGE (default
+        1 = the whole notional) would refuse every entry."""
+        if getattr(getattr(self.venue, "client", None), "broker_margin", False) and getattr(
+                self.venue, "im_rate", None):
+            per_notional = float(self.venue.im_rate)
+        elif LEVERAGE:
             per_notional = 1.0 / float(LEVERAGE)
         elif getattr(self.venue, "im_rate", None):
             per_notional = float(self.venue.im_rate)
@@ -3857,6 +4829,10 @@ class ArbBot:
                     f"a stale price (feed is live; VENUE_TICKER_STALE_S)")
         if self.feed.private_enabled and not self.feed.private_ok:
             return f"private fill stream down — {self.feed.private_reason}"
+        if PRICE_REFERENCE == "ibkr":
+            why = self._ref_gate()
+            if why:
+                return why
         if not self.venue.order_transport_ready:
             # The price feed being fine says nothing about whether an order
             # can reach the venue. On FIX this is the dangerous direction:
@@ -4013,6 +4989,8 @@ class ArbBot:
         if sig != self._mt5_sig:
             prev, self._mt5_sig = self._mt5_sig, sig
             self._mt5_change_t = now
+            if prev is not None:
+                self._mt5_tick_t = now     # a real tick, not the first read
             if sig[2] and prev and prev[2] and float(sig[2]) > float(prev[2]):
                 # a LIVE tick (it ADVANCED: the first one seen is the
                 # gateway's last, of any age): server clock vs wall clock,
@@ -4028,6 +5006,11 @@ class ArbBot:
             # hold quotes for REOPEN_BLACKOUT_S — the first prints of a
             # reopen are the widest of the day
             self._session_reopen_t = now
+            if _EOD is not None:
+                try:
+                    _atomic_write(EOD_FILE, {"reopen_t": now, "updated_utc": _utcnow()})
+                except OSError:
+                    pass
             if REOPEN_BLACKOUT_S:
                 _log(f"{SYMBOL_MT5} is quoting again — reopen blackout: no quotes "
                      f"for {REOPEN_BLACKOUT_S / 60:g} min "
@@ -4039,6 +5022,8 @@ class ArbBot:
             return          # the slow tick retires quotes and logs it
         self.xau_mid = xau.mid
         self.xau_bid, self.xau_ask = xau.bid, xau.ask
+        if PRICE_REFERENCE == "ibkr":
+            self._update_ref(now)
 
         # perp top-of-book from the ws cache — the ONLY source quotes are
         # priced off. With the feed unfit (_ws_gate) the pass ends here; the
@@ -4074,7 +5059,7 @@ class ArbBot:
         whenever sampling stops, which fails safe for the gate."""
         k = self.venue_ticker
         self._basis_loop_t = now
-        self._push_basis(now, k.bid - self.ref_bid, k.ask - self.ref_ask)
+        self._push_basis(now, *_basis_pair(k.bid, k.ask, self.ref_bid, self.ref_ask))
 
     def _push_basis(self, now: float, bid_basis: float, ask_basis: float) -> None:
         """Append one basis sample and republish the averages (the loop's
@@ -4111,8 +5096,12 @@ class ArbBot:
         if q[-1][0] - q[0][0] >= BASIS_WINDOW_S - 1.0:
             self.basis_avg_bid = sum(s[1] for s in q) / len(q)
             self.basis_avg_ask = sum(s[2] for s in q) / len(q)
+            # the anchor counts: it is the basis that held at the window's start
+            self.basis_max_bid = max(s[1] for s in q)
+            self.basis_min_ask = min(s[2] for s in q)
         else:
             self.basis_avg_bid = self.basis_avg_ask = None
+            self.basis_max_bid = self.basis_min_ask = None
 
     # ── the basis filler: the window keeps being fed while the loop blocks ──
     # The anchor above absorbs a ~1 s stall; a slower venue does not stop at
@@ -4154,8 +5143,11 @@ class ArbBot:
         with self._basis_lock:
             if not self._basis_samples:
                 return False    # the loop cleared the window meanwhile
-            self._push_basis_locked(now, tk.bid - HEDGE_RATIO * x.bid,
-                                    tk.ask - HEDGE_RATIO * x.ask)
+            q = self._ref_quote(x.bid, x.ask)
+            if q is None:
+                return False
+            self._push_basis_locked(now, *_basis_pair(tk.bid, tk.ask, HEDGE_RATIO * q[0],
+                                                      HEDGE_RATIO * q[1]))
         return True
 
     def _basis_filler(self) -> None:
@@ -4165,30 +5157,63 @@ class ArbBot:
             except Exception:                               # noqa: BLE001
                 pass            # a filler bug never touches the loop
 
+    def _order_interval_gate(self, desired: list[DesiredOrder],
+                             now: Optional[float] = None) -> list[DesiredOrder]:
+        """MIN_ORDER_INTERVAL_S: for that long after ANY fill, no order is
+        quoted - entries AND exits (a resting one is cancelled by the sync,
+        none is placed). The margin de-risk exit is exempt: it exists to get
+        out, and waiting is the one thing it must not do."""
+        if not MIN_ORDER_INTERVAL_S or not self._last_fill_t:
+            return desired
+        now = time.time() if now is None else now
+        left = self._last_fill_t + float(MIN_ORDER_INTERVAL_S) - now
+        if left <= 0:
+            self._last_msgs.pop("order_interval", None)
+            return desired
+        held = [d for d in desired if d.key != RISK_FLAT_KEY]
+        if held:
+            self._log_once("order_interval", f"orders paused {float(MIN_ORDER_INTERVAL_S):g} s "
+                                             f"after a fill (MIN_ORDER_INTERVAL_S), exits "
+                                             f"included")
+        return [d for d in desired if d.key == RISK_FLAT_KEY]
+
     def _basis_gate(self, desired: list[DesiredOrder]) -> list[DesiredOrder]:
         """BASIS_TRIGGER submission filter: keep an order only while the
         rolling basis average is at/through its spread level — buys while
         avg(perp_bid − k·xau_bid) <= level, sells while avg(perp_ask − k·xau_ask)
         >= level. An order that armed stays live until the average retreats
         BASIS_RELEASE back inside (hysteresis). No average (warm-up,
-        stale feed) drops everything — fail safe."""
+        stale feed) drops everything — fail safe.
+
+        BASIS_TRIGGER_MODE 'min/max' arms on the whole window instead of its
+        average — a buy only while the HIGHEST bid basis is at/below the
+        level, a sell only while the LOWEST ask basis is at/above it — and
+        releases on the average exactly as 'avg' does."""
         if not BASIS_TRIGGER:
             return desired
+        minmax = BASIS_TRIGGER_MODE == "min/max"
         out: list[DesiredOrder] = []
         for d in desired:
-            avg = self.basis_avg_bid if d.side == "buy" else self.basis_avg_ask
+            buy = d.side == "buy"
+            avg = self.basis_avg_bid if buy else self.basis_avg_ask
             armed = self._basis_armed.get(d.key, False)
-            if avg is None:
+            # what this pass is judged on: arming in 'min/max' mode reads the
+            # window's worst sample for the order, holding reads the average
+            arm_on, what = avg, "avg"
+            if minmax and not armed:
+                arm_on = self.basis_max_bid if buy else self.basis_min_ask
+                what = "max" if buy else "min"
+            if avg is None or arm_on is None:
                 live = False
-            elif d.side == "buy":
-                live = avg <= d.level + (BASIS_RELEASE if armed else 0.0)
+            elif buy:
+                live = arm_on <= d.level + (BASIS_RELEASE if armed else 0.0)
             else:
-                live = avg >= d.level - (BASIS_RELEASE if armed else 0.0)
+                live = arm_on >= d.level - (BASIS_RELEASE if armed else 0.0)
             if live != armed:
                 _log(f"basis trigger {'ARMED' if live else 'released'} "
-                     f"{d.key}: avg_{'bid' if d.side == 'buy' else 'ask'} "
-                     f"{avg:+.3f} vs level {d.level:+.3f}"
-                     if avg is not None else
+                     f"{d.key}: {what}_{'bid' if buy else 'ask'} "
+                     f"{arm_on:+.3f} vs level {d.level:+.3f}"
+                     if avg is not None and arm_on is not None else
                      f"basis trigger released {d.key}: no fresh basis average")
             self._basis_armed[d.key] = live
             if live:
@@ -4282,9 +5307,9 @@ class ArbBot:
         reason = self._ws_gate()
         if reason:
             self.ws_ok, self.ws_sleep_reason = False, reason
-            self._log_once("ws_sleep", f"crypto venue ws down — sleeping (quotes down, "
+            self._log_once("ws_sleep", f"quote exchange ws down — sleeping (quotes down, "
                                        f"reconcile only): {reason}")
-            self._retire_all_quotes(f"crypto venue ws down: {reason}")
+            self._retire_all_quotes(f"quote exchange ws down: {reason}")
             self.venue_source = "none"
             self.spread_now = None
             # a gap in the basis window must not span the sleep (ws_ok is
@@ -4294,7 +5319,7 @@ class ArbBot:
                 self.basis_avg_bid = self.basis_avg_ask = None
         else:
             if self._last_msgs.pop("ws_sleep", None):
-                _log("crypto venue ws up — quoting resumes")
+                _log("quote exchange ws up — quoting resumes")
             self.ws_ok, self.ws_sleep_reason = True, None
         # the private fill stream gets its own once-logged warning, on its own
         # schedule: it is not a ticker problem and must never hide behind one
@@ -4352,6 +5377,7 @@ class ArbBot:
         self._phase("refresh_balances", self._refresh_balances, now)
         self._phase("place_margin", self._refresh_place_margin, now)   # an entry found it stale
         self._phase("risk", self._refresh_risk, now)   # daily limits + de-risk
+        self._phase("close_only", self._update_gate_reasons)   # close_only.signal, live
         self._phase("position_reconcile", self._reconcile_position, now)
         if not self.hedge_ok:
             self._retire_all_quotes("hedge leg down — exposure parity broken")
@@ -4610,7 +5636,11 @@ class ArbBot:
             if getattr(self.mt5, "is_connected", False):
                 rep.read_mt5_deals(self.mt5, SYMBOL_MT5, self._srv_offset_s)
         k = self.venue_ticker
-        rep.mark(now, k.mid if k else None, self.xau_mid)
+        # a venue feed that is down has no price: its last mid is not recorded
+        # as one (quiet is not dead — only the connection's health counts)
+        feed = getattr(self, "feed", None)
+        rep.mark(now, k.mid if k else None, self.xau_mid,
+                 venue_live=bool(getattr(feed, "public_ok", True)))
         if final:
             rep.close(self._venue_report(), self._mt5_report(), live_trading=LIVE_TRADING)
         elif rep.due(now):
@@ -4647,7 +5677,11 @@ class ArbBot:
                       "maintenance_margin": self.venue_maintenance_margin,
                       "unrealized_funding": self.venue_unrealized_funding,
                       "total_unrealized": self.venue_total_unrealized,
-                      "pnl": self.venue_pnl, "ts": self._venue_margin_t}
+                      "pnl": self.venue_pnl, "ts": self._venue_margin_t,
+                      # the account's own currency when the figures were
+                      # converted into the quote currency (an EUR MT5 account)
+                      "ccy": getattr(self.venue, "account_ccy", None),
+                      "usd_rate": getattr(self.venue, "account_usd_rate", None)}
         if not self.is_perp and self.venue.free_base is not None:
             # the WHOLE account, not the traded pair. A spot account is
             # shared — with other strategies, with manual trading, with
@@ -4774,6 +5808,12 @@ class ArbBot:
             "exposure_drift_units": round(self._venue_exposure_units()
                                        + self.mt5_net_units, 4),
             "hedge_ok": self.hedge_ok,
+            # the hedge MT5 refused for the request itself, held (see _hedge)
+            "hedge_refusal": ({k: v for k, v in self.hedge_refusal.items()
+                               if k not in ("t", "until")}
+                              if self.hedge_refusal else None),
+            "mt5_volume_max": self.volume_max or None,
+            "mt5_adopt_magics": list(MT5_ADOPT_MAGICS),
             # can the terminal take a hedge right now (and why not)
             "mt5_health": getattr(self, "mt5_health", None),
             "hedge_mode": HEDGE_MODE,
@@ -4885,11 +5925,40 @@ class ArbBot:
             },
             # always present (the rolling averages); ``enabled``/``armed`` say
             # whether they also gate submission
+            "price_reference": {
+                "source": PRICE_REFERENCE,
+                "symbol": REF_SYMBOL if PRICE_REFERENCE == "ibkr" else SYMBOL_MT5,
+                "ref_bid": self.ref_src_bid, "ref_ask": self.ref_src_ask,
+                "offset": None if self.ref_offset is None else round(self.ref_offset, 4),
+                "offset_samples": len(self.__dict__.get("_ref_offsets") or ()),
+                "ref_age_s": (round(self.ref_feed.ticker_age_s, 2)
+                              if self.ref_feed is not None else None),
+                "gate": self._ref_gate() if PRICE_REFERENCE == "ibkr" else None,
+            },
+            "execution": {
+                "mode": EXECUTION_MODE,
+                "pairs_stopped": self._pair_latched,
+                "eod": None if _EOD is None else {
+                    "at": EOD_CLOSE_AT,
+                    "window": self._eod_window(time.time()) is not None,
+                    "rounds": self._eod_rounds, "pending": self._eod_pending is not None,
+                    "failed": self._eod_failed},
+                "paper": ({"pos_units": self.paper_pos_units,
+                           "realized_usd": round(self.paper_realized_usd, 2),
+                           "pairs": self.paper_pairs}
+                          if MARKET_PAIR and not LIVE_TRADING else None),
+            },
             "basis_trigger": {
                 "enabled": BASIS_TRIGGER, "window_s": BASIS_WINDOW_S,
-                "release_usd": BASIS_RELEASE,
+                "release_usd": BASIS_RELEASE, "mode": BASIS_TRIGGER_MODE,
+                "basis_mode": BASIS_MODE,
+                "max_bid": None if self.basis_max_bid is None
+                else round(self.basis_max_bid, 4),
+                "min_ask": None if self.basis_min_ask is None
+                else round(self.basis_min_ask, 4),
                 "optimize_limit_offset": OPTIMIZE_LIMIT_OFFSET,
                 "optimize_limit_taker": OPTIMIZE_LIMIT_TAKER,
+                "min_tob_spread": MIN_TOB_SPREAD,
                 "avg_bid": None if self.basis_avg_bid is None
                 else round(self.basis_avg_bid, 4),
                 "avg_ask": None if self.basis_avg_ask is None
@@ -4958,8 +6027,11 @@ class ArbBot:
         xau = self.mt5.get_ticker(SYMBOL_MT5)
         sig = (xau.bid, xau.ask, (xau.raw or {}).get("time_msc"))
         pushes = self.feed.counters["tickers"]
-        event = urgent or sig != self._mt5_sig or pushes != self._bbo_seen
+        ref_pushes = self.ref_feed.counters["tickers"] if self.ref_feed is not None else 0
+        event = (urgent or sig != self._mt5_sig or pushes != self._bbo_seen
+                 or ref_pushes != self._ref_seen)
         self._bbo_seen = pushes
+        self._ref_seen = ref_pushes
         run_pass = urgent
         if event and not urgent:
             if now - self._last_pass_t >= QUOTE_THROTTLE_S:
@@ -5095,7 +6167,9 @@ class ArbBot:
                 self._drain_event_hedges()      # book what it sent last
             except Exception:
                 pass
-        for client in (self.venue, self.mt5):
+        for client in (self.venue, self.mt5, self.ref_client):
+            if client is None:
+                continue
             try:
                 client.disconnect()
             except Exception:

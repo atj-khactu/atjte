@@ -13,6 +13,7 @@ same)::
     hyperliquid    Hyperliquid (perpetuals + spot)
     lighter        Lighter (perpetuals)
     ibkr           Interactive Brokers (listed futures, through TWS / IB Gateway)
+    mt5            an MT5 broker's CFD as the QUOTE leg (market orders only)
 
 ``family`` is the exchange name a user thinks in (``kraken``, ``binance``);
 ``kind`` says what the id trades. Adding an exchange is adding a row here
@@ -26,13 +27,13 @@ from dataclasses import dataclass
 from typing import Optional
 
 #: The exchanges, in the order the panel lists them.
-FAMILIES = ("kraken", "coinbase", "binance", "hyperliquid", "lighter", "ibkr")
+FAMILIES = ("kraken", "coinbase", "binance", "hyperliquid", "lighter", "ibkr", "mt5")
 
 #: The ids that are NOT CCXT exchanges: their gateway speaks the platform's
 #: own API and hands the bot CCXT-SHAPED markets, tickers and fills, so the
 #: engine is unchanged — but nothing may look them up in ``ccxt`` /
 #: ``ccxt.pro`` (the registry's honesty tests, the panel's catalogue).
-NON_CCXT = ("ibkr",)
+NON_CCXT = ("ibkr", "mt5")
 
 
 #: the order-execution transports, most direct last. These are the values of
@@ -102,6 +103,11 @@ SUPPORTED: dict[str, Venue] = {
     # API and hands the bot CCXT-shaped markets, tickers and fills. The keys
     # live in TWS itself (the gateway knows only the account id).
     "ibkr": Venue("ibkr", "ibkr", "Interactive Brokers (futures)", "future"),
+    # not a CCXT exchange: an MT5 terminal's symbol through that terminal's
+    # MT5 gateway (atjte.clients.gateway.MT5VenueClient) — a CFD against
+    # another broker's CFD, traded with MARKET orders on both legs
+    # (EXECUTION_MODE = 'market'); the market is CCXT-shaped from the specs.
+    "mt5": Venue("mt5", "mt5", "MetaTrader 5 (CFD, market orders)", "perp"),
 }
 
 
@@ -181,7 +187,8 @@ def transports(exchange_id: Optional[str]) -> tuple[str, ...]:
 #: EVERY platform connection goes through a gateway (:mod:`atjte.gateways`).
 #: Which gateway kind serves a venue — its own where it has one, the CCXT
 #: gateway otherwise; a Kraken venue can also take the Kraken FIX gateway.
-GATEWAY_KIND_OF = {"hyperliquid": "hyperliquid", "lighter": "lighter", "ibkr": "ibkr"}
+GATEWAY_KIND_OF = {"hyperliquid": "hyperliquid", "lighter": "lighter", "ibkr": "ibkr",
+                   "mt5": "mt5"}
 FIX_GATEWAY_VENUES = ("kraken", "krakenfutures")
 #: the bot-side connector for each gateway kind (``VENUE_CLIENT``)
 GATEWAY_CONNECTORS = {
@@ -189,6 +196,7 @@ GATEWAY_CONNECTORS = {
     "hyperliquid": "atjte.clients.gateway.HyperliquidGatewayClient",
     "lighter": "atjte.clients.gateway.LighterGatewayClient",
     "ibkr": "atjte.clients.gateway.IbkrGatewayClient",
+    "mt5": "atjte.clients.gateway.MT5VenueClient",
     "fix:kraken": "atjte.clients.gateway.KrakenFixClient",
     "fix:krakenfutures": "atjte.clients.gateway.KrakenFuturesFixClient",
 }
@@ -196,8 +204,11 @@ GATEWAY_CONNECTORS = {
 MT5_GATEWAY_CONNECTOR = "atjte.clients.gateway.MT5GatewayClient"
 #: the hedge on cTrader (``MT5_CLIENT``): through the account's cTrader gateway
 CTRADER_GATEWAY_CONNECTOR = "atjte.clients.gateway.CTraderGatewayClient"
+#: the hedge on Interactive Brokers (``MT5_CLIENT``): the IBKR gateway's hedge side
+IBKR_HEDGE_GATEWAY_CONNECTOR = "atjte.clients.gateway.IbkrHedgeGatewayClient"
 #: the hedge connector for each hedge gateway kind
-HEDGE_CONNECTORS = {"mt5": MT5_GATEWAY_CONNECTOR, "ctrader": CTRADER_GATEWAY_CONNECTOR}
+HEDGE_CONNECTORS = {"mt5": MT5_GATEWAY_CONNECTOR, "ctrader": CTRADER_GATEWAY_CONNECTOR,
+                    "ibkr": IBKR_HEDGE_GATEWAY_CONNECTOR}
 
 
 def gateway_kinds(exchange_id: Optional[str]) -> tuple[str, ...]:

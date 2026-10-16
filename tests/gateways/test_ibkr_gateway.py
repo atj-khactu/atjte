@@ -916,5 +916,191 @@ class ConnectorTest(GatewayCase):
             v.disconnect()
 
 
+
+class CommodityReferenceTest(unittest.TestCase):
+    """IBKR's spot XAUUSD (CMDTY on SMART): accepted in gateway.json and
+    served as one spot market, XAUUSD/USD - a price reference, not traded."""
+
+    def test_a_cmdty_spec_is_accepted(self):
+        spec = CFG.parse_contract({"symbol": "XAUUSD", "exchange": "SMART",
+                                   "currency": "USD", "sec_type": "CMDTY"})
+        self.assertEqual(spec.sec_type, "CMDTY")
+        with self.assertRaises(CFG.ConfigError):
+            CFG.parse_contract({"symbol": "GLD", "exchange": "SMART", "sec_type": "STK"})
+
+    def test_the_market_is_spot_without_expiry(self):
+        c = mock.Mock(conId=69067924, symbol="XAUUSD", currency="USD", localSymbol="XAUUSD",
+                      exchange="SMART", primaryExchange="", secType="CMDTY",
+                      lastTradeDateOrContractMonth="")
+        cd = mock.Mock(contract=c, minTick=0.01, longName="London Gold Spot")
+        spec = CFG.ContractSpec("XAUUSD", "SMART", "USD", "CMDTY")
+        m = U.market_from_commodity(cd, spec)
+        self.assertEqual(m["symbol"], "XAUUSD/USD")
+        self.assertTrue(m["spot"])
+        self.assertFalse(m["contract"])
+        self.assertIsNone(m["expiry"])
+        self.assertEqual(m["precision"]["price"], 0.01)
+
+
+class ExecutionJournalTest(UpstreamTest):
+    """TWS serves the API only today's executions (IB Gateway: since
+    midnight), so the gateway keeps every execution it sees in its own
+    journal: a fill from before a restart or before midnight stays in
+    ``fetch_my_trades``, where a bot's start-up catch-up and ``atjte
+    backfill`` read it."""
+
+    def setUp(self):
+        super().setUp()
+        from atjte.gateways.ibkr.journal import ExecutionJournal
+        self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "executions.jsonl"
+        self.up._journal = ExecutionJournal(self.path)
+
+    def _fill(self, eid, when, side="BOT", price=4200.0, account=ACCOUNT_ID, fee=1.17):
+        from ib_async import CommissionReport, Execution, Fill
+        ex = Execution(execId=eid, time=when, acctNumber=account, side=side, shares=1.0,
+                       price=price, orderId=600)
+        rep = (CommissionReport(execId=eid, commission=fee, currency="USD")
+               if fee is not None else CommissionReport())
+        return Fill(self.up._contracts[MGC], ex, rep, when)
+
+    def _trades(self, **a):
+        return self.up.read("main", "fetch_my_trades", {"symbol": MGC, **a})
+
+    def test_the_start_up_backfill_keeps_what_tws_serves(self):
+        yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+        fills = [self._fill("e.1", yesterday), self._fill("e.2", yesterday, side="SLD")]
+
+        async def req():
+            return fills
+        self.ib.reqExecutionsAsync = req
+        asyncio.run(self.up._backfill_executions())
+        self.assertEqual(len(self.up._journal), 2)
+        # TWS forgets them at midnight; a restarted gateway still serves them
+        from atjte.gateways.ibkr.journal import ExecutionJournal
+        self.up._journal = ExecutionJournal(self.path)
+        self.ib._fills = []
+        self.assertEqual([t["id"] for t in self._trades()], ["e.1", "e.2"])
+
+    def test_live_and_replayed_fills_are_kept_with_their_fee(self):
+        now = datetime.now(timezone.utc)
+        live = self._fill("e.3", now, fee=None)                 # the placeholder report
+        self.up._on_exec(None, live)
+        self.assertIsNone(self.up._journal.trades()[0]["fee"])
+        rep = live.commissionReport
+        rep.execId, rep.commission, rep.currency = "e.3", 1.17, "USD"
+        self.up._on_commission(None, live, rep)
+        self.assertEqual(self.up._journal.trades()[0]["fee"], {"cost": 1.17, "currency": "USD"})
+        old = self._fill("e.4", now - timedelta(hours=3))        # a replay: kept, not pushed
+        self.up._on_exec(None, old)
+        self.up._on_commission(None, old, old.commissionReport)
+        self.assertEqual(sorted(t["id"] for t in self.up._journal.trades()), ["e.3", "e.4"])
+        self.assertEqual(sum(1 for p in self.pushed if p[0] == "fill"), 2)   # e.3 twice
+
+    def test_history_merges_the_journal_and_the_session(self):
+        now = datetime.now(timezone.utc)
+        self.up._journal.record([self.up.trade_dict(self._fill("e.5", now - timedelta(days=2))),
+                                 self.up.trade_dict(self._fill("e.6", now - timedelta(days=2),
+                                                               account="DU0000001"))])
+        self.ib._fills = [self._fill("e.7", now)]
+        self.assertEqual([t["id"] for t in self._trades()], ["e.5", "e.7"])   # its account only
+        since = int((now - timedelta(days=1)).timestamp() * 1000)
+        self.assertEqual([t["id"] for t in self._trades(since=since)], ["e.7"])
+        self.assertIn("e.7", {t["id"] for t in self.up._journal.trades()})   # read = kept
+
+    def test_a_copy_without_fee_never_replaces_one_with(self):
+        from atjte.gateways.ibkr.journal import ExecutionJournal
+        now = datetime.now(timezone.utc)
+        with_fee = self.up.trade_dict(self._fill("e.8", now))
+        self.assertEqual(self.up._journal.record([with_fee]), 1)
+        self.assertEqual(self.up._journal.record([self.up.trade_dict(self._fill("e.8", now, fee=None))]), 0)
+        self.assertEqual(self.up._journal.record([with_fee]), 0)
+        self.up._journal.record([{**with_fee, "price": 4201.0}])      # a corrected copy
+        lines = self.path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        j = ExecutionJournal(self.path)                               # compacted at load
+        self.assertEqual(j.trades()[0]["price"], 4201.0)
+        self.assertEqual(len(self.path.read_text(encoding="utf-8").splitlines()), 1)
+
+
+def _gc_details(last, con_id):
+    from ib_async import ContractDetails, Future
+    c = Future(symbol="GC", exchange="COMEX", currency="USD", conId=con_id,
+               lastTradeDateOrContractMonth=last, multiplier="100", localSymbol="GCZ6",
+               tradingClass="GC")
+    return ContractDetails(contract=c, minTick=0.1, longName="Gold")
+
+
+class AddContractsTest(UpstreamTest):
+    """A contract saved to a RUNNING gateway's gateway.json is listed from
+    TWS and added to the session, and markets.json rewritten — the panel's
+    New strategy dialog offers it without a gateway or panel restart."""
+
+    def setUp(self):
+        super().setUp()
+        self.asked = []
+
+        async def details(contract):
+            self.asked.append(contract.symbol)
+            if contract.symbol == "GC":
+                return [_gc_details("20270224", 2002), _gc_details("20261229", 2001)]
+            return []
+        self.ib.reqContractDetailsAsync = details
+        self.tmp = Path(tempfile.mkdtemp())
+        self.logs = []
+
+    def _write_config(self, contracts):
+        p = self.tmp / CFG.CONFIG_NAME
+        p.write_text(json.dumps({"name": "ib", "venue": "ibkr", "contracts": contracts}),
+                     encoding="utf-8")
+        return p.stat().st_mtime
+
+    def test_a_new_spec_is_listed_and_a_known_one_is_not_asked_again(self):
+        before = self.up._markets
+        added, failed = self.up.add_contracts([CFG.ContractSpec("MGC", "COMEX"),
+                                               CFG.ContractSpec("GC", "COMEX")])
+        self.assertEqual(failed, {})
+        self.assertEqual(added, ["GC/USD:USD-261229", "GC/USD:USD-270224"])
+        self.assertEqual(self.asked, ["GC"])                        # MGC is loaded already
+        self.assertIn(MGC, self.up._markets)                         # nothing removed
+        self.assertIsNot(self.up._markets, before)                   # rebound, not grown
+        self.assertEqual(self.up._sym_of[2001], "GC/USD:USD-261229")
+        rows = {r["symbol"]: r for r in self.up.market_rows()}
+        self.assertEqual(rows["GC/USD:USD-261229"]["contract_size"], 100.0)
+        self.assertEqual(self.up.add_contracts([CFG.ContractSpec("GC", "COMEX")]), ([], {}))
+
+    def test_a_spec_tws_does_not_list_fails_alone(self):
+        added, failed = self.up.add_contracts([CFG.ContractSpec("ZZ", "COMEX"),
+                                               CFG.ContractSpec("GC", "COMEX")])
+        self.assertEqual(len(added), 2)
+        self.assertIn("ZZ@COMEX", failed)
+        self.assertIn("lists no FUT contract", failed["ZZ@COMEX"])
+
+    def test_the_watch_adds_what_gateway_json_gained_and_rewrites_markets_json(self):
+        from atjte.gateways.ibkr import daemon as D
+        seen = self._write_config([{"symbol": "MGC", "exchange": "COMEX"}])
+        self.assertEqual(D.contracts_tick(self.tmp, "paper", self.up, seen, self.logs.append),
+                         seen)                                       # unchanged: nothing read
+        self.assertEqual(self.asked, [])
+        time.sleep(0.02)
+        seen2 = self._write_config([{"symbol": "MGC", "exchange": "COMEX"},
+                                    {"symbol": "GC", "exchange": "COMEX"}])
+        self.assertEqual(D.contracts_tick(self.tmp, "paper", self.up, seen, self.logs.append),
+                         seen2)
+        listed = json.loads((self.tmp / CFG.MARKETS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(sorted(m["symbol"] for m in listed["markets"]),
+                         ["GC/USD:USD-261229", "GC/USD:USD-270224", MGC])
+        self.assertTrue(any("listed 2 new market(s)" in m for m in self.logs))
+
+    def test_an_unparsable_edit_adds_nothing_and_says_so(self):
+        from atjte.gateways.ibkr import daemon as D
+        seen = self._write_config([{"symbol": "GC", "exchange": "COMEX", "sec_type": "STK"}])
+        self.assertEqual(D.contracts_tick(self.tmp, "paper", self.up, 0.0, self.logs.append),
+                         seen)
+        self.assertEqual(self.asked, [])
+        self.assertFalse((self.tmp / CFG.MARKETS_NAME).exists())
+        self.assertTrue(any("do not parse" in m for m in self.logs))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
