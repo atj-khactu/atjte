@@ -14,6 +14,39 @@ opens no venue connection of its own.
 `atjte` is the open-source engine and its gateways (MIT). ATJ's strategy
 control panel is a separate application built on it.
 
+## Disclaimer
+
+**Read this before you install or run atjte.**
+
+- **Financial risk.** atjte places real orders with real money on
+  exchanges and MetaTrader 5 brokers. Trading crypto assets, perpetual
+  futures, futures and CFDs is highly risky. Leverage can lose more than you
+  deposit, and arbitrage is not risk-free: a hedge can fail, fill late or
+  fill at a worse price, a venue or broker can go down, and a spread can move
+  against you for longer than your margin lasts. Only trade money you can
+  afford to lose. Nothing in this repository, its samples or its documentation
+  is financial, investment or trading advice. The sample strategies are
+  examples, not recommendations.
+- **Bugs and errors.** This software may contain bugs, errors and
+  incomplete features, any of which can cause unintended orders, unhedged
+  positions or losses. Run every strategy in dry run (`LIVE_TRADING = False`)
+  and with small sizes first, and watch it.
+- **AI-written code.** This project was "vibe coded": it was written largely
+  with AI coding assistants, and it has not been independently reviewed,
+  audited or certified. Read the code before you trust it with money.
+- **Your strategies, your settings.** You alone decide which strategies run
+  and with what settings, and you are responsible for every strategy file
+  and setting you run, write, edit or import: the sample strategies,
+  the templates and the defaults included. Check every size, limit and level
+  against your own accounts before you go live.
+- **No liability.** The software is provided "as is", without warranty of
+  any kind. The author, ATJ Traders and the contributors accept no liability
+  for any loss or damage of any kind arising from its use, including trading
+  losses, lost profits and losses caused by bugs, outages or third-party
+  platforms. You use atjte entirely at your own risk and are solely
+  responsible for your trading decisions and for complying with the laws
+  and the platforms' terms that apply to you. See `LICENSE`.
+
 ## Install
 
 ```
@@ -170,4 +203,4 @@ python tests/arb/test_arb_bot.py          # one file (stdlib unittest, no pytest
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see `LICENSE`. Use is subject to the [Disclaimer](#disclaimer) above.
