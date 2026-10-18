@@ -12,7 +12,7 @@ import ast
 import unittest
 from pathlib import Path
 
-TYPES = Path(__file__).resolve().parents[1] / "src" / "atjte" / "strategy_types" / "ccxt"
+TYPES = Path(__file__).resolve().parents[1] / "src" / "atjte" / "strategy_types" / "arb"
 
 
 def _module_names(tree: ast.Module) -> set:

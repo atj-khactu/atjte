@@ -18,7 +18,7 @@ same key for its address. Reads (REST) ask about ``user`` = the address.
 Liveness, the engine's rules: a private stream is OK only once the venue has
 acknowledged that account's fills subscription (``subscriptionResponse`` or
 its ``userFills`` frame — an account that never traded gets an EMPTY
-snapshot CCXT would swallow, see ``atjte.engines.ccxt.venue_feed``) and while
+snapshot CCXT would swallow, see ``atjte.engines.arb.venue_feed``) and while
 its connection is up; the public side is OK while its connection is up
 (quiet is not dead: a market that does not move sends nothing).
 """

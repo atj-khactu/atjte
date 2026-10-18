@@ -22,12 +22,21 @@ THE FILE (``version`` 2, 2026-10-16)::
      "hedge_exchange": "mt5",         "hedge_symbol": "USDJPY",
      "atjte_version": "0.2.7",        "acp_version": "0.1.7",
      "symbol_venue": ..., "symbol_mt5": ...,     # version 1's names, still written
-     "settings": {NAME: "python literal", ...}}
+     "settings": {NAME: "python literal", ...},
+     "descriptions": {NAME: "what it does", ...}}   # a sample's; Import ignores it
 
 ``atjte_version`` / ``acp_version`` are what WROTE the file. A sample also
 says what it NEEDS: ``min_atjte_version`` / ``min_acp_version``, the first
 release whose engine and form know every setting it carries and take its
 values (:func:`requirement_gaps`).
+
+THE SCHEDULE (:data:`SCHEDULE`, 2026-10-17) travels as ONE unit: the
+schedule timezone, the seven days' trading hours and every session break —
+what the panel's Trading Sessions tab holds. Hours mean nothing without the
+zone they are in, so a file either carries the whole schedule (Export always
+writes it, every sample has it) and Import replaces the strategy's with it,
+a name the file lacks taking the engine default; or it carries none of it
+and the strategy's own schedule is kept untouched — never a mix.
 
 ``quote_exchange`` is the CCXT id (``EXCHANGE_ID``), ``hedge_exchange`` the
 hedge platform (``mt5`` / ``ctrader`` / ``ibkr``: the kind of the
@@ -59,6 +68,18 @@ MINIMUM = ("min_atjte_version", "min_acp_version")
 #: the fields that must match the strategy a file is loaded into: the sizes
 #: are in the pair's own units on its own platforms
 PAIR = ("quote_exchange", "quote_symbol", "hedge_exchange", "hedge_symbol")
+#: the strategy's SCHEDULE — when it may quote: the timezone the hours are
+#: in, the seven days' hours, and the session breaks (the dated holidays and
+#: macro events, the daily windows, the market-open pauses, the reopen
+#: blackout and the default windows). Imported and exported as ONE unit
+#: (:func:`schedule_of`)
+SCHEDULE = ("BLACKOUT_TZ",
+            "SESSION_MON", "SESSION_TUE", "SESSION_WED", "SESSION_THU",
+            "SESSION_FRI", "SESSION_SAT", "SESSION_SUN",
+            "MARKET_OPEN_BREAKS", "MARKET_OPEN_BREAK_MIN",
+            "BREAK_MARKETS", "BREAK_ASSET_CLASS", "HOLIDAYS", "MACRO_EVENTS",
+            "DAILY_BLACKOUTS", "SESSION_REOPEN_BLACKOUT_MIN",
+            "BLACKOUT_BEFORE_MIN", "BLACKOUT_AFTER_MIN")
 
 
 def sample_files() -> list[Path]:
@@ -157,6 +178,18 @@ def requirement_gaps(body: dict, acp: Optional[str], atjte: Optional[str]) -> li
         if need and newer(str(need), mine):
             out.append(f"needs {what} {need} or later (this is {mine})")
     return out
+
+
+def schedule_of(body: dict) -> Optional[dict]:
+    """The schedule a settings file carries — ``{name: literal text}`` for
+    the :data:`SCHEDULE` names it holds — or None when it holds none of
+    them (the file says nothing about when to quote). A file holding only
+    some is still a schedule: the names it lacks are the engine defaults."""
+    settings = (body or {}).get("settings") if isinstance(body, dict) else None
+    if not isinstance(settings, dict):
+        return None
+    found = {n: settings[n] for n in SCHEDULE if n in settings}
+    return found or None
 
 
 def samples_for(symbol_venue: Optional[str], symbol_mt5: Optional[str],

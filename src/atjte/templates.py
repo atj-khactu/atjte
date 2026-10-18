@@ -26,28 +26,34 @@ import shutil
 from pathlib import Path
 from typing import Optional
 
-ENGINES = ("perp", "spot", "ccxt")
+ENGINES = ("arb",)
+#: ``ENGINE`` literals older projects carry, each read as the one engine.
+#: ``perp`` / ``spot`` were the Kraken Futures / Kraken engines (merged into
+#: one on 2026-09-13; the literal still names the exchange such a project
+#: never states — :func:`atjte.engines.common.aliases.exchange_for`); ``ccxt``
+#: was the one engine's name until 2026-10-17. ``atjte migrate`` rewrites
+#: them to ``arb``.
+LEGACY_ENGINES = {"perp": "arb", "spot": "arb", "ccxt": "arb"}
 #: the engine module (the bot base class lives there) per engine
-# ONE engine since 2026-09-13: every ENGINE literal runs atjte.engines.ccxt.arb_bot
-# (the perp / spot modules are aliases of it, kept so the literal, the
-# templates and the strategy-type folders of existing projects stay valid)
-ENGINE_MODULES = {"perp": "atjte.engines.ccxt.arb_bot", "spot": "atjte.engines.ccxt.arb_bot",
-                  "ccxt": "atjte.engines.ccxt.arb_bot"}
+ENGINE_MODULES = {"arb": "atjte.engines.arb.arb_bot"}
 #: what each engine trades — the crypto leg's exchange(s) (CCXT ids; None =
 #: any exchange in :mod:`atjte.venues`)
-ENGINE_VENUES = {"perp": ("krakenfutures",), "spot": ("kraken",), "ccxt": None}
+ENGINE_VENUES = {"arb": None}
 #: the project IDENTITY per engine — the settings with no engine default,
 #: written into ``project_settings.py`` by whoever makes a project (the
-#: crypto-leg symbol, the MT5 symbol, the hedge magic; the ccxt engine also
-#: names the exchange)
-# (the Kraken engines' templates say SYMBOL_VENUE too since the merge — the
-# exchange they never state is filled in from the ENGINE literal)
-IDENTITY_NAMES = {"perp": ("SYMBOL_VENUE", "SYMBOL_MT5", "MT5_MAGIC"),
-                  "spot": ("SYMBOL_VENUE", "SYMBOL_MT5", "MT5_MAGIC"),
-                  "ccxt": ("EXCHANGE_ID", "SYMBOL_VENUE", "SYMBOL_MT5", "MT5_MAGIC")}
-#: the engine whose types get the bare key (``grid``); the others are
-#: prefixed (``spot_grid``) — the control panel's generator convention
-GENERATOR_ENGINE = "perp"
+#: exchange, the crypto-leg symbol, the MT5 symbol, the hedge magic)
+IDENTITY_NAMES = {"arb": ("EXCHANGE_ID", "SYMBOL_VENUE", "SYMBOL_MT5", "MT5_MAGIC")}
+#: the engine whose types get the bare key (``grid``); any other would be
+#: prefixed (``<engine>_grid``) — the control panel's generator convention
+GENERATOR_ENGINE = "arb"
+
+
+def canonical_engine(literal: Optional[str]) -> Optional[str]:
+    """The engine an ``ENGINE`` literal runs — itself, or the one a legacy
+    literal (:data:`LEGACY_ENGINES`) now means; None when it is neither."""
+    if not isinstance(literal, str):
+        return None
+    return literal if literal in ENGINES else LEGACY_ENGINES.get(literal)
 
 _TYPE_LABELS: dict[str, tuple[str, str]] = {
     "grid": ("Grid",
@@ -87,9 +93,10 @@ def _package_dir(name: str) -> Path:
 
 
 def _check_engine(engine: str) -> str:
-    if engine not in ENGINES:
+    canon = canonical_engine(engine)
+    if canon is None:
         raise ValueError(f"unknown engine {engine!r}: one of {ENGINES}")
-    return engine
+    return canon
 
 
 # ── engines ──────────────────────────────────────────────────────────────────
@@ -99,12 +106,9 @@ def engine_dir(engine: str) -> Path:
 
 
 def engine_settings_file(engine: str) -> Path:
-    """The engine defaults (``base_settings.py``) — the first settings layer.
-    ONE file since the merge: every engine literal resolves its defaults
-    from the ccxt engine's (legacy spellings read through
-    ``atjte.engines.common.aliases``)."""
-    _check_engine(engine)
-    return engine_dir("ccxt") / "base_settings.py"
+    """The engine defaults (``base_settings.py``) — the first settings layer
+    (legacy spellings read through ``atjte.engines.common.aliases``)."""
+    return engine_dir(engine) / "base_settings.py"
 
 
 def project_settings_template(engine: str) -> Path:
@@ -137,7 +141,8 @@ def strategy_types(engine: Optional[str] = None,
     holding ``<name>.py`` and a ``strategy_settings_template.py``. ``kind``
     is the folder name minus its ``_bot`` suffix (``grid``, ``bollinger``);
     ``key`` is the kind for *generator_engine* and engine-prefixed for any
-    other (``spot_grid``). *engine* narrows the result to one engine."""
+    other. *engine* narrows the result to one engine."""
+    engine = None if engine is None else _check_engine(engine)
     out: dict[str, dict] = {}
     for eng in ENGINES:
         if engine is not None and eng != engine:
@@ -181,7 +186,8 @@ def shim_source(type_name: str, engine: Optional[str] = None) -> str:
     It carries NO logic: the strategy is ``atjte.strategy_types.<engine>.<type>``
     and the engine binds THIS folder's ``strategy_settings.py`` and
     ``../../project_settings.py`` when it runs."""
-    where = f"atjte.strategy_types.{engine}.{type_name}" if engine else f"the atjte library ({type_name})"
+    where = (f"atjte.strategy_types.{_check_engine(engine)}.{type_name}" if engine
+             else f"the atjte library ({type_name})")
     return (
         f'"""{type_name} — this project\'s copy of the strategy type.\n'
         f'\n'

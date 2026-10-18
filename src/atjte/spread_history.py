@@ -190,9 +190,9 @@ def read(path: Path) -> Optional[dict]:
 # ── the gateways ─────────────────────────────────────────────────────────────
 def venue_client(exchange_id: str, symbol: str, *, gateway_port: int, account: str = "main",
                  network: str = "", fix: bool = False, attach_timeout_s: float = 30.0):
-    """A connected :class:`atjte.engines.ccxt.venue.Venue` on the gateway at
+    """A connected :class:`atjte.engines.arb.venue.Venue` on the gateway at
     ``gateway_port``, READ-ONLY."""
-    from .engines.ccxt.venue import Venue
+    from .engines.arb.venue import Venue
     opts: dict[str, Any] = {"gateway_host": "127.0.0.1", "gateway_port": int(gateway_port),
                             "client_name": f"spread_history_{os.getpid()}",
                             "symbol": symbol, "readonly": True,

@@ -7,7 +7,7 @@ is a framing error rather than a parser exploit.
 Why JSON and not FIX again: the bot never needs to know FIX exists. The
 gateway owns ClOrdIDs, sequence numbers, the session and the venue's dialect;
 the bot asks for "a post-only buy of 0.5 at 83000" and gets back the same
-CCXT-shaped order dict :class:`atjte.engines.ccxt.venue.Venue` already
+CCXT-shaped order dict :class:`atjte.engines.arb.venue.Venue` already
 consumes. That keeps the seam identical to the direct-session transport, so
 one engine path serves both.
 

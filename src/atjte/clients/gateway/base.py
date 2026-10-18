@@ -28,7 +28,7 @@ import ccxt
 
 from atjte.clients.base import Order, OrderSide, OrderType, Trade
 from atjte.clients.ccxt_client import CCXTClient
-from atjte.engines.ccxt.venue_feed import ticker_from_ccxt, trade_from_ccxt
+from atjte.engines.arb.venue_feed import ticker_from_ccxt, trade_from_ccxt
 
 from atjte.gateways.hyperliquid import protocol as P
 from atjte.gateways.hyperliquid.client import GatewayDown, HlGatewayClient

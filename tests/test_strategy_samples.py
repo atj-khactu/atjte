@@ -63,6 +63,30 @@ class SamplesTest(unittest.TestCase):
             self.assertIn(f.name, [m["name"] for m in
                                    S.samples_for(body["symbol_venue"], body["symbol_mt5"])])
 
+    def test_every_sample_carries_the_whole_schedule(self):
+        """The trading sessions travel as one unit: a sample holds every
+        schedule setting, so Import replaces the strategy's schedule whole."""
+        for f in S.sample_files():
+            body = S.load(f.name)
+            self.assertEqual(set(S.schedule_of(body)), set(S.SCHEDULE), f.name)
+
+    def test_every_input_of_a_sample_is_described(self):
+        """``descriptions``: one line per setting the sample carries, no more."""
+        for f in S.sample_files():
+            body = S.load(f.name)
+            desc = body.get("descriptions") or {}
+            self.assertEqual(list(desc), list(body["settings"]), f.name)
+            for name, text in desc.items():
+                self.assertTrue(isinstance(text, str) and text.strip(), f"{f.name}: {name}")
+
+    def test_schedule_of(self):
+        self.assertIsNone(S.schedule_of({"settings": {"GRID_STEP": "1"}}))
+        self.assertIsNone(S.schedule_of({}))
+        self.assertIsNone(S.schedule_of([1]))
+        self.assertEqual(S.schedule_of({"settings": {"GRID_STEP": "1",
+                                                     "SESSION_MON": "00:00-12:00"}}),
+                         {"SESSION_MON": "00:00-12:00"})
+
     def test_a_sample_fits_its_own_pair_only(self):
         body = S.load(S.sample_files()[0].name)
         mine = S.samples_for(body["symbol_venue"], body["symbol_mt5"].lower())

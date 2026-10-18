@@ -78,7 +78,7 @@ class Venue:
                                # a cancel by the venue's order index is accepted
                                # yet cancels nothing (Lighter, measured 2026-09-15)
     fix: bool = False          # the ENGINE'S OWN transport (ORDER_TRANSPORT =
-                               # 'fix', engines/ccxt/fix_transport.py) can carry
+                               # 'fix', engines/arb/fix_transport.py) can carry
                                # this venue's orders. Not the same as "the venue
                                # has FIX", nor even "atjte.fix speaks it" — see
                                # FIX_AT_VENUE: krakenfutures is False here while

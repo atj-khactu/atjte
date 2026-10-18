@@ -8,11 +8,10 @@ The package is organised as:
 
 - :mod:`atjte.clients` — unified venue connectors (``Account``, ``Position``,
   ``Order``, ``Trade`` ... dataclasses + the ``UniversalClient`` ABC);
-- :mod:`atjte.engines.perp` / :mod:`atjte.engines.spot` — the two bot
-  engines (perpetual contract vs MT5, spot pair vs MT5) and their default
-  settings;
-- :mod:`atjte.strategy_types` — the strategies that plug into an engine
-  (grid, Bollinger), one sub-package per engine;
+- :mod:`atjte.engines.arb` — the bot engine (a crypto leg on any venue,
+  spot, perpetual or dated, vs MT5) and its default settings;
+- :mod:`atjte.strategy_types` — the strategies that plug into the engine
+  (grid, grid futures, Bollinger, fixed levels, fixed entry / exit);
 - :mod:`atjte.runtime` — how a strategy PROJECT on disk is bound and run
   (``python -m atjte bot <strategy_dir>``);
 - :mod:`atjte.workspace` / :mod:`atjte.credentials` — where projects,

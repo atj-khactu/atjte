@@ -202,7 +202,7 @@ class GatewayTest(unittest.TestCase):
         self.assertTrue(getattr(getattr(importlib.import_module(module), name), "via_gateway"))
 
     def test_the_engine_refuses_a_connector_that_connects_directly(self):
-        from atjte.engines.ccxt.venue import Venue
+        from atjte.engines.arb.venue import Venue
         with self.assertRaises(RuntimeError) as cm:
             Venue("kraken", "PAXG/USD", client_path="atjte.clients.kraken.KrakenClient")._client_class()
         self.assertIn("gateway", str(cm.exception))

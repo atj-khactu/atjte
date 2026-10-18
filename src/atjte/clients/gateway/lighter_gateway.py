@@ -12,7 +12,7 @@ signing library — the Hyperliquid gateway connector's split
 - orders and cancels to the gateway only. Every order's id is its CLIENT
   index, which the gateway assigns — the id Lighter's fills name the order
   by (``bid_client_id`` / ``ask_client_id``, see
-  ``atjte.engines.ccxt.venue_feed.trade_from_ccxt``);
+  ``atjte.engines.arb.venue_feed.trade_from_ccxt``);
 - no amend (``supports_amend = False``): the engine re-prices by cancel +
   place;
 - markets, the ticker and the fills stream from the gateway.

@@ -10,7 +10,7 @@ Per account:
   key (Kraken) that is the difference between ten bots colliding all day and
   none ever colliding: every signed call — REST and the websocket token
   fetches — draws its nonce from one strictly increasing stream per account.
-- A :class:`~atjte.engines.ccxt.venue_feed.VenueFeed` per SYMBOL the
+- A :class:`~atjte.engines.arb.venue_feed.VenueFeed` per SYMBOL the
   account's bots trade, opened when the first bot on it says hello. The feed
   is the engine's own: every liveness rule it carries (heartbeat clocks,
   subscription confirmation, the forced reconnect, Kraken's ws v2 dead man's
@@ -36,7 +36,7 @@ import threading
 import time
 from typing import Any, Callable, Optional
 
-from atjte.engines.ccxt.venue_feed import VenueFeed
+from atjte.engines.arb.venue_feed import VenueFeed
 
 from ..common import book_payload, jsonable, markets_payload
 

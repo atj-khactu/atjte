@@ -20,7 +20,7 @@ from atjte import templates as T
 from atjte import workspace as ws
 
 
-def _project(root: Path, engine: str = "perp", strategy: str = "grid_bot",
+def _project(root: Path, engine: str = "arb", strategy: str = "grid_bot",
              name: str = "proj") -> Path:
     proj = root / name
     proj.mkdir(parents=True)
@@ -37,13 +37,18 @@ class TestLocate(unittest.TestCase):
         self._td.cleanup()
 
     def test_engine_from_literal_or_symbol(self):
-        d = _project(self.tmp, "spot", "grid_bot")
-        self.assertEqual(R.project_engine(R.project_dir_of(d)), "spot")
+        d = _project(self.tmp, "arb", "grid_bot")
+        self.assertEqual(R.project_engine(R.project_dir_of(d)), "arb")
         psf = R.project_settings_file(d)
+        for old in ("perp", "spot", "ccxt"):          # retired literals: the one engine
+            psf.write_text(f"ENGINE = {old!r}\n", encoding="utf-8")
+            self.assertEqual(R.project_engine(psf.parent), "arb")
         psf.write_text("SYMBOL_KRAKEN = 'XAUT/USD:USD'\n", encoding="utf-8")
-        self.assertEqual(R.project_engine(psf.parent), "perp")
+        self.assertEqual(R.project_engine(psf.parent), "arb")
+        self.assertEqual(R.infer_engine("XAUT/USD:USD"), "perp")    # the Kraken venue it implies
         psf.write_text("SYMBOL_VENUE = 'PAXG/USD'\n", encoding="utf-8")
-        self.assertEqual(R.project_engine(psf.parent), "spot")
+        self.assertEqual(R.project_engine(psf.parent), "arb")
+        self.assertEqual(R.infer_engine("PAXG/USD"), "spot")
         psf.write_text("MT5_MAGIC = 1\n", encoding="utf-8")
         with self.assertRaises(R.ProjectError):
             R.project_engine(psf.parent)
@@ -112,11 +117,15 @@ class TestCheckSubprocess(unittest.TestCase):
     bound — dry run, the template's identity, the gateway connectors."""
 
     def test_perp_and_spot_check(self):
-        for engine, strategy, symbol in (("perp", "grid_bot", "XAUT/USD:USD"),
-                                         ("spot", "bollinger_bot", "PAXG/USD")):
-            with self.subTest(engine=engine), tempfile.TemporaryDirectory() as td:
+        from atjte import settings_io
+        for exchange, strategy, symbol in (("krakenfutures", "grid_bot", "XAUT/USD:USD"),
+                                           ("kraken", "bollinger_bot", "PAXG/USD")):
+            with self.subTest(exchange=exchange), tempfile.TemporaryDirectory() as td:
                 w = ws.ensure(Path(td) / "ws")
-                d = _project(w.strategies_dir, engine, strategy)
+                d = _project(w.strategies_dir, "arb", strategy)
+                settings_io.write_settings(R.project_settings_file(d), {
+                    "EXCHANGE_ID": repr(exchange), "SYMBOL_VENUE": repr(symbol),
+                    "UNIT_LABEL": "'oz'", "SYMBOL_MT5": "'XAUUSD'"})
                 env = {**os.environ, ws.ENV_HOME: str(w.root)}
                 for k in list(env):
                     if k.lower().startswith(("kraken", "mt5")):
@@ -125,7 +134,8 @@ class TestCheckSubprocess(unittest.TestCase):
                                    capture_output=True, text=True, env=env, timeout=120)
                 self.assertEqual(r.returncode, 0, r.stderr[-2000:])
                 report = json.loads(r.stdout[r.stdout.index("{"):])
-                self.assertEqual(report["engine"], engine)
+                self.assertEqual(report["engine"], "arb")
+                self.assertEqual(report["EXCHANGE_ID"], exchange)
                 self.assertEqual(report["type"], strategy)
                 self.assertEqual(report["SYMBOL_KRAKEN"], symbol)
                 self.assertFalse(report["LIVE_TRADING"])

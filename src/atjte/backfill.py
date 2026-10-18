@@ -102,7 +102,7 @@ def identity_of(strategy_dir: Path) -> dict:
         raise RuntimeError(f"{psf} names no exchange and none can be inferred")
     magic = vals.get("MT5_MAGIC")
     # the gateways the engine leases — the same connectors and options it
-    # resolves (atjte.engines.ccxt.arb_bot), so the backfill reads the account
+    # resolves (atjte.engines.arb.arb_bot), so the backfill reads the account
     # the bot trades
     wants_fix = (str(vals.get("ORDER_TRANSPORT") or "").lower() == "fix"
                  or bool(vals.get("FIX_ORDER_ENTRY")))
@@ -125,11 +125,11 @@ def identity_of(strategy_dir: Path) -> dict:
 
 # ── the venue leg ────────────────────────────────────────────────────────────
 def venue_client(ident: dict, attach_timeout_s: float = 30.0):
-    """A connected :class:`atjte.engines.ccxt.venue.Venue` for the strategy's
+    """A connected :class:`atjte.engines.arb.venue.Venue` for the strategy's
     market, through the strategy's GATEWAY on a READ-ONLY lease: it attaches
     beside the running bot, reads the account's own trades, and can place
     nothing."""
-    from .engines.ccxt.venue import Venue
+    from .engines.arb.venue import Venue
     opts = {**ident.get("venue_client_options", {}),
             "client_name": f"{ident['project']}_{ident['strategy']}_backfill",
             "symbol": ident["symbol"], "readonly": True,

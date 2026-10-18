@@ -74,8 +74,12 @@ class TestMigrate(unittest.TestCase):
 
         actions = P.migrate_project(proj)
         lit = read_literals(proj / "project_settings.py")
-        self.assertEqual(lit["ENGINE"], "spot")
+        self.assertEqual(lit["ENGINE"], "arb")
         self.assertEqual(lit["SYMBOL_VENUE"], "PAXG/USD")   # renamed by the migration
+        # what the spot engine implied, written over the template's placeholder
+        self.assertEqual((lit["EXCHANGE_ID"], lit["MARKET_KIND"], lit["UNIT_LABEL"]),
+                         ("kraken", "spot", "oz"))
+        self.assertEqual(lit["SYMBOL_MT5"], "XAUUSD")
         self.assertEqual(lit["MT5_MAGIC"], 77008)
         self.assertEqual(lit["HEDGE_THRESHOLD_UNITS"], 2.0)             # lifted override, canonical name
         self.assertNotIn("HEDGE_THRESHOLD_OZ", lit)
@@ -97,20 +101,54 @@ class TestMigrate(unittest.TestCase):
         again = P.migrate_project(proj)
         self.assertEqual(again, ["nothing to do — already in the library layout"])
 
-    def test_perp_project_missing_engine_and_shim(self):
+    def _kraken_project(self, engine_line: str, symbol: str = "XAUT/USD:USD") -> Path:
+        """A project file the way the retired Kraken engines' templates made
+        it: no EXCHANGE_ID / MARKET_KIND / UNIT_LABEL, *engine_line* (or
+        none) saying which venue."""
         proj = self.tmp / "xaut"
         sd = proj / "strategies" / "grid_bot"
         sd.mkdir(parents=True)
-        text = T.project_settings_template("perp").read_text(encoding="utf-8")
-        text = re.sub(r"^ENGINE\s*=.*$", "", text, flags=re.M)
-        (proj / "project_settings.py").write_text(text, encoding="utf-8")
+        text = T.project_settings_template("arb").read_text(encoding="utf-8")
+        text = re.sub(r"^(ENGINE|EXCHANGE_ID|MARKET_KIND|UNIT_LABEL)\s*=.*$", "", text, flags=re.M)
+        text = re.sub(r"^SYMBOL_VENUE\s*=.*$", f"SYMBOL_VENUE = {symbol!r}", text, flags=re.M)
+        (proj / "project_settings.py").write_text(text + engine_line, encoding="utf-8")
         (sd / "grid_bot.py").write_text(OLD_ENTRY, encoding="utf-8")
-        shutil.copyfile(T.type_dir("perp", "grid_bot") / "strategy_settings_template.py",
+        shutil.copyfile(T.type_dir("arb", "grid_bot") / "strategy_settings_template.py",
                         sd / "strategy_settings_template.py")
+        return proj
+
+    def test_perp_project_missing_engine_and_shim(self):
+        proj = self._kraken_project("")
+        sd = proj / "strategies" / "grid_bot"
         self.assertNotIn("ENGINE", read_literals(proj / "project_settings.py"))
         P.migrate_project(proj)
-        self.assertEqual(read_literals(proj / "project_settings.py")["ENGINE"], "perp")
+        lit = read_literals(proj / "project_settings.py")
+        self.assertEqual(lit["ENGINE"], "arb")
+        self.assertEqual((lit["EXCHANGE_ID"], lit["MARKET_KIND"], lit["UNIT_LABEL"]),
+                         ("krakenfutures", "swap", "oz"))      # the symbol implied them
         self.assertTrue(T.is_shim((sd / "grid_bot.py").read_text(encoding="utf-8")))
+
+    def test_retired_engine_literal_is_rewritten_with_what_it_implied(self):
+        proj = self._kraken_project("ENGINE = 'spot'\n", symbol="PAXG/USD")
+        psf = proj / "project_settings.py"
+        dry = P.migrate_project(proj, dry_run=True)
+        self.assertTrue(any("rename ENGINE = 'spot' to 'arb'" in a for a in dry), dry)
+        self.assertTrue(any("EXCHANGE_ID = 'kraken'" in a for a in dry), dry)
+        self.assertEqual(read_literals(psf)["ENGINE"], "spot")           # dry run wrote nothing
+        P.migrate_project(proj)
+        lit = read_literals(psf)
+        self.assertEqual(lit["ENGINE"], "arb")
+        self.assertEqual((lit["EXCHANGE_ID"], lit["MARKET_KIND"], lit["UNIT_LABEL"]),
+                         ("kraken", "spot", "oz"))
+        self.assertEqual(lit["SYMBOL_VENUE"], "PAXG/USD")
+        # a ccxt-engine project states its identity: only the name changes
+        psf.write_text(psf.read_text(encoding="utf-8").replace("ENGINE = 'arb'", "ENGINE = 'ccxt'"),
+                       encoding="utf-8")
+        before = read_literals(psf)
+        actions = P.migrate_project(proj)
+        self.assertEqual(actions, ["rename ENGINE = 'ccxt' to 'arb' in project_settings.py"])
+        self.assertEqual(read_literals(psf), {**before, "ENGINE": "arb"})
+        self.assertEqual(P.migrate_project(proj), ["nothing to do — already in the library layout"])
 
     def test_unknown_type_is_skipped_and_no_project_is_refused(self):
         proj = self.tmp / "p"

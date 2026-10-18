@@ -1,14 +1,15 @@
 """Run every atjte test suite, each engine's in its OWN interpreter.
 
-The engines bind ``strategy_settings`` at import, process-wide, so the perp
-suite (``tests/perp/``) and the spot suite (``tests/spot/``) can never share
-a process; the top-level tests (pure modules: workspace, credentials,
-templates, runtime, settings_io, projects, cli) run in a third, and the
-gateways and the FIX stack (``tests/gateways/``) in a fourth.
+The engine binds ``strategy_settings`` at import, process-wide, so each
+engine suite — the engine's own (``tests/arb/``) and the two projects with a
+retired ``ENGINE`` literal (``tests/legacy_perp/``, ``tests/legacy_spot/``)
+— runs in its own process; the top-level tests (pure modules: workspace,
+credentials, templates, runtime, settings_io, projects, cli) run in another,
+and the gateways and the FIX stack (``tests/gateways/``) in another.
 
     .venv\\Scripts\\python.exe atjte\\tests\\run_all.py            # everything
-    .venv\\Scripts\\python.exe atjte\\tests\\run_all.py perp       # one suite
-    .venv\\Scripts\\python.exe -m unittest discover -s atjte\\tests\\perp -t atjte\\tests\\perp
+    .venv\\Scripts\\python.exe atjte\\tests\\run_all.py arb        # one suite
+    .venv\\Scripts\\python.exe -m unittest discover -s atjte\\tests\\arb -t atjte\\tests\\arb
 
 Exit code 0 only when every suite passed.
 """
@@ -21,9 +22,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SUITES = {
     "core": (HERE, HERE),
-    "perp": (HERE / "perp", HERE / "perp"),
-    "spot": (HERE / "spot", HERE / "spot"),
-    "ccxt": (HERE / "ccxt", HERE / "ccxt"),
+    "arb": (HERE / "arb", HERE / "arb"),
+    "legacy_perp": (HERE / "legacy_perp", HERE / "legacy_perp"),
+    "legacy_spot": (HERE / "legacy_spot", HERE / "legacy_spot"),
     "gateways": (HERE / "gateways", HERE / "gateways"),
 }
 
@@ -45,7 +46,7 @@ def main(argv: list[str]) -> int:
     results = {n: run(n) for n in names}
     print("\n=== summary ===")
     for n, rc in results.items():
-        print(f"{n:8s} {'OK' if rc == 0 else f'FAILED (rc={rc})'}")
+        print(f"{n:12s} {'OK' if rc == 0 else f'FAILED (rc={rc})'}")
     return 0 if all(rc == 0 for rc in results.values()) else 1
 
 

@@ -895,7 +895,7 @@ class ConnectorTest(GatewayCase):
         self.assertEqual(what[2]["params"], {"timeout_s": 40})
 
     def test_venue_reads_the_contract_as_a_perp_in_base_units(self):
-        from atjte.engines.ccxt.venue import Venue
+        from atjte.engines.arb.venue import Venue
         # the engine puts the symbol and the client name into the options
         v = Venue("ibkr", MGC, client_path="atjte.clients.gateway.IbkrGatewayClient",
                   client_options={"gateway_port": self.gw.port, "gateway_token": TOKEN,

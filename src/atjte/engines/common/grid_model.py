@@ -424,7 +424,7 @@ def fixed_levels(pos: float, size: float, buy_level: float, sell_level: float,
                  long_exit: Optional[float] = None,
                  short_exit: Optional[float] = None,
                  exit_clip: Optional[float] = None) -> list[DesiredOrder]:
-    """The fixed-level strategy (``atjte.strategy_types.ccxt.fixed_bot``): ONE buy resting
+    """The fixed-level strategy (``atjte.strategy_types.arb.fixed_bot``): ONE buy resting
     at ``buy_level`` and ONE sell at ``sell_level`` (spread, USD per base
     unit), ``size`` units each, whatever the position — no ladder, no exit
     rungs at 0. A buy filled at −15 is unwound by the sell at +15 and vice
@@ -507,7 +507,7 @@ def fixed_entry_exit_levels(pos: float, size: float,
                             close_only: bool = False,
                             exit_clip: Optional[float] = None) -> list[DesiredOrder]:
     """The fixed ENTRY / EXIT strategy
-    (``atjte.strategy_types.ccxt.fixed_entry_exit``): each direction has its
+    (``atjte.strategy_types.arb.fixed_entry_exit``): each direction has its
     own fixed entry level and its own fixed exit level (spread, USD per base
     unit), and the bot holds ONE direction at a time.
 

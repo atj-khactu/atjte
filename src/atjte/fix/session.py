@@ -1,6 +1,6 @@
 """The FIX 4.4 session engine: one TLS socket on one daemon thread.
 
-Shape deliberately copied from :class:`atjte.engines.ccxt.venue_feed.VenueFeed`
+Shape deliberately copied from :class:`atjte.engines.arb.venue_feed.VenueFeed`
 so the rest of the codebase reads the same: a background worker owns the
 connection, the caller's thread gets a SYNCHRONOUS facade, health is an
 ``(ok, reason)`` pair, and a transport that is not up makes a call FAIL

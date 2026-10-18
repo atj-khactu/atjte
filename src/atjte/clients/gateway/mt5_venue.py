@@ -7,7 +7,7 @@ symbol (Blueberry ``XAUUSD247.i``) against another's (IC ``XAUUSD``, the
 ordinary MT5 hedge): the MT5 gateway that serves a terminal's hedges serves
 its quote leg too, over the same wire and the same magic rules.
 
-What makes it a venue to the engine (:mod:`atjte.engines.ccxt.venue`):
+What makes it a venue to the engine (:mod:`atjte.engines.arb.venue`):
 
 - the MATH runs on :class:`MT5Exchange`, a ``ccxt.Exchange`` with no
   endpoints, loaded with ONE market built from the broker's symbol specs:

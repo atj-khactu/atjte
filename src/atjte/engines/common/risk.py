@@ -1,7 +1,7 @@
 """Daily risk limits and the margin de-risk trigger for the atjte engines
 — pure, unit-tested, no venue and no I/O (``tests/*/test_risk.py``).
 
-The engine (:mod:`atjte.engines.perp.perp_bot` or its spot twin) owns the
+The engine (:mod:`atjte.engines.arb.arb_bot`) owns the
 venue reads and the order book; everything it *decides* about risk is
 computed here so it can be tested without a market:
 

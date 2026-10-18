@@ -2,7 +2,7 @@
 
 The engines resolve their settings at IMPORT time, by name, from
 ``sys.path[0]``: the strategy folder holding ``strategy_settings.py`` must be
-first on the path when ``atjte.engines.<engine>.<engine>_bot`` is imported,
+first on the path when ``atjte.engines.arb.arb_bot`` is imported,
 and the project's ``project_settings.py`` (two levels up) is loaded by path
 from there. That contract is what :func:`bind_strategy` establishes and
 :func:`run_strategy` drives::
@@ -42,22 +42,28 @@ def project_settings_file(strategy_dir: Path) -> Path:
 
 
 def infer_engine(symbol: Optional[str]) -> Optional[str]:
-    """A CCXT symbol with a settle suffix (``XAUT/USD:USD``) is a perpetual;
-    a bare pair (``PAXG/USD``) is spot."""
+    """The LEGACY engine literal a Kraken project's symbol implies: a CCXT
+    symbol with a settle suffix (``XAUT/USD:USD``) is a Kraken Futures
+    perpetual (``perp``), a bare pair (``PAXG/USD``) Kraken spot (``spot``).
+    Both run the one engine (:func:`atjte.templates.canonical_engine`); the
+    literal still says which Kraken venue a project that names none trades."""
     if not isinstance(symbol, str) or not symbol:
         return None
     return "perp" if ":" in symbol else "spot"
 
 
 def project_engine(project_dir: Path) -> str:
-    """The engine a project runs: its ``ENGINE`` literal, else inferred from
-    its crypto symbol (``SYMBOL_KRAKEN`` / ``SYMBOL_VENUE``)."""
+    """The engine a project runs: its ``ENGINE`` literal (a legacy one —
+    ``perp``, ``spot``, ``ccxt`` — read as the engine it now means), else,
+    for a project old enough to have none, the one its crypto symbol
+    (``SYMBOL_KRAKEN`` / ``SYMBOL_VENUE``) implies."""
     path = Path(project_dir) / "project_settings.py"
     lit = read_literals(path, names={"ENGINE", "SYMBOL_KRAKEN", "SYMBOL_VENUE"})
-    engine = lit.get("ENGINE")
-    if isinstance(engine, str) and engine in templates.ENGINES:
+    engine = templates.canonical_engine(lit.get("ENGINE"))
+    if engine:
         return engine
-    guess = infer_engine(lit.get("SYMBOL_KRAKEN") or lit.get("SYMBOL_VENUE"))
+    guess = templates.canonical_engine(
+        infer_engine(lit.get("SYMBOL_KRAKEN") or lit.get("SYMBOL_VENUE")))
     if guess:
         return guess
     raise ProjectError(f"{path} defines no ENGINE ({' / '.join(templates.ENGINES)}) and no symbol to infer it from")
@@ -129,9 +135,9 @@ def check_report(engine: str, type_name: str) -> dict:
         ws = _ws.current(g("STRATEGY_DIR")).as_dict()
     except _ws.WorkspaceNotFound:
         ws = None
-    # the Kraken engines spelled the crypto leg SYMBOL_KRAKEN; the ccxt
-    # engine names the exchange and spells it SYMBOL_VENUE — one report shape
-    venues = templates.ENGINE_VENUES.get(engine)
+    # the Kraken engines spelled the crypto leg SYMBOL_KRAKEN; the engine
+    # names the exchange and spells it SYMBOL_VENUE — one report shape
+    venues = templates.ENGINE_VENUES.get(templates.canonical_engine(engine))
     # every platform connection goes through a gateway: which connector the
     # crypto leg and the MT5 hedge lease, and on which port / account (the
     # options, minus anything that could be a secret)

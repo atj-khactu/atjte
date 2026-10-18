@@ -12,8 +12,10 @@ New shape (see :mod:`atjte.templates`)::
     <project>/project_settings.py              ENGINE + identity + overrides
     <project>/strategies/<type>/<type>.py      the shim
 
-The migration: writes/extends ``project_settings.py`` (``ENGINE``; for a
-legacy project the identity and every engine default the copied
+The migration: writes/extends ``project_settings.py`` (``ENGINE = 'arb'``
+— a retired literal, ``perp`` / ``spot`` / ``ccxt``, is rewritten, and the
+Kraken venue, market kind and unit ``perp`` / ``spot`` implied are written
+out; for a legacy project the identity and every engine default the copied
 ``base_settings.py`` had changed, lifted as overrides so behaviour is
 preserved), swaps each entry point for the shim (the old file is kept as
 ``<type>.py.legacy``), makes sure the settings template is beside it, sets
@@ -24,6 +26,8 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Optional
 
 from . import settings_io, templates
 from .literals import read_literals
@@ -41,8 +45,9 @@ def is_legacy(project_dir: Path) -> bool:
 
 
 def legacy_engine(project_dir: Path) -> str:
-    """Which engine a legacy project's copy is: spot when it holds
-    ``spot_bot.py``, else perp (checked against its symbol)."""
+    """Which engine a legacy project's copy was — the retired literal that
+    names its Kraken venue: spot when it holds ``spot_bot.py``, else perp
+    (checked against its symbol)."""
     bc = Path(project_dir) / "bot_core"
     if (bc / "spot_bot.py").is_file():
         return "spot"
@@ -54,6 +59,22 @@ def legacy_engine(project_dir: Path) -> str:
 
 def _repr(v) -> str:
     return repr(v)
+
+
+def implied_identity(engine_literal: Optional[str], values: dict[str, Any]) -> dict[str, Any]:
+    """The identity a project never stated because its ``ENGINE`` literal
+    implied it — ``EXCHANGE_ID``, ``MARKET_KIND``, ``UNIT_LABEL`` (a retired
+    ``perp`` = Kraken Futures, ``spot`` = Kraken; no literal: the symbol's
+    settle suffix) — for the names *values* leaves unset. The engine fills
+    the same at start (:func:`atjte.engines.common.aliases.identity_defaults`);
+    the migration writes them down so ``ENGINE = 'arb'`` loses nothing."""
+    from .engines.common import aliases
+    project = SimpleNamespace(**{k: v for k, v in values.items() if k != "ENGINE"})
+    project.ENGINE = engine_literal if engine_literal in ("perp", "spot") else None
+    project.SYMBOL_VENUE = values.get("SYMBOL_VENUE") or values.get("SYMBOL_KRAKEN")
+    if not project.SYMBOL_VENUE:
+        return {}
+    return {n: getattr(project, n) for n in aliases.identity_defaults(project)}
 
 
 def _lift_overrides(engine: str, legacy_settings: Path) -> dict[str, str]:
@@ -85,11 +106,17 @@ def migrate_project(project_dir: Path, *, dry_run: bool = False) -> list[str]:
     if not strategies.is_dir():
         raise RuntimeError(f"{d} has no strategies/ folder — not a project")
 
+    from .engines.common import aliases
     psf = d / "project_settings.py"
     if is_legacy(d):
-        engine = legacy_engine(d)
+        legacy = legacy_engine(d)              # 'perp' | 'spot': its Kraken venue
+        engine = templates.canonical_engine(legacy)
         legacy_settings = d / "bot_core" / "base_settings.py"
-        identity = read_literals(legacy_settings, names=set(IDENTITY_SETTING_NAMES))
+        identity = {aliases.canonical(k): v for k, v in read_literals(
+            legacy_settings, names={*IDENTITY_SETTING_NAMES, "SYMBOL_VENUE"}).items()}
+        # the template's own identity is a placeholder market: what the
+        # legacy literal implied is written over it
+        identity.update(implied_identity(legacy, {"SYMBOL_VENUE": identity.get("SYMBOL_VENUE")}))
         overrides = _lift_overrides(engine, legacy_settings)
         actions.append(f"write project_settings.py from the {engine} template "
                        f"(identity: {', '.join(sorted(identity)) or 'none found'}; "
@@ -100,12 +127,14 @@ def migrate_project(project_dir: Path, *, dry_run: bool = False) -> list[str]:
             changes = {k: _repr(v) for k, v in identity.items() if k in present}
             if changes:
                 settings_io.write_settings(psf, changes)
-            additions = {k: (v, "lifted from the project's old bot_core/base_settings.py")
-                         for k, v in overrides.items() if k not in present}
+            additions = {k: (_repr(v), "the project's identity") for k, v in identity.items()
+                         if k not in present}
+            additions.update({k: (v, "lifted from the project's old bot_core/base_settings.py")
+                              for k, v in overrides.items() if k not in present})
             for k, v in overrides.items():
                 if k in present:
                     settings_io.write_settings(psf, {k: v})
-            if engine == "spot":
+            if legacy == "spot":
                 # the key-role prefix, under the one engine's name (a file
                 # that still spells it KRAKEN_ROLE_PREFIX keeps that line)
                 prefix_name = ("KRAKEN_ROLE_PREFIX" if "KRAKEN_ROLE_PREFIX" in present
@@ -122,11 +151,32 @@ def migrate_project(project_dir: Path, *, dry_run: bool = False) -> list[str]:
     else:
         engine = project_engine(d)
 
-    # ENGINE literal
-    if "ENGINE" not in read_literals(psf, names={"ENGINE"}):
-        actions.append(f"add ENGINE = {engine!r} to project_settings.py")
-        if not dry_run:
-            settings_io.append_settings(psf, {"ENGINE": (_repr(engine), "which atjte engine runs this project")})
+    # ENGINE literal: the one engine's name. A retired literal (perp / spot
+    # named the Kraken venue the file never states) leaves what it implied
+    # written out first, so the rewrite changes nothing the engine resolves.
+    values = read_literals(psf)
+    literal = values.get("ENGINE")
+    if literal != engine:
+        implied = implied_identity(literal if isinstance(literal, str) else None, values)
+        if implied:
+            actions.append("write " + ", ".join(f"{k} = {v!r}" for k, v in implied.items())
+                           + " to project_settings.py"
+                           + (f" (implied by ENGINE = {literal!r})" if literal else ""))
+            if not dry_run:
+                set_now = {k: _repr(v) for k, v in implied.items() if k in values}
+                if set_now:
+                    settings_io.write_settings(psf, set_now)
+                settings_io.append_settings(psf, {
+                    k: (_repr(v), "the project's identity") for k, v in implied.items()
+                    if k not in values})
+        if "ENGINE" in values:
+            actions.append(f"rename ENGINE = {literal!r} to {engine!r} in project_settings.py")
+            if not dry_run:
+                settings_io.write_settings(psf, {"ENGINE": _repr(engine)})
+        else:
+            actions.append(f"add ENGINE = {engine!r} to project_settings.py")
+            if not dry_run:
+                settings_io.append_settings(psf, {"ENGINE": (_repr(engine), "which atjte engine runs this project")})
 
     # entry points → shims, templates present
     for sd in sorted(p for p in strategies.iterdir() if p.is_dir() and not p.name.startswith(("_", "."))):

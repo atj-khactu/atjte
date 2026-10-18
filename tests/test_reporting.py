@@ -583,7 +583,7 @@ class AtomicWriteTest(unittest.TestCase):
         that is the bug this whole class exists for."""
         import ast
         src = (Path(__file__).resolve().parents[1] / "src" / "atjte" / "engines"
-               / "ccxt" / "arb_bot.py").read_text(encoding="utf-8")
+               / "arb" / "arb_bot.py").read_text(encoding="utf-8")
         fn = next(n for n in ast.parse(src).body
                   if isinstance(n, ast.FunctionDef) and n.name == "_atomic_write")
         body = fn.body[1:] if ast.get_docstring(fn) else fn.body   # skip the docstring

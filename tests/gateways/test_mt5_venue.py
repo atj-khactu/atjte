@@ -166,7 +166,7 @@ class AccountTest(unittest.TestCase):
 
     def test_several_tickets_are_one_position(self):
         import dataclasses
-        from atjte.engines.ccxt.venue import Venue
+        from atjte.engines.arb.venue import Venue
         lease = FakeLease()
         lease.positions = [dataclasses.replace(_pos(1, PositionSide.LONG, 0.1, 77020),
                                                entry_price=4150.0, unrealized_pnl=100.0),

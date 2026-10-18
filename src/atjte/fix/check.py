@@ -160,7 +160,7 @@ def _settings(strategy_dir: Path) -> dict:
     # the ENGINE's defaults, found through the atjte package (this module no
     # longer lives inside it; a missing file would read as no defaults at all)
     import atjte
-    base_settings = Path(atjte.__file__).resolve().parent / "engines" / "ccxt" / "base_settings.py"
+    base_settings = Path(atjte.__file__).resolve().parent / "engines" / "arb" / "base_settings.py"
     if not base_settings.exists():
         raise RuntimeError(f"atjte engine defaults not found at {base_settings}")
     engine_defaults = read_literals(base_settings)
