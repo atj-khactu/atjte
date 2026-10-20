@@ -88,6 +88,9 @@ HIST_TIMEOUT_S = 9.0
 HIST_TIMEOUT_MAX_S = 60.0
 #: IB error codes that mean "no live market data for this contract"
 MD_REFUSED_CODES = {354, 10167, 10168, 10197, 10089, 10090}
+#: "Market depth data has been RESET": TWS restarts a depth book on the same
+#: request (ib_async empties its rows); a notice, never a refusal
+DEPTH_RESET_CODE = 317
 #: IB error codes that are informational on a connection
 _CONN_INFO_CODES = {2104, 2106, 2107, 2108, 2158, 2119}
 _OPEN = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted", "PendingCancel",
@@ -560,8 +563,10 @@ class IbkrUpstream:
                 self.counters["errors"] += 1
         if reqId is not None and int(reqId) in self._depth_reqs:
             # the DEPTH request's answer: never the symbol's quotes (a depth
-            # refusal is no market-data refusal); 21xx are notices
-            if not 2100 <= code < 2200:
+            # refusal is no market-data refusal); 21xx are notices, and so is
+            # 317 — read as a refusal on 2026-10-19 23:02, both COMEX books
+            # stayed top of book until the gateway restarted
+            if not 2100 <= code < 2200 and code != DEPTH_RESET_CODE:
                 sym = self._depth_reqs.pop(int(reqId))
                 self._depth_off[sym] = f"{code}: {text}"
                 self._log(f"ib upstream: depth of market for {sym} unavailable ({code}: "
@@ -980,6 +985,11 @@ class IbkrUpstream:
                 "portfolioValue": g("NetLiquidation"), "totalUnrealized": g("UnrealizedPnL"),
                 "unrealizedFunding": None, "pnl": g("RealizedPnL"),
                 "excessLiquidity": g("ExcessLiquidity"), "cash": g("TotalCashValue"),
+                # the excess at IBKR's NEXT margin change (an overnight requirement,
+                # a stock's Reg T step) and the cushion (excess / net liquidation):
+                # the liquidation threshold reads the look-ahead too
+                "lookAheadExcessLiquidity": g("LookAheadExcessLiquidity"),
+                "cushion": s.get("Cushion", (None, ""))[0],
                 "currency": want or None, "baseCurrency": base or None,
                 "fxRate": rate}
 

@@ -11,6 +11,8 @@ can run over a strategy folder.
   (that is where close-by realized profit lands).
 - :func:`hedge_executions` — the bot's REAL market executions on MT5 (the
   legs that mirrored a venue fill), close-by bookkeeping legs excluded.
+- :class:`FxSeries` — the account currency's USD rate by day (the D1
+  closes of its FX pair), so a past MT5 deal is converted at ITS day's rate.
 - :func:`daily_pnl` — realized PnL per local date over both legs.
 - :func:`position_summary` — where the venue leg stands now, from the seed
   and every fill since.
@@ -19,10 +21,16 @@ A ``fill`` here is a dict with ``ts`` (epoch seconds, UTC), ``side``
 (``buy`` | ``sell``), ``amount`` (base units), ``price`` and optionally
 ``fee_usd``; a ``deal`` is the reporting module's MT5 deal record (``ts``,
 ``side``, ``lots``, ``price``, ``profit``, ``costs``, ``entry``, ``magic``,
-``position_id``). Both are exactly what ``trades.jsonl`` holds.
+``position_id``). Both are exactly what ``trades.jsonl`` holds. A deal with
+an ``adjust`` name is an MT5 ADJUSTMENT on the hedge symbol — a dividend, a
+tax, a charge, an interest or commission booking, a correction: money the
+account was credited or charged with no trade behind it (``side`` None,
+``lots`` 0, ``entry`` None). A deal may carry ``usd_rate``, the account
+currency's USD rate when it was recorded.
 """
 from __future__ import annotations
 
+import bisect
 from typing import Iterable, Optional
 
 EPS = 1e-9
@@ -99,14 +107,29 @@ def attribute_mt5_deals(deals: Iterable[dict], magic: Optional[int]) -> list[dic
     deals PLUS the close-by legs (``entry`` 3, booked under magic 0) whose
     ``position_id`` the bot opened — that is where a close-by's realized
     profit lands, and a magic-only filter under-reports it to near zero.
-    Input order is kept."""
+
+    An ADJUSTMENT (``adjust``) belongs to it when it carries the bot's magic
+    or names a position the bot opened; one tied to no position (a broker's
+    dividend on the symbol, ``position_id`` 0) belongs to every strategy that
+    records the symbol — a report reads its own hedge symbol only, so it is
+    the symbol's, and two strategies hedging ONE symbol on ONE account would
+    each count it. Input order is kept."""
     deals = list(deals)
     if magic is None:
         return []
-    own = {d.get("position_id") for d in deals if d.get("magic") == magic}
-    return [d for d in deals
-            if d.get("magic") == magic
-            or (d.get("entry") == DEAL_ENTRY_OUT_BY and d.get("position_id") in own)]
+    own = {d.get("position_id") for d in deals
+           if d.get("magic") == magic and not d.get("adjust")}
+    own.discard(0)
+    own.discard(None)
+
+    def mine(d: dict) -> bool:
+        if d.get("magic") == magic:
+            return True
+        pid = d.get("position_id")
+        if d.get("adjust"):
+            return pid in own or not pid
+        return d.get("entry") == DEAL_ENTRY_OUT_BY and pid in own
+    return [d for d in deals if mine(d)]
 
 
 def hedge_executions(deals: Iterable[dict], magic: Optional[int]) -> list[dict]:
@@ -118,6 +141,47 @@ def hedge_executions(deals: Iterable[dict], magic: Optional[int]) -> list[dict]:
     return [d for d in deals
             if d.get("magic") == magic
             and d.get("entry") in (DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT)]
+
+
+class FxSeries:
+    """USD per unit of the account currency, by day: ``points`` are
+    ``(ts, rate)`` — a D1 bar's open (UTC) and the rate at its close. A
+    moment takes the latest bar that opened at or before it (a weekend or a
+    holiday carries the last close forward); one before every bar takes the
+    first. Empty = no answer (:meth:`at` returns None)."""
+
+    def __init__(self, points: Iterable) -> None:
+        pts = sorted((float(t), float(r)) for t, r in points
+                     if t is not None and r is not None and float(r) > 0)
+        self._ts = [t for t, _ in pts]
+        self._rate = [r for _, r in pts]
+
+    def __bool__(self) -> bool:
+        return bool(self._ts)
+
+    def __len__(self) -> int:
+        return len(self._ts)
+
+    def at(self, ts: float) -> Optional[float]:
+        if not self._ts:
+            return None
+        i = bisect.bisect_right(self._ts, float(ts)) - 1
+        return self._rate[max(i, 0)]
+
+
+def deal_rate(d: dict, fx: Optional[FxSeries], spot: float) -> tuple[float, str]:
+    """The USD rate a deal is converted at, and where it came from: the
+    rate recorded WITH the deal (``deal``), else its day's close
+    (``daily``), else today's (``spot``) — a past day's PnL must not move
+    with the FX market whenever that day's rate is known."""
+    r = d.get("usd_rate")
+    if r is not None and float(r) > 0:
+        return float(r), "deal"
+    if fx:
+        v = fx.at(float(d["ts"]))
+        if v is not None:
+            return v, "daily"
+    return float(spot), "spot"
 
 
 def local_date(ts: float) -> str:
@@ -149,14 +213,30 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
               *, funding: Iterable[dict] = (),
               since_ts: Optional[float] = None, until_ts: Optional[float] = None,
               contract: float = 100.0, mt5_rate: float = 1.0,
-              seed_pos: float = 0.0, seed_avg: Optional[float] = None) -> dict:
+              fx: Optional[FxSeries] = None,
+              seed_pos: float = 0.0, seed_avg: Optional[float] = None,
+              venue_deals: Iterable[dict] = (), venue_magic: Optional[int] = None,
+              venue_rate: float = 1.0, venue_fx: Optional[FxSeries] = None) -> dict:
     """Realized PnL per local date, both legs, no mark-to-market.
 
     The venue leg is avg-cost realized over EVERY fill (older fills feed the
     basis; only events inside the window are reported), seeded with
-    ``seed_pos`` / ``seed_avg``. The MT5 leg is the broker's own ``profit``
-    + ``costs`` on the bot's deals (:func:`attribute_mt5_deals`, so close-by
-    profit counts) times ``mt5_rate`` (account currency → USD).
+    ``seed_pos`` / ``seed_avg`` — unless the venue reported its own figure
+    (``realized_usd`` on every fill of a date), or the venue is an MT5 QUOTE
+    leg: then ``venue_deals`` (its terminal's deals,
+    :func:`atjte.reporting.venue_deal_record`) are booked like the hedge's —
+    the broker's ``profit`` on ``venue_magic``'s deals and their close-by
+    legs, its commission + fee + swap as the date's fees, each at
+    :func:`deal_rate` (``venue_fx`` / ``venue_rate``) — on every date from
+    the first such deal on file (the history covers the leg from there).
+    Avg-cost on one leg against the broker's ticket pairing on the other
+    splits the same round trips differently: on 2026-10-20 XAUUSD247.i's day
+    read 28 USD more realized than average cost gives on both legs.
+
+    The MT5 leg is the broker's own ``profit`` + ``costs`` on the bot's deals (:func:`attribute_mt5_deals`, so close-by
+    profit and the symbol's adjustments count), each converted to USD at
+    :func:`deal_rate`: its own recorded rate, else its day's in ``fx``, else
+    ``mt5_rate`` (today's).
 
     ``funding`` is the funding settlements (:func:`reporting.funding_record`,
     negative = paid) — a real cash flow on a perpetual that never arrives as
@@ -166,7 +246,9 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
     ``kr_fills``, ``kr_vol``, ``kr_realized``, ``kr_fees``, ``mt5_deals``,
     ``mt5_vol`` (in units, ``lots × contract``), ``mt5_realized``,
     ``mt5_costs`` (commission + broker fee + swap, already INSIDE
-    ``mt5_realized`` and reported beside it), ``funding``, ``net``
+    ``mt5_realized`` and reported beside it), ``mt5_adjust`` (the
+    adjustments, also inside it), ``mt5_fx`` (the rate the date's last deal
+    took), ``funding``, ``net``
     (``kr_realized − kr_fees + mt5_realized + funding``) and ``cum``."""
     fills = sorted(fills, key=lambda f: float(f["ts"]))
     acc = avg_cost(fills, pos0=seed_pos, avg0=seed_avg)
@@ -187,7 +269,8 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
                                    "kr_source": "avg_cost",   # a date the MT5
                                    "mt5_deals": 0, "mt5_vol": 0.0,   # leg opens
                                    "mt5_realized": 0.0,              # has no fills
-                                   "mt5_costs": 0.0, "funding": 0.0})
+                                   "mt5_costs": 0.0, "mt5_adjust": 0.0,
+                                   "mt5_fx": None, "funding": 0.0})
     # The venue's OWN realized figure per fill, where it reports one, kept
     # per date alongside a flag for whether every fill that date had it.
     venue_realized: dict[str, float] = {}
@@ -226,21 +309,55 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
             r["kr_source"] = "venue"
         else:
             r["kr_source"] = "avg_cost"
+    # An MT5 QUOTE leg: the broker's own booked result, date by date, from
+    # the first of its deals on file (before it, the replay above stands)
+    vown = (attribute_mt5_deals(sorted(venue_deals, key=lambda d: float(d["ts"])),
+                                venue_magic)
+            if venue_magic is not None else [])
+    if vown:
+        first_day = local_date(float(vown[0]["ts"]))
+        booked: dict[str, list[float]] = {}
+        for d in vown:
+            ts = float(d["ts"])
+            if not inside(ts):
+                continue
+            rate, _src = deal_rate(d, venue_fx, venue_rate)
+            b = booked.setdefault(row(ts)["date"], [0.0, 0.0])
+            b[0] += float(d.get("profit") or 0.0) * rate
+            b[1] += float(d.get("costs") or 0.0) * rate
+        for r in days_rows(rows):
+            if r["date"] < first_day:
+                continue
+            realized, costs = booked.get(r["date"], (0.0, 0.0))
+            r["kr_realized"] = realized
+            r["kr_fees"] = -costs           # a charge is a positive fee
+            r["kr_source"] = "venue"
     own = attribute_mt5_deals(sorted(deals, key=lambda d: float(d["ts"])), magic)
+    fx_sources: dict[str, int] = {}
     for d in own:
         ts = float(d["ts"])
         if not inside(ts):
             continue
         r = row(ts)
+        rate, src = deal_rate(d, fx, mt5_rate)
+        fx_sources[src] = fx_sources.get(src, 0) + 1
+        r["mt5_fx"] = rate
+        if d.get("adjust"):
+            # a dividend, tax, charge, interest: money the account moved on
+            # the symbol with no trade behind it
+            amount = (float(d.get("profit") or 0.0) + float(d.get("costs") or 0.0)) * rate
+            r["mt5_adjust"] += amount
+            r["mt5_realized"] += amount
+            continue
         r["mt5_deals"] += 1
         if d.get("entry") in (DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT):
             r["mt5_vol"] += float(d.get("lots") or 0.0) * contract
-        costs = float(d.get("costs") or 0.0) * mt5_rate
+        costs = float(d.get("costs") or 0.0) * rate
         # commission + broker fee + swap. Kept INSIDE mt5_realized (it is what
         # the account was credited) and reported beside it, because "what did
         # the hedging cost me" is a question the net alone cannot answer.
         r["mt5_costs"] += costs
-        r["mt5_realized"] += float(d.get("profit") or 0.0) * mt5_rate + costs
+        r["mt5_realized"] += float(d.get("profit") or 0.0) * rate + costs
     # Funding: a real cash flow on a perpetual, charged on the venue's own
     # schedule and never as a fill, so it is recorded on its own
     # (reporting.funding_record) and bucketed here like one. Negative = paid.
@@ -265,10 +382,14 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
         "mt5_vol": sum(r["mt5_vol"] for r in days),
         "mt5_realized": sum(r["mt5_realized"] for r in days),
         "mt5_costs": sum(r["mt5_costs"] for r in days),
+        "mt5_adjust": sum(r["mt5_adjust"] for r in days),
         "funding": sum(r["funding"] for r in days),
         "net": cum,
         "pos": acc["pos"], "avg_price": acc["avg_price"],
         "mt5_rate": mt5_rate,
+        # how many deals took each kind of rate (deal / daily / spot): a
+        # history converted at "spot" moves with today's FX market
+        "mt5_fx_sources": fx_sources,
         "kr_source": ("venue" if days and all(r.get("kr_source") == "venue" for r in days)
                       else "avg_cost" if days and all(r.get("kr_source") == "avg_cost" for r in days)
                       else "mixed"),

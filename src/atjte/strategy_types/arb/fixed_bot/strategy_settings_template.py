@@ -118,16 +118,16 @@ SELL_MIN_SPREAD = None
 FUNDING_RATE_MAX_ABS = None
 
 # --- Risk controls: daily limits (engine feature; None = off) ---
-# Measured on the bot's OWN trading, in USD, REALIZED ONLY (the convention
-# of sample_project's get_daily_pnl_usd): the closing fills of both legs
-# plus each funding period that settles. An open drawdown never trips it,
-# and a position carried across midnight books its whole PnL on the day it
-# is closed. A breach latches CLOSE-ONLY — exits keep quoting, no new entry
+# Measured on the bot's OWN trading, in USD, MARKED TO MARKET: today's
+# realized PnL (closing fills of both legs, settled funding, fees, MT5
+# commission + swap) plus the open position's move since the day began, so
+# an open drawdown trips it; a position carried across midnight counts only
+# today's move. A breach latches CLOSE-ONLY — exits keep quoting, no new entry
 # — until the day rolls; the day's book is persisted with the position
 # state, so a restart resumes the same day instead of starting the count
 # again. The day boundary is the machine's LOCAL midnight (the dashboard's
 # "today"); True = UTC midnight.
-MAX_DAILY_LOSS_USD = None            # e.g. 200 -> close-only below -200 USD today
+MAX_DAILY_LOSS_USD = None            # REQUIRED live: e.g. 200 -> close-only below -200 USD today
 MAX_DAILY_VENUE_VOLUME_USD = None    # e.g. 500000 -> crypto notional traded today
 MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded today
 

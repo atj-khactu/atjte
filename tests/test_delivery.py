@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from atjte.engines.common.delivery import first_delivery_day  # noqa: E402
+from atjte.engines.common.delivery import first_delivery_day, parse_close_date  # noqa: E402
 
 
 class FirstDeliveryDayTest(unittest.TestCase):
@@ -25,6 +25,25 @@ class FirstDeliveryDayTest(unittest.TestCase):
     def test_unreadable_is_none(self):
         for bad in (None, "", "2026", "202613", "abcdef"):
             self.assertIsNone(first_delivery_day(bad), bad)
+
+
+class CloseDateTest(unittest.TestCase):
+    def test_a_day_or_a_day_and_time_in_utc(self):
+        from datetime import datetime, timezone
+        self.assertEqual(parse_close_date("2026-11-20"),
+                         datetime(2026, 11, 20, tzinfo=timezone.utc))
+        self.assertEqual(parse_close_date(" 2026-11-20 14:30 "),
+                         datetime(2026, 11, 20, 14, 30, tzinfo=timezone.utc))
+        self.assertEqual(parse_close_date("2026-11-20T14:30").hour, 14)
+
+    def test_off(self):
+        for off in (None, "", "None", "  "):
+            self.assertIsNone(parse_close_date(off), off)
+
+    def test_unreadable_raises(self):
+        for bad in ("20/11/2026", "2026-13-01", "tomorrow", 7):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_close_date(bad)
 
 
 if __name__ == "__main__":

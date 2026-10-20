@@ -318,10 +318,17 @@ EOD_RESUME_MAX_H = 3.0
 EOD_ROLLOVER_AT = None
 # What the hedge writes in the MT5 order's comment field — what you read in
 # the terminal's Trade/History tabs beside each ticket. Empty = "hedge
-# <market> <strategy key>" ("hedge XYZ-EUR grid"). MT5 truncates the comment at 31 characters, and some
+# <market> <strategy key>" ("hedge XYZ-EUR grid"); None = no comment at
+# all (an empty field). MT5 truncates the comment at 31 characters, and some
 # brokers overwrite it entirely; MT5_MAGIC, not this, is what the bot
 # identifies its own book by, so a broker that rewrites it costs nothing.
 MT5_COMMENT = ""
+# The same for an MT5 QUOTE leg (EXCHANGE_ID 'mt5'): what its market orders
+# carry in the comment field. Empty = "quote <market> <strategy key>", None =
+# no comment at all; its
+# own magic, not this, is how the bot knows the quote leg's tickets. Wins
+# over VENUE_CLIENT_OPTIONS['comment']. Ignored on any other Quote exchange.
+MT5_QUOTE_COMMENT = ""
 
 # --- Reconcile (venue position vs MT5 exposure) ---
 # Every RECONCILE_INTERVAL_S: compare the venue's position with the MT5
@@ -506,7 +513,13 @@ MT5_STALE_S = 300.0
 MT5_HEALTH_INTERVAL_S = 5.0
 MT5_HEALTH_RETRY_S = 1.0
 
-# --- Limit unit: absolute amounts or percentages ---
+# --- Limit unit: SUPERSEDED (2026-10-19) — write the unit into the value ---
+# A limit is an amount as a plain number (2500) or a percentage as '2%': of the
+# day's capital (Quote + Hedge equity, taken once per risk day) for the daily
+# loss and volumes, of the account it guards (taken once per day) for a margin
+# floor or liquidation threshold. Any other unit stops the bot at start.
+# The OLD strategy-wide switch below still makes the plain numbers of an
+# older file percentages (the bot says so at start):
 # "abs" (default): MAX_DAILY_LOSS_USD and the margin floors below are amounts,
 # as written (USD / the venue's quote / the MT5 account currency).
 # "pct": they are PERCENTAGES —
@@ -521,7 +534,10 @@ RISK_UNIT = "abs"
 
 # --- Margin / soft risk gates (block NEW entries; exits keep running) ---
 BALANCE_REFRESH_S = 60.0         # how often (s) to poll margins/positions
-MIN_MARGIN_LEVEL_MT5 = 200.0     # % — block entries when MT5 margin level drops below
+# % — block entries when MT5 margin level drops below; 0 = off, the default
+# since 2026-10-19: the Hedge entry floor is MIN_MT5_FREE_MARGIN_OPEN (the
+# panel no longer shows this row; a value in a strategy file still applies)
+MIN_MARGIN_LEVEL_MT5 = 0.0
 MIN_MT5_FREE_MARGIN_OPEN = 1000.0  # account ccy — block entries below this MT5 free margin
 # PERPETUAL ONLY — quote-currency margin head-room floor on the crypto venue.
 # On spot the equivalent guard is the account's free balance, which bounds
@@ -557,11 +573,18 @@ MARGIN_REJECT_PAUSE_S = 60.0
 CLOSE_ONLY = False
 
 # --- Daily limits (sticky for the rest of the day; None/0 = off) ---
-# Measured on the bot's OWN trading (atjte.engines.common.risk), REALIZED ONLY — the
-# convention of sample_project's get_daily_pnl_usd: the closing fills of
-# both legs (average-cost, USD per base unit) plus each funding period that
-# settles. An open drawdown never trips it, and a position carried across
-# midnight books its whole PnL on the day it is closed. Breaching a limit
+# REQUIRED for a LIVE start (2026-10-19): the max daily loss and a volume cap
+# on each exchange (MAX_DAILY_VOLUME_USD, or both per-exchange caps) — a live
+# bot refuses to start with either off. A dry run starts without them.
+# Measured on the bot's OWN trading (atjte.engines.arb.risk), MARKED TO MARKET
+# (2026-10-19; realized only before): today's realized PnL — the closing
+# fills of both legs (average-cost, USD per base unit), each funding period
+# that settles, the venue's fees on the bot's fills and the MT5 commission +
+# swap on its hedge deals — PLUS the open position's move since the day
+# began (both legs at the bot's own prices, accrued funding included). An
+# open drawdown trips it as it happens; a position carried across midnight
+# counts only today's move (its unrealized at the day roll is the
+# baseline). A leg that cannot be priced keeps the last priced move. Breaching a limit
 # puts the strategy into CLOSE-ONLY (exits keep quoting, no new entry) until
 # the day rolls; a PnL that recovers does NOT re-open the book.
 # Volumes are traded notional in USD per venue (crypto fills / MT5 hedge
@@ -570,7 +593,7 @@ CLOSE_ONLY = False
 # panel's Settings page — atjte.clock). LEGACY, only when none is set: True = UTC
 # midnight, False = the machine's local midnight.
 RISK_DAY_UTC = False
-MAX_DAILY_LOSS_USD = None            # today's PnL <= -this -> close-only for the day
+MAX_DAILY_LOSS_USD = None            # today's PnL <= -this -> close-only for the day (REQUIRED live)
 # ONE daily volume cap for both exchanges: either exchange's notional traded
 # today >= this -> close-only. The per-exchange names below override it for
 # that exchange only (None = the shared cap).
@@ -647,6 +670,10 @@ BREAK_MARKETS = None
 BREAK_ASSET_CLASS = None
 
 # --- Spread unit: absolute price points or basis points ---
+# SUPERSEDED (2026-10-19) — write the unit into the value: a price gap is
+# price points as a plain number (1.5) or basis points of the quoting price
+# as '12bps' (any other unit stops the bot at start). The OLD strategy-wide
+# switch below still makes the plain numbers of an older file bps:
 # "abs" (default): every price-gap setting below is in the pair's own
 # price points, as written. "bps": they are basis points of the quoting
 # price (1 bp = price / 10,000), so one template fits every instrument —
@@ -664,6 +691,9 @@ BPS_REANCHOR_WAIT_H = 6.0
 BPS_REANCHOR_DRIFT_PCT = None
 
 # --- Margin de-risk: EXIT the position, not just stop entering (None = off) ---
+# The panel calls these the LIQUIDATION THRESHOLD: Quote (the quoting
+# exchange: available margin, distance to liquidation) and Hedge (the hedge
+# account: margin level, free margin).
 # Any threshold breached while a position is open arms a de-risk latch:
 # every strategy quote comes down and the engine rests ONE reduce-only
 # post-only order at the TOUCH (join the best bid to buy back a short / the
@@ -684,6 +714,46 @@ DERISK_VENUE_LIQ_DISTANCE_PCT = None      # % — distance to the liquidation pr
 LIQ_DISTANCE_BASE = "entry"
 DERISK_MT5_MARGIN_LEVEL = None            # % — MT5 margin level floor (broker stop-out is well below)
 DERISK_MT5_FREE_MARGIN = None             # account ccy — MT5 free margin floor
+# IBKR ONLY — the account's EXCESS LIQUIDITY (equity − maintenance margin):
+# below 0 IBKR liquidates at once, choosing the positions itself, and the
+# figure is the WHOLE account's (a stock elsewhere in it spends it too). Checked
+# now AND at IBKR's look-ahead (the excess at its next margin change: an
+# overnight futures requirement, a stock's Reg T step). USD; RISK_UNIT pct = %
+# of the account's net liquidation. None = off.
+DERISK_VENUE_EXCESS_LIQUIDITY_USD = None
+# --- How the liquidation-threshold exit closes (and close before delivery) ---
+# LIQUIDATION_EXIT_MODE, one of:
+# "maker-pegged": ONE reduce-only post-only order of the strategy's order
+#    size (the whole position when that is smaller), pegged at the best price
+#    on its side (a long sells at the best ask) and re-priced as it moves; once
+#    it fills the next one rests, until flat — no slippage, no taker fee, but
+#    it fills only when someone trades against it.
+# "market-chunks" (was "chunks", still read): every EXIT_CHUNK_INTERVAL_S one reduce-only limit order that MAY
+#    take liquidity, priced EXIT_MAX_SLIPPAGE_BPS from the Quote mid — it
+#    fills what the book holds within that price, and what is left is
+#    cancelled at once (never a market sweep). Its size is the smaller of the
+#    position, the strategy's order size and EXIT_MAX_BOOK_SHARE of the book's
+#    depth within that price (the gateway's book; without one, the order size
+#    alone). The interval lets the book refill.
+# The Hedge is closed fill by fill either way. A strategy in market execution
+# mode (EXECUTION_MODE 'market') rests nothing: it always uses the chunks, as
+# market orders of that size.
+LIQUIDATION_EXIT_MODE = "maker-pegged"
+EXIT_CHUNK_INTERVAL_S = 5.0    # s between two chunks
+EXIT_MAX_SLIPPAGE_BPS = 25.0   # a chunk's price: at most this far from the mid (bp)
+EXIT_MAX_BOOK_SHARE = 0.25     # a chunk: at most this share of the depth (None = off)
+# A DATED FUTURE: close the position this many days before the contract's
+# first delivery day (else its expiry) and rest no entry from then on — IBKR
+# closes a physically delivered future itself ahead of delivery, at a time of
+# its choosing. Calendar days; the exit is the liquidation threshold's (one
+# reduce-only order at the touch, the Hedge following). None = off; a perpetual
+# or spot market never delivers, so it does nothing there.
+CLOSE_BEFORE_DELIVERY_DAYS = None
+# ... or on a fixed DATE: from 'YYYY-MM-DD' (00:00 UTC) or 'YYYY-MM-DD HH:MM'
+# (UTC) on, the same close through LIQUIDATION_EXIT_MODE and no entry. With
+# both set, whichever comes first. A dated future only, like the days; None =
+# off. An unreadable date stops the bot at start.
+CLOSE_BEFORE_DELIVERY_DATE = None
 
 # --- Error handling ---
 MAX_CONSECUTIVE_ERRORS = 3   # after this many failed ticks: cancel quotes, back off

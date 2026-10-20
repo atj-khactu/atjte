@@ -220,6 +220,9 @@ class GridWiringTest(unittest.TestCase):
         return bot
 
     def test_dynamic_allocation_sizes_each_level_cap_over_levels(self):
+        saved = grid_bot.GRID_LEVEL_DAILY                          # follow every cap
+        self.addCleanup(lambda: setattr(grid_bot, "GRID_LEVEL_DAILY", saved))
+        grid_bot.GRID_LEVEL_DAILY = False
         bot = self._dyn(6.0)
         d = by_key(bot._target_orders())
         self.assertAlmostEqual(d["grid-entry-L1"].size, 2.0)        # 6 / 3 levels
@@ -250,6 +253,44 @@ class GridWiringTest(unittest.TestCase):
         self.assertAlmostEqual(d["grid-entry-L3"].size, 0.7)       # ... so L3 still rests
         bot.venue_pos_units = 2.1                                  # the grid full
         self.assertNotIn("grid-entry-L3", by_key(bot._desired_orders()))
+
+    def test_dynamic_level_is_held_for_the_day(self):
+        """GRID_LEVEL_DAILY: the cap breathing inside the day cannot move
+        the level size (each move was a sell + a buy at one spread); a cap
+        10 % lower shrinks it at once; the next day takes the new cap."""
+        saved = (grid_bot.GRID_LEVEL_DAILY, grid_bot._day)
+        self.addCleanup(lambda: setattr(grid_bot, "GRID_LEVEL_DAILY", saved[0]))
+        self.addCleanup(lambda: setattr(grid_bot, "_day", saved[1]))
+        grid_bot.GRID_LEVEL_DAILY = True
+        today = ["2026-10-19"]
+        grid_bot._day = lambda: today[0]
+        bot = self._dyn(363000.0, step=1000.0, min_lot=1000.0)
+        self.assertEqual(bot._level_units(), 121000.0)
+        bot.venue_pos_units = -242000.0                            # S1 + S2 full
+        first = by_key(bot._target_orders())
+        self.assertNotIn("grid-exit-S3", first)
+        for cap in (358181.0, 364976.0, 359141.0, 361564.0):       # the day's noise
+            bot.dyn_cap_units = cap
+            self.assertEqual(bot._level_units(), 121000.0)
+            # the S2/S3 boundary never moves: no S3 take-profit appears and
+            # S2's entry never reopens at that same spread
+            self.assertEqual(by_key(bot._target_orders()), first)
+        bot.dyn_cap_units = 320000.0                               # 106.7k < 121k x 0.9
+        self.assertEqual(bot._level_units(), 107000.0)
+        bot.dyn_cap_units = 363000.0                               # recovers: still held
+        self.assertEqual(bot._level_units(), 107000.0)
+        today[0] = "2026-10-20"                                    # the new day's cap
+        self.assertEqual(bot._level_units(), 121000.0)
+        self.assertEqual(bot._extra_state()["grid"]["level_units_day"], "2026-10-20")
+
+    def test_dynamic_level_follows_every_cap_when_not_daily(self):
+        saved = grid_bot.GRID_LEVEL_DAILY
+        self.addCleanup(lambda: setattr(grid_bot, "GRID_LEVEL_DAILY", saved))
+        grid_bot.GRID_LEVEL_DAILY = False
+        bot = self._dyn(363000.0, step=1000.0, min_lot=1000.0)
+        self.assertEqual(bot._level_units(), 121000.0)
+        bot.dyn_cap_units = 358181.0
+        self.assertEqual(bot._level_units(), 119000.0)
 
     def test_no_dynamic_level_holds_entries_but_keeps_exits(self):
         bot = self._dyn(None)

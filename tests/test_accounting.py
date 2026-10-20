@@ -81,11 +81,107 @@ class DailyPnlTest(unittest.TestCase):
         self.assertEqual([r["date"] for r in later["days"]],
                          [A.local_date(t0 + 86400 * 3)])
 
+    def test_an_mt5_quote_leg_books_its_brokers_profit(self):
+        """XAUUSD247.i: buy 1 @100, buy 1 @110, sell 1 @108. Average cost
+        realizes 108 - 105 = 3; the broker closed the sell by the FIRST buy
+        and booked 8 — the figure the hedge's own broker pairing matches."""
+        t0 = 1_800_000_000.0
+        early = [fill(t0 - 86400 * 3, "buy", 1, 50.0), fill(t0 - 86400 * 3 + 9, "sell", 1, 52.0)]
+        fills = early + [fill(t0, "buy", 1, 100.0), fill(t0 + 10, "buy", 1, 110.0),
+                         fill(t0 + 20, "sell", 1, 108.0)]
+        vdeals = [deal(t0, 77, 0, 1, price=100.0), deal(t0 + 10, 77, 0, 2, price=110.0),
+                  deal(t0 + 20, 77, 0, 3, side="sell", price=108.0),
+                  deal(t0 + 21, 0, 3, 1, side="sell", profit=8.0, costs=-0.3),
+                  deal(t0 + 21, 0, 3, 3, side="buy", profit=0.0),
+                  deal(t0 + 30, 78, 0, 9, profit=50.0)]          # another magic
+        plain = A.daily_pnl(fills, [], None)
+        self.assertAlmostEqual(plain["days"][-1]["kr_realized"], 3.0)
+        out = A.daily_pnl(fills, [], None, venue_deals=vdeals, venue_magic=77,
+                          venue_rate=2.0)
+        first, day = out["days"]
+        # before the first venue deal on file the replay stands
+        self.assertEqual(first["kr_source"], "avg_cost")
+        self.assertAlmostEqual(first["kr_realized"], 2.0)
+        self.assertEqual(day["kr_source"], "venue")
+        self.assertAlmostEqual(day["kr_realized"], 16.0)          # 8 at the rate 2
+        self.assertAlmostEqual(day["kr_fees"], 0.6)               # the costs, as a fee
+        self.assertEqual(day["kr_fills"], 3)
+        self.assertAlmostEqual(day["net"], 16.0 - 0.6)
+        self.assertEqual(out["summary"]["kr_source"], "mixed")
+        self.assertEqual(out["summary"]["pos"], 1.0)              # the position is the fills'
+        # no magic for the quote terminal (an older snapshot): the replay
+        self.assertAlmostEqual(A.daily_pnl(fills, [], None, venue_deals=vdeals)
+                               ["days"][-1]["kr_realized"], 3.0)
+
     def test_position_summary(self):
         s = A.position_summary([fill(1, "buy", 2, 100.0)], mark=105.0)
         self.assertEqual(s["pos"], 2.0)
         self.assertAlmostEqual(s["unrealized"], 10.0)
         self.assertEqual(s["fills"], 1)
+
+
+def adjustment(ts, profit, magic=0, position_id=0, name="dividend"):
+    return {"kind": "deal", "ts": ts, "adjust": name, "magic": magic, "entry": None,
+            "position_id": position_id, "side": None, "profit": profit, "costs": 0.0,
+            "lots": 0.0, "price": 0.0}
+
+
+class FxByDayTest(unittest.TestCase):
+    """A past MT5 deal converts at ITS day's rate (2026-10-19): converting
+    the whole history at today's rate moved every past day with the FX
+    market — a JPY account's year of PnL re-priced each time USDJPY did."""
+
+    DAY = 86400.0
+
+    def test_a_moment_takes_the_bar_it_falls_in_and_carries_forward(self):
+        fx = A.FxSeries([(2 * self.DAY, 0.0070), (0.0, 0.0068), (self.DAY, 0.0069)])
+        self.assertEqual(fx.at(0.5 * self.DAY), 0.0068)
+        self.assertEqual(fx.at(self.DAY), 0.0069)              # the bar's own open
+        self.assertEqual(fx.at(10 * self.DAY), 0.0070)         # a weekend carries it on
+        self.assertEqual(fx.at(-5.0), 0.0068)                  # before every bar: the first
+        self.assertIsNone(A.FxSeries([]).at(1.0))
+        self.assertFalse(A.FxSeries([(1.0, 0.0)]))             # a zero rate is no rate
+
+    def test_the_rate_recorded_with_the_deal_wins_then_the_day_then_spot(self):
+        fx = A.FxSeries([(0.0, 0.0068)])
+        self.assertEqual(A.deal_rate({"ts": 5.0, "usd_rate": 0.0067}, fx, 0.0065),
+                         (0.0067, "deal"))
+        self.assertEqual(A.deal_rate({"ts": 5.0}, fx, 0.0065), (0.0068, "daily"))
+        self.assertEqual(A.deal_rate({"ts": 5.0}, None, 0.0065), (0.0065, "spot"))
+
+    def test_each_day_is_converted_at_its_own_rate(self):
+        fx = A.FxSeries([(0.0, 0.0070), (self.DAY, 0.0060)])
+        deals = [deal(0.5 * self.DAY, 7, 1, 1, profit=1000.0),
+                 deal(1.5 * self.DAY, 7, 1, 2, profit=1000.0)]
+        out = A.daily_pnl([], deals, 7, mt5_rate=0.0050, fx=fx)
+        self.assertEqual([round(r["mt5_realized"], 6) for r in out["days"]], [7.0, 6.0])
+        self.assertEqual(out["summary"]["mt5_fx_sources"], {"daily": 2})
+        # today's rate is only the fallback
+        out = A.daily_pnl([], deals, 7, mt5_rate=0.0050)
+        self.assertAlmostEqual(out["summary"]["mt5_realized"], 10.0)
+        self.assertEqual(out["summary"]["mt5_fx_sources"], {"spot": 2})
+
+
+class AdjustmentTest(unittest.TestCase):
+    """MT5 adjustments — a dividend on an index CFD, a tax, a charge — are
+    money the account moved on the symbol with no trade (2026-10-19): they
+    count in the MT5 leg, never as a deal or a hedge execution."""
+
+    def test_the_symbols_and_the_bots_own_adjustments_count(self):
+        deals = [deal(1, 7, 0, 100), deal(2, 9, 0, 200),
+                 adjustment(3, -4.0),                         # the symbol's: no position
+                 adjustment(4, 2.5, position_id=100),         # on the bot's position
+                 adjustment(5, 9.0, position_id=200),         # on another magic's
+                 adjustment(6, 1.0, magic=7)]
+        mine = A.attribute_mt5_deals(deals, 7)
+        self.assertEqual([d["ts"] for d in mine], [1, 3, 4, 6])
+        out = A.daily_pnl([], deals, 7)
+        sm = out["summary"]
+        self.assertAlmostEqual(sm["mt5_adjust"], -0.5)
+        self.assertAlmostEqual(sm["mt5_realized"], -0.5)
+        self.assertEqual(sm["mt5_deals"], 1)                  # trades only
+        self.assertEqual(sm["mt5_vol"], 0.01 * 100.0)
+        self.assertEqual([d["ts"] for d in A.hedge_executions(deals, 7)], [1])
 
 
 if __name__ == "__main__":

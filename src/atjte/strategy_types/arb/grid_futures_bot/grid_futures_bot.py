@@ -216,6 +216,14 @@ class GridFuturesBot(GridBot):
     def _now(self) -> datetime:
         return datetime.now(timezone.utc)
 
+    def _delivery_date(self) -> Optional[datetime]:
+        """The engine's close-before-delivery date: the carry's own
+        (``CARRY_DELIVERY``, else the first delivery day, else the expiry)."""
+        try:
+            return self._delivery()[0]
+        except Exception:                                   # noqa: BLE001
+            return None
+
     def _expiry(self) -> datetime:
         """The contract's last trade date: ``CARRY_EXPIRY``, else the venue
         market's ``expiry`` (a dated CCXT future / the IBKR gateway's markets).

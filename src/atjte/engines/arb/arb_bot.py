@@ -109,12 +109,15 @@ Risk controls (``atjte.engines.common.risk``, all off by default, every strategy
 inherits them):
 
 - **Daily limits** — ``MAX_DAILY_LOSS_USD``,
-  ``MAX_DAILY_VENUE_VOLUME_USD``, ``MAX_DAILY_MT5_VOLUME_USD``. The day's
-  PnL is **realized only** (``sample_project``'s convention): the closing
-  fills of both legs through one average-cost ledger each, in USD/unit, plus
-  each funding period that settles — an open drawdown never trips it, and a
-  position carried across midnight books its whole PnL on the day it is
-  closed. The volumes are traded notional per venue. A breach latches
+  ``MAX_DAILY_VENUE_VOLUME_USD``, ``MAX_DAILY_MT5_VOLUME_USD`` — REQUIRED for
+  a LIVE start (the loss and a volume cap on each exchange:
+  :meth:`ArbBot._assert_daily_limits`). The day's
+  PnL is **marked to market** (2026-10-19): the closing fills of both legs
+  through one average-cost ledger each, in USD/unit, plus each funding period
+  that settles, less the venue's fees and the MT5 commission + swap of the
+  bot's deals, PLUS the open position's move since the day began
+  (:func:`~atjte.engines.arb.risk.open_change`) — an open drawdown trips it,
+  and a position carried across midnight counts only today's move. The volumes are traded notional per venue. A breach latches
   CLOSE-ONLY — exits keep quoting, no new entry — for the rest of the day
   (midnight in the ACP timezone, ``atjte.clock``); the day's book is
   persisted with the position state, so a restart resumes the same day
@@ -136,7 +139,8 @@ inherits them):
   ``DERISK_VENUE_LIQ_DISTANCE_PCT``, ``DERISK_MT5_MARGIN_LEVEL``,
   ``DERISK_MT5_FREE_MARGIN``. Any of these breached while a position is open
   takes the strategy off the book entirely and rests ONE reduce-only
-  post-only order for the whole position AT THE TOUCH (join the best ask to
+  post-only order of the strategy's order size (the next once it fills)
+  AT THE TOUCH (join the best ask to
   sell a long, the best bid to cover a short), re-priced to the touch every
   pass, until the position is flat — the MT5 hedge unwinds with it
   through the normal per-fill hedging. The latch is **sticky until the
@@ -239,10 +243,11 @@ from atjte import events as _events                                    # noqa: E
 from atjte import workspace as _ws                                     # noqa: E402
 
 from ..common.grid_model import DesiredOrder, one_per_side, round_to_step  # noqa: E402
+from ... import units as _units                                        # noqa: E402
 from . import base_settings as _base                                   # noqa: E402
 from .risk import (                                                    # noqa: E402
-    DayBook, Ledger, combined_unrealized, daily_limit_reasons,
-    derisk_reasons, funding_settled, liq_distance_pct,
+    DayBook, Ledger, combined_unrealized, daily_limit_reasons, daily_limits_missing,
+    derisk_reasons, funding_settled, liq_distance_pct, open_change,
 )
 from ..common import blackout as _blackout                             # noqa: E402
 from ..common import ratio as _ratio                                   # noqa: E402
@@ -296,6 +301,67 @@ def _cfg(name: str):
                            f"magic are project identity and have no engine default")
     return v
 
+
+# ── units written into the values (atjte.units, 2026-10-19) ─────────────────
+#: the price-gap settings: price points (a plain number) or '12bps' — basis
+#: points of the quoting price, converted at the first price and re-anchored
+#: daily (BPS_ORIG / apply_bps)
+BPS_NAMES = ("GRID_STEP", "GRID_CENTER", "GRID_TAKE_PROFIT", "GRID_FIRST_OFFSET",
+             "BUY_SPREAD", "SELL_SPREAD",
+             "LONG_ENTRY_SPREAD", "SHORT_ENTRY_SPREAD", "LONG_EXIT_SPREAD",
+             "SHORT_EXIT_SPREAD", "BASIS_RELEASE", "BUY_MAX_SPREAD", "SELL_MIN_SPREAD",
+             "ORACLE_BASIS_MAX", "OPTIMIZE_LIMIT_OFFSET", "REQUOTE_MIN_MOVE")
+#: the limits: an amount (a plain number) or '2%' of the base LIMIT_BASE names,
+#: taken once per risk day (ArbBot._day_base)
+LIMIT_BASE = {"MAX_DAILY_LOSS_USD": "capital", "MAX_DAILY_VOLUME_USD": "capital",
+              "MAX_DAILY_VENUE_VOLUME_USD": "capital", "MAX_DAILY_MT5_VOLUME_USD": "capital",
+              "MIN_VENUE_AVAILABLE_MARGIN_USD": "venue",
+              "DERISK_VENUE_AVAILABLE_MARGIN_USD": "venue",
+              "DERISK_VENUE_EXCESS_LIQUIDITY_USD": "venue",
+              "MIN_MT5_FREE_MARGIN_OPEN": "mt5", "DERISK_MT5_FREE_MARGIN": "mt5"}
+#: each unit-bearing setting's unit as it resolved ("abs" / "bps" / "pct")
+UNITS: dict = {}
+#: the names a LEGACY strategy-wide unit (SPREAD_UNIT 'bps' / RISK_UNIT 'pct')
+#: put in bps / % because they are written as plain numbers
+UNITS_LEGACY: list = []
+
+
+def _normalize_units() -> None:
+    """Read every unit-bearing setting's unit out of its value and leave the
+    NUMBER in its place, in every settings module that defines it — so the
+    strategy types, which import these names as constants, read numbers as
+    they always did. A unit a setting does not take stops the bot here. A
+    plain number in a file whose old strategy-wide SPREAD_UNIT / RISK_UNIT is
+    'bps' / 'pct' keeps meaning what it meant (UNITS_LEGACY: the banner says
+    to write the unit into the value)."""
+    legacy_bps = str(_cfg("SPREAD_UNIT") or "abs").strip().lower() == "bps"
+    legacy_pct = str(_cfg("RISK_UNIT") or "abs").strip().lower() in ("pct", "%", "percent")
+    tables = ((BPS_NAMES, _units.SPREAD, legacy_bps, _units.BPS),
+              (tuple(LIMIT_BASE), _units.LIMIT, legacy_pct, _units.PCT))
+    for names, allowed, legacy, old in tables:
+        for name in names:
+            final = None
+            for mod in (_base, _project, _settings):          # the later one wins
+                raw = getattr(mod, name, _MISSING)
+                if raw is _MISSING:
+                    continue
+                try:
+                    v, unit, explicit = _units.parse(raw, allowed, name)
+                except _units.UnitError as e:
+                    raise RuntimeError(f"{getattr(mod, '__file__', mod)}: {e}") from None
+                if explicit:
+                    setattr(mod, name, v)
+                final = (v, unit, explicit)
+            if final is None:
+                continue
+            v, unit, explicit = final
+            if not explicit and legacy and v is not None:
+                unit = old
+                UNITS_LEGACY.append(name)
+            UNITS[name] = unit
+
+
+_normalize_units()
 
 if not hasattr(_settings, "LIVE_TRADING"):
     raise RuntimeError(f"strategies/{STRATEGY_DIR.name}/strategy_settings.py must "
@@ -401,7 +467,10 @@ if MT5_MAGIC is not None and int(MT5_MAGIC) in MT5_ADOPT_MAGICS:
     raise RuntimeError(f"MT5_ADOPT_MAGICS lists this bot's own MT5_MAGIC ({MT5_MAGIC})")
 MT5_REFUSED_HOLD_S = float(_cfg("MT5_REFUSED_HOLD_S") or 0.0)
 MT5_DEVIATION_POINTS = _cfg("MT5_DEVIATION_POINTS")
-MT5_COMMENT = str(_cfg("MT5_COMMENT") or "").strip()
+#: None = an EMPTY MT5 comment; "" = the automatic one (hedge_comment)
+MT5_COMMENT = None if _cfg("MT5_COMMENT") is None else str(_cfg("MT5_COMMENT")).strip()
+MT5_QUOTE_COMMENT = (None if _cfg("MT5_QUOTE_COMMENT") is None
+                     else str(_cfg("MT5_QUOTE_COMMENT")).strip())
 #: MT5 truncates an order comment at 31 characters
 MT5_COMMENT_MAX = 31
 HEDGE_THRESHOLD_UNITS = _cfg("HEDGE_THRESHOLD_UNITS")
@@ -581,14 +650,8 @@ CLOSE_ONLY = _cfg("CLOSE_ONLY")
 RISK_DAY_UTC = bool(_cfg("RISK_DAY_UTC"))
 
 
-#: the price-gap settings SPREAD_UNIT = "bps" converts (basis points of the
-#: quoting price -> the pair's price points)
-BPS_NAMES = ("GRID_STEP", "GRID_CENTER", "GRID_TAKE_PROFIT", "GRID_FIRST_OFFSET",
-             "BUY_SPREAD", "SELL_SPREAD",
-             "LONG_ENTRY_SPREAD", "SHORT_ENTRY_SPREAD", "LONG_EXIT_SPREAD",
-             "SHORT_EXIT_SPREAD", "BASIS_RELEASE", "BUY_MAX_SPREAD", "SELL_MIN_SPREAD",
-             "ORACLE_BASIS_MAX", "OPTIMIZE_LIMIT_OFFSET", "REQUOTE_MIN_MOVE")
-# "bps" converts; anything else ("abs", the default; "points") is as written
+# LEGACY strategy-wide unit: "bps" makes every price-gap setting written as a
+# plain number basis points (UNITS_LEGACY); a value carries its own unit now
 SPREAD_UNIT = str(_cfg("SPREAD_UNIT") or "abs").strip().lower()
 BPS_REANCHOR_WAIT_S = float(_cfg("BPS_REANCHOR_WAIT_H") or 6.0) * 3600.0
 BPS_REANCHOR_DRIFT_PCT = _cfg("BPS_REANCHOR_DRIFT_PCT")
@@ -602,7 +665,9 @@ def _bps_value(name):
 
 
 #: the bps values as written (before any conversion), for every re-anchor
-BPS_ORIG = ({n: _bps_value(n) for n in BPS_NAMES} if SPREAD_UNIT == "bps" else {})
+BPS_ORIG = {n: _bps_value(n) for n in BPS_NAMES if UNITS.get(n) == _units.BPS}
+#: any price-gap setting in bps: quotes wait for the first anchor
+BPS_ON = bool(BPS_ORIG)
 
 
 def _bps_modules():
@@ -674,25 +739,54 @@ MAX_DAILY_MT5_VOLUME_USD = _cfg("MAX_DAILY_MT5_VOLUME_USD")
 # the one cap for both exchanges; a per-exchange cap, where set, overrides it
 if MAX_DAILY_VENUE_VOLUME_USD is None:
     MAX_DAILY_VENUE_VOLUME_USD = MAX_DAILY_VOLUME_USD
+    UNITS["MAX_DAILY_VENUE_VOLUME_USD"] = UNITS.get("MAX_DAILY_VOLUME_USD", "abs")
 if MAX_DAILY_MT5_VOLUME_USD is None:
     MAX_DAILY_MT5_VOLUME_USD = MAX_DAILY_VOLUME_USD
+    UNITS["MAX_DAILY_MT5_VOLUME_USD"] = UNITS.get("MAX_DAILY_VOLUME_USD", "abs")
 DERISK_VENUE_AVAILABLE_MARGIN_USD = _cfg("DERISK_VENUE_AVAILABLE_MARGIN_USD")
 DERISK_VENUE_LIQ_DISTANCE_PCT = _cfg("DERISK_VENUE_LIQ_DISTANCE_PCT")
 DERISK_MT5_MARGIN_LEVEL = _cfg("DERISK_MT5_MARGIN_LEVEL")
 DERISK_MT5_FREE_MARGIN = _cfg("DERISK_MT5_FREE_MARGIN")
+# IBKR: the account's excess liquidity floor, now and at the look-ahead
+DERISK_VENUE_EXCESS_LIQUIDITY_USD = _cfg("DERISK_VENUE_EXCESS_LIQUIDITY_USD")
+# a dated future: close the position this many days before its first
+# delivery day (else its expiry) and enter nothing from then on; None = off
+CLOSE_BEFORE_DELIVERY_DAYS = _cfg("CLOSE_BEFORE_DELIVERY_DAYS")
+# ... or from a fixed date on (UTC); parsed here so a typo stops the start
+from ..common.delivery import parse_close_date as _parse_close_date  # noqa: E402
+CLOSE_BEFORE_DELIVERY_DATE = _parse_close_date(_cfg("CLOSE_BEFORE_DELIVERY_DATE"))
+# the liquidation-threshold exit: "maker-pegged" or "market-chunks"
+# (base_settings); "chunks", its name before 2026-10-19, still reads as it
+LIQUIDATION_EXIT_MODE = str(_cfg("LIQUIDATION_EXIT_MODE") or "maker-pegged").strip().lower()
+if LIQUIDATION_EXIT_MODE == "chunks":
+    LIQUIDATION_EXIT_MODE = "market-chunks"
+if LIQUIDATION_EXIT_MODE not in ("maker-pegged", "market-chunks"):
+    raise RuntimeError(f"LIQUIDATION_EXIT_MODE must be 'maker-pegged' or 'market-chunks' - "
+                       f"got {LIQUIDATION_EXIT_MODE!r}")
+EXIT_CHUNK_INTERVAL_S = float(_cfg("EXIT_CHUNK_INTERVAL_S") or 0.0)
+EXIT_MAX_SLIPPAGE_BPS = float(_cfg("EXIT_MAX_SLIPPAGE_BPS") or 0.0)
+EXIT_MAX_BOOK_SHARE = _cfg("EXIT_MAX_BOOK_SHARE")
 # the liquidation distance: "entry" = % of the entry -> liquidation cushion
 # left, "mark" = % of the mark (base_settings)
 LIQ_DISTANCE_BASE = "mark" if str(_cfg("LIQ_DISTANCE_BASE") or "entry").strip().lower()     == "mark" else "entry"
-# "pct": the daily loss and the margin floors are percentages (base_settings)
+# LEGACY strategy-wide unit: "pct" makes every limit written as a plain
+# number a percentage (UNITS_LEGACY); a value carries its own unit now
 RISK_UNIT = str(_cfg("RISK_UNIT") or "abs").strip().lower()
-RISK_PCT = RISK_UNIT in ("pct", "%", "percent")
+#: any limit in % (its base is taken once per risk day)
+RISK_PCT = any(UNITS.get(n) == _units.PCT for n in LIMIT_BASE)
 
 
-def pct_limit(value, base) -> Optional[float]:
-    """A limit as the gates compare it: ``value`` as written (RISK_UNIT abs),
-    or ``value`` % of ``base`` (pct). None / non-positive = off; a pct limit
-    whose base is unknown is off for now (a failed read already holds
-    entries through the margin gate)."""
+def limit_pct(name: str) -> bool:
+    """Whether the limit ``name`` is written as a percentage."""
+    return UNITS.get(name) == _units.PCT
+
+
+def pct_limit(value, base, name: Optional[str] = None) -> Optional[float]:
+    """A limit as the gates compare it: ``value`` as written when it is an
+    amount, or ``value`` % of ``base`` when the setting ``name`` is written
+    in % (``'2%'``). None / non-positive = off; a % limit whose base is
+    unknown is off for now (a failed read already holds entries through
+    the margin gate)."""
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -701,7 +795,7 @@ def pct_limit(value, base) -> Optional[float]:
         return None
     if v <= 0:
         return None
-    if not RISK_PCT:
+    if not (limit_pct(name) if name else RISK_PCT):
         return v
     if base is None:
         return None
@@ -815,6 +909,11 @@ STATE_FILE = STRATEGY_DIR / "bot_state.json"          # heartbeat, rewritten eve
 POSITION_FILE = STRATEGY_DIR / "position_state.json"  # tracked position + orders
 FILL_MARKS_FILE = STRATEGY_DIR / "fill_marks.csv"      # every perp fill + the MT5 tick at that moment
 FILL_MARK_LATE_S = 1.0              # ... and the tick this long after it
+# a fill booked with no venue trade behind it (REST cumulative, a cancel's
+# final state) is reported only if the venue's own trade has not arrived on
+# the ws stream within this long — the trade usually lands a moment later,
+# and reporting both counted the part twice (PAXG_PERP, 2026-10-19)
+INFERRED_FILL_WAIT_S = 30.0
 # 1 s spread sampling (the ENGINE, so every strategy gets the series): the
 # live spread is sampled once a second in the fast pass and persisted to the
 # strategy folder's spread_1s.json (atomic rewrite every ~10 s; reloaded at
@@ -1042,6 +1141,9 @@ class OrderRec:
                                          # quote is priced off the basis avg
     prior_ids: set = field(default_factory=set)   # ids an AMEND replaced: a fill
                                          # on one of them is still this order's
+    inferred: float = 0.0    # booked with no venue trade yet, not yet reported
+    inferred_t: float = 0.0  # ... when the last of it was booked
+    inferred_src: str = ""   # ... and by what (poll, a settle reason)
 
     @property
     def remaining(self) -> float:
@@ -1107,7 +1209,8 @@ class ArbBot:
     @property
     def hedge_comment(self) -> str:
         """What the hedge writes in the MT5 order's comment field:
-        ``MT5_COMMENT`` where the strategy sets one, else ``hedge <market>
+        ``MT5_COMMENT`` where the strategy sets one, nothing at all where it
+        sets None, else ``hedge <market>
         <key>`` — the venue symbol's base (``XYZ-EUR``, ``XAUT``) and the
         strategy type, so the terminal tells two projects' hedges apart:
         before, every grid wrote ``hedge grid`` (2026-09-28: xyz:EUR, xyz:JPY
@@ -1116,7 +1219,23 @@ class ArbBot:
         The magic, not this, is how the bot knows its own book."""
         market = str(SYMBOL_VENUE or "").split("/", 1)[0].strip()
         default = f"hedge {market} {self.STRATEGY_KEY}" if market else f"hedge {self.STRATEGY_KEY}"
+        if MT5_COMMENT is None:
+            return ""
         return (MT5_COMMENT or default)[:MT5_COMMENT_MAX]
+
+    @property
+    def quote_comment(self) -> str:
+        """What an MT5 QUOTE leg's market orders carry in the comment field:
+        ``MT5_QUOTE_COMMENT``, else ``VENUE_CLIENT_OPTIONS['comment']``, else
+        ``quote <market> <key>`` — so the terminal tells the quote leg's
+        tickets from the hedge's on one account. None = no comment at all
+        (over the client option too). Truncated as the hedge's."""
+        market = str(SYMBOL_VENUE or "").split("/", 1)[0].strip()
+        default = f"quote {market} {self.STRATEGY_KEY}" if market else f"quote {self.STRATEGY_KEY}"
+        if MT5_QUOTE_COMMENT is None:
+            return ""
+        given = MT5_QUOTE_COMMENT or str(VENUE_CLIENT_OPTIONS.get("comment") or "").strip()
+        return (given or default)[:MT5_COMMENT_MAX]
     # 1 s spread history the engine keeps and persists (s). A strategy that
     # computes on the samples (the Bollinger bands) overrides this to cover
     # its own window + grace.
@@ -1138,8 +1257,11 @@ class ArbBot:
         return {}
 
     def __init__(self) -> None:
+        # an MT5 quote leg's order comment (MT5VenueClient's ``comment``);
+        # no other connector takes one
+        quote_opts = ({"comment": self.quote_comment} if EXCHANGE_ID == "mt5" else {})
         self.venue = Venue(EXCHANGE_ID, SYMBOL_VENUE, client_path=VENUE_CLIENT,
-                           client_options={**VENUE_CLIENT_OPTIONS,
+                           client_options={**VENUE_CLIENT_OPTIONS, **quote_opts,
                                            "client_name": f"{PROJECT_DIR.name}_{STRATEGY_DIR.name}",
                                            "symbol": SYMBOL_VENUE, "log": _log},
                            base_inventory=BASE_INVENTORY_UNITS,
@@ -1178,6 +1300,12 @@ class ArbBot:
         self.orders: dict[str, OrderRec] = {}  # key -> resting order
         self.intents: dict[str, dict] = {}     # dry-run: what would rest
         self._retired: dict[str, float] = {}   # recently settled order_id -> t
+        # ... and its record: a ws trade that lands after the settle keeps
+        # the order's key and purpose in the report
+        self._retired_recs: dict[str, OrderRec] = {}
+        # order_id -> rec with an inferred booking whose venue trade has not
+        # arrived yet (reported after INFERRED_FILL_WAIT_S if it never does)
+        self._inferred_wait: dict[str, OrderRec] = {}
         # order_id -> (rec, reason): cancelled by a requote, final-state read
         # still owed (_drain_settling, on the slow tick); ws fills book here
         self._settling: dict[str, tuple[OrderRec, str]] = {}
@@ -1322,8 +1450,9 @@ class ArbBot:
         self.venue_ledger = Ledger()
         self.mt5_ledger = Ledger()
         self.risk_reasons: list[str] = []       # the daily limits' close-only reasons
-        self.risk_pnl_usd: Optional[float] = None
+        self.risk_pnl_usd: Optional[float] = None      # the gated figure: realized + open move
         self.risk_unrealized_usd: Optional[float] = None
+        self.risk_open_change_usd: Optional[float] = None   # last priced open move today
         self.derisk_active = False              # armed = flatten; sticky until restart
         self.derisk_reasons: list[str] = []
         self.derisk_since: Optional[str] = None
@@ -1445,7 +1574,7 @@ class ArbBot:
             _log(f"limit optimisation: an order (entry or exit) the {BASIS_WINDOW_S:g} s "
                  f"basis average is already through is priced "
                  f"{float(OPTIMIZE_LIMIT_OFFSET):g} "
-                 f"{'bp' if SPREAD_UNIT == 'bps' else 'USD'} inside the average instead "
+                 f"{'bp' if UNITS.get('OPTIMIZE_LIMIT_OFFSET') == 'bps' else 'USD'} inside the average instead "
                  f"of at its level (never past the level)"
                  + ("" if OPTIMIZE_LIMIT_TAKER or not (ALLOW_TAKER_ENTRY or ALLOW_TAKER_EXIT)
                     else " — MAKER orders only: a taker order is priced at its level "
@@ -1465,6 +1594,20 @@ class ArbBot:
                  f"hedged elsewhere); the short side can only sell that inventory"
                  + ("" if BASE_INVENTORY_UNITS > 0 else
                     " — with it at 0 the bot can only sell what it has bought"))
+
+    def _assert_daily_limits(self) -> None:
+        """A LIVE start is refused while the max daily loss or a daily volume
+        cap is off (2026-10-19): they are the bot's only bound on a bad day,
+        and None was the default. A dry run starts without them."""
+        if not LIVE_TRADING:
+            return
+        missing = daily_limits_missing(MAX_DAILY_LOSS_USD, MAX_DAILY_VENUE_VOLUME_USD,
+                                       MAX_DAILY_MT5_VOLUME_USD)
+        if missing:
+            raise RuntimeError(
+                "LIVE start refused: " + "; ".join(missing) + " — set them in the "
+                "strategy's settings (Maximum Loss / Maximum Volume settings), or run "
+                "with LIVE_TRADING = False")
 
     def _assert_single_bot(self) -> None:
         """Every strategy under ``strategies/`` trades the same market
@@ -1536,6 +1679,7 @@ class ArbBot:
         # atomic. This lock has none of those gaps: the kernel arbitrates, and
         # it is released however the holder dies, so it never needs clearing.
         self._instance_lock = _InstanceLock(STRATEGY_DIR).acquire()
+        self._assert_daily_limits()  # a LIVE bot never runs without them
         self._assert_single_bot()   # BEFORE connecting: never touch a live
                                     # sibling's resting orders
         if STOP_FILE.exists():
@@ -1853,12 +1997,17 @@ class ArbBot:
         return None
 
     def _book(self, rec: OrderRec, source: str,
-              trade: Optional[Trade] = None) -> None:
-        """Apply any un-booked fill on `rec` to the net position."""
+              trade: Optional[Trade] = None) -> float:
+        """Apply any un-booked fill on `rec` to the net position; returns the
+        units booked. A venue ``trade`` is booked at its own price (a taker
+        exit fills away from its limit); a booking with no trade behind it
+        is at the order's price and waits for the venue's trade before it is
+        reported (:meth:`_defer_inferred`)."""
         target = min(rec.amount, max(rec.ws_cum, rec.rest_cum))
         delta = target - rec.booked
         if delta <= POS_EPS:
-            return
+            return 0.0
+        price = float(trade.price) if trade is not None and trade.price else rec.price
         rec.booked = target
         self._last_fill_t = time.time()
         signed = delta if rec.side == "buy" else -delta
@@ -1868,20 +2017,87 @@ class ArbBot:
         self.counters["fills_booked_units"] = round(
             self.counters["fills_booked_units"] + delta, 8)
         # the day's risk book: this leg's realized PnL and traded notional
-        # (the fill price is the resting order's — these are maker fills)
+        # (the trade's price; the order's when no trade is behind it — a
+        # later venue trade for that part corrects it: _cover_inferred)
         self._roll_day()
-        self.day.realized_venue_usd += self.venue_ledger.apply(rec.side, delta, rec.price)
-        self.day.venue_volume_usd += delta * rec.price
+        self.day.realized_venue_usd += self.venue_ledger.apply(rec.side, delta, price)
+        self.day.venue_volume_usd += delta * price
         self._hedge_dirty = True
         self._bal_dirty = True
-        _log(f"FILL {rec.key} {rec.side} {delta:g} units @ ~{rec.price} [{source}] "
+        _log(f"FILL {rec.key} {rec.side} {delta:g} units @ "
+             f"{'' if trade is not None else '~'}{price} [{source}] "
              f"-> pos {self.pos_units:+.4f} units")
         self._persist_position()
         if trade is None:           # a venue trade is reported by the ws handler,
-            self._report_fill(rec, delta, source)   # at its OWN size, not this delta
+            self._defer_inferred(rec, delta, source)   # at its OWN size, not this delta
         if source != "ws":          # ws fills are marked per trade by the caller
             self._mark_fill(rec.side, delta, rec.price, rec.key, "", rec.order_id, source,
                             purpose=rec.purpose, level=rec.level)
+        return delta
+
+    def _defer_inferred(self, rec: OrderRec, delta: float, source: str) -> None:
+        """Hold the report row of a fill booked with no venue trade behind
+        it. The venue's trade nearly always follows on the ws stream (a
+        cancel's REST read or final state ran ahead of it), and reporting
+        the guess as well counted that part twice at the order's price —
+        PAXG_PERP's market-chunks exit on 2026-10-19 reported 7.833 units
+        for 5.0 traded. The trade covers it (:meth:`_cover_inferred`); what
+        no trade covers in INFERRED_FILL_WAIT_S is reported as inferred
+        (:meth:`_flush_inferred`)."""
+        rec.inferred = round(rec.inferred + delta, 10)
+        rec.inferred_t = time.time()
+        rec.inferred_src = source
+        if getattr(self, "_inferred_wait", None) is None:
+            self._inferred_wait = {}
+        self._inferred_wait[rec.order_id] = rec
+
+    def _cover_inferred(self, rec: OrderRec, units: float, price: float) -> None:
+        """A venue trade of ``units`` @ ``price`` on ``rec`` that the position
+        had ALREADY taken by inference: it replaces that inferred part — no
+        second report row — and the leg's ledger moves from the order's
+        price to the trade's."""
+        covered = min(rec.inferred, units)
+        if covered <= POS_EPS:
+            return
+        rec.inferred = round(rec.inferred - covered, 10)
+        if rec.inferred <= POS_EPS:
+            rec.inferred = 0.0
+            getattr(self, "_inferred_wait", {}).pop(rec.order_id, None)
+            # the guess's fill mark too, if it is still waiting for its late tick
+            self._pending_marks = [m for m in getattr(self, "_pending_marks", [])
+                                   if not (m["row"][3] == rec.order_id and m["row"][1] != "ws")]
+        diff = (price - rec.price) * covered
+        if abs(diff) > 1e-9:
+            led = self.venue_ledger
+            self._roll_day()
+            if ((led.inv_units > POS_EPS and rec.side == "buy")
+                    or (led.inv_units < -POS_EPS and rec.side == "sell")):
+                led.avg_cost += diff / abs(led.inv_units)   # it opened: the basis moves
+            else:                                           # it reduced: the PnL does
+                r = diff if rec.side == "sell" else -diff
+                led.realized_usd += r
+                self.day.realized_venue_usd += r
+            led.volume_usd += diff
+            self.day.venue_volume_usd += diff
+            self._persist_position()
+        _log(f"FILL {rec.key} {rec.side} {covered:g} units @ {price} [ws] — the venue's "
+             f"trade for what {rec.inferred_src or 'a read'} booked at ~{rec.price}; "
+             f"the position already had it")
+
+    def _flush_inferred(self, now: float, final: bool = False) -> None:
+        """Report what was booked by inference and never covered by a venue
+        trade within INFERRED_FILL_WAIT_S (``final``: all of it, at
+        teardown) — recorded as inferred, at the order's price."""
+        waiting = getattr(self, "_inferred_wait", {})
+        for oid, rec in list(waiting.items()):
+            if rec.inferred <= POS_EPS:
+                waiting.pop(oid, None)
+                continue
+            if not final and now - rec.inferred_t < INFERRED_FILL_WAIT_S:
+                continue
+            waiting.pop(oid, None)
+            amount, rec.inferred = rec.inferred, 0.0
+            self._report_fill(rec, amount, rec.inferred_src or "inferred")
 
     def _mark_fill(self, side: str, amount: float, price: float, key: str,
                    trade_id: str, order_id: str, source: str,
@@ -1999,8 +2215,19 @@ class ArbBot:
                 if tr.order_id in self._retired:
                     # settled already (often by inference, when the cancel
                     # found it gone): the position took it then, but the
-                    # report still needs the venue's trade itself
-                    self._report_fill(None, self.venue.to_units(tr.amount), "ws", tr)
+                    # report still needs the venue's trade itself — under
+                    # the order's key and purpose, in place of the inferred
+                    # part it covers
+                    old = getattr(self, "_retired_recs", {}).get(tr.order_id)
+                    if old is not None:
+                        if tr.trade_id in old.ws_trade_ids:
+                            continue  # ws replay/snapshot duplicate
+                        old.ws_trade_ids.add(tr.trade_id)
+                    units = self.venue.to_units(tr.amount)
+                    self._report_fill(old, units, "ws", tr)
+                    if old is not None:
+                        old.ws_cum = min(old.amount, old.ws_cum + units)
+                        self._cover_inferred(old, units, float(tr.price or old.price))
                 elif tr.timestamp is not None and tr.timestamp >= self._started_utc:
                     self._log_once(f"untracked_{tr.order_id}",
                                    f"note: ws fill for untracked order {tr.order_id} "
@@ -2015,7 +2242,10 @@ class ArbBot:
             self._report_fill(rec, fill_units, "ws", tr)
             rec.ws_cum = min(rec.amount, rec.ws_cum + fill_units)
             rec.last_fill_t = time.time()
-            self._book(rec, source="ws", trade=tr)
+            booked = self._book(rec, source="ws", trade=tr)
+            # what the position already took by inference (a REST read ran
+            # ahead of this trade): the trade replaces that guess
+            self._cover_inferred(rec, fill_units - booked, float(tr.price or rec.price))
             self._mark_fill(rec.side, fill_units, tr.price, rec.key, tr.trade_id,
                             tr.order_id or rec.order_id, "ws",
                             purpose=rec.purpose, level=rec.level)
@@ -2028,11 +2258,21 @@ class ArbBot:
     def _drop_rec(self, key: str) -> None:
         rec = self.orders.pop(key, None)
         if rec is not None:
-            self._retired[rec.order_id] = time.time()
-            if len(self._retired) > 200:  # prune old entries
-                cutoff = time.time() - 600
-                self._retired = {k: v for k, v in self._retired.items() if v > cutoff}
+            self._note_retired(rec)
             self._persist_position()
+
+    def _note_retired(self, rec: OrderRec) -> None:
+        """Remember a settled order — its id against a late ws fill, and its
+        record, so that fill is reported under the order's key and purpose."""
+        self._retired[rec.order_id] = time.time()
+        recs = getattr(self, "_retired_recs", None)
+        if recs is None:
+            recs = self._retired_recs = {}
+        recs[rec.order_id] = rec
+        if len(self._retired) > 200:  # prune old entries
+            cutoff = time.time() - 600
+            self._retired = {k: v for k, v in self._retired.items() if v > cutoff}
+            self._retired_recs = {k: v for k, v in recs.items() if k in self._retired}
 
     def _retire_rec(self, rec: OrderRec) -> None:
         """Drop a fully booked record wherever it is tracked: the resting
@@ -2042,7 +2282,7 @@ class ArbBot:
             self._drop_rec(rec.key)
             return
         if getattr(self, "_settling", {}).pop(rec.order_id, None) is not None:
-            self._retired[rec.order_id] = time.time()
+            self._note_retired(rec)
 
     def _drain_settling(self, now: float) -> None:
         """The final-state read a requote's cancel owes, done on the slow tick
@@ -2381,24 +2621,58 @@ class ArbBot:
     def _resolve_hedge_threshold(self) -> None:
         """HEDGE_THRESHOLD_UNITS / RECONCILE_TOLERANCE_UNITS None: one MT5
         min lot in venue units (the lot specs are loaded) — the smallest
-        hedge the broker takes. A value in the settings is used as written."""
+        hedge the broker takes. A value in the settings is used as written.
+
+        A derived gate is remembered (``_lot_gates``) and follows the lot:
+        :meth:`_rederive_lot_gates` re-sizes it when FX_CONVERSION_SYMBOL
+        moves the venue units one lot hedges. Rounded to 8 places, the
+        rounding every gap it is compared with gets, so a gap of exactly one
+        min lot clears it (xyz:JP225 2026-10-19: a 1-lot MT5 book against a
+        flat venue read 0.00631536 < 0.006315364 and was never closed)."""
         global HEDGE_THRESHOLD_UNITS, RECONCILE_TOLERANCE_UNITS
         global POSITION_RECONCILE_TOLERANCE_UNITS
-        lot_units = round(self.volume_min * self.contract_size, 10)
+        lot_units = round(self.volume_min * self.contract_size, 8)
+        self._lot_gates = set()
         if HEDGE_THRESHOLD_UNITS is None:
             HEDGE_THRESHOLD_UNITS = lot_units
+            self._lot_gates.add("HEDGE_THRESHOLD_UNITS")
             self.hedge_threshold_from = "mt5_min_lot"
             _log(f"hedge threshold: one {SYMBOL_MT5} min lot ({self.volume_min:g} lot) = "
                  f"{HEDGE_THRESHOLD_UNITS:g} {UNIT_LABEL} (HEDGE_THRESHOLD_UNITS None)")
         if RECONCILE_TOLERANCE_UNITS is None:
             RECONCILE_TOLERANCE_UNITS = lot_units
+            self._lot_gates.add("RECONCILE_TOLERANCE_UNITS")
             _log(f"reconcile tolerance: one {SYMBOL_MT5} min lot = "
                  f"{RECONCILE_TOLERANCE_UNITS:g} {UNIT_LABEL} (RECONCILE_TOLERANCE_UNITS None)")
         if POSITION_RECONCILE_TOLERANCE_UNITS is None:
             POSITION_RECONCILE_TOLERANCE_UNITS = lot_units / 2.0
+            self._lot_gates.add("POSITION_RECONCILE_TOLERANCE_UNITS")
             _log(f"position reconcile tolerance: half a {SYMBOL_MT5} min lot = "
                  f"{POSITION_RECONCILE_TOLERANCE_UNITS:g} {UNIT_LABEL} "
                  f"(POSITION_RECONCILE_TOLERANCE_UNITS None)")
+
+    def _rederive_lot_gates(self) -> None:
+        """The gates :meth:`_resolve_hedge_threshold` derived from the lot,
+        re-sized to the CURRENT lot (an FX re-size moved it). Frozen at the
+        start-up rate, a USDJPY that rose made one lot worth less than the
+        gate: a whole-lot gap read 'under one lot' and was carried for good
+        (xyz:JP225 2026-10-19, threshold 0.00632039 from 158.218, one lot
+        0.00631536 at 158.344). Settings written as values are left alone."""
+        global HEDGE_THRESHOLD_UNITS, RECONCILE_TOLERANCE_UNITS
+        global POSITION_RECONCILE_TOLERANCE_UNITS
+        gates = getattr(self, "_lot_gates", set())
+        if not gates:
+            return
+        lot_units = round(self.volume_min * self.contract_size, 8)
+        if "HEDGE_THRESHOLD_UNITS" in gates:
+            HEDGE_THRESHOLD_UNITS = lot_units
+            if self.hedger is not None:
+                self.hedger.threshold_units = lot_units
+        if "RECONCILE_TOLERANCE_UNITS" in gates:
+            RECONCILE_TOLERANCE_UNITS = lot_units
+        if "POSITION_RECONCILE_TOLERANCE_UNITS" in gates:
+            POSITION_RECONCILE_TOLERANCE_UNITS = lot_units / 2.0
+        self.mt5_min_lot_units = self.volume_min * self.contract_size
 
     def _check_hedge_thresholds(self, min_lot_units: float) -> None:
         """WARN (log + the report's ``market.hedge_gate_warnings``) when
@@ -2485,6 +2759,7 @@ class ArbBot:
         self.contract_size = self._broker_contract / (HEDGE_RATIO * rate)
         if self.hedger is not None:
             self.hedger.contract_size = self.contract_size
+        self._rederive_lot_gates()
         _log(f"{FX_CONVERSION_SYMBOL} hourly rate {old:g} -> {rate:g}: the hedge is now "
              f"{HEDGE_RATIO * rate:g} MT5 units per venue unit -- the parity check re-sizes it")
         self._hedge_dirty = True
@@ -2899,6 +3174,8 @@ class ArbBot:
         self.venue_initial_margin = self.venue.initial_margin
         self.venue_initial_margin_orders = self.venue.initial_margin_orders
         self.venue_maintenance_margin = self.venue.maintenance_margin
+        self.venue_excess_liquidity = getattr(self.venue, "excess_liquidity", None)
+        self.venue_excess_ahead = getattr(self.venue, "excess_liquidity_ahead", None)
         self.venue_unrealized_funding = self.venue.unrealized_funding
         self.venue_total_unrealized = self.venue.total_unrealized
         self.venue_pnl = self.venue.pnl
@@ -3047,14 +3324,15 @@ class ArbBot:
             # MT5 equity = margin used + free margin (account currency)
             self.mt5_equity_ccy = (None if mm.used is None or mm.free is None
                                    else float(mm.used) + float(mm.free))
-            mt5_free_min = pct_limit(MIN_MT5_FREE_MARGIN_OPEN, self.mt5_equity_ccy)
+            mt5_free_min = pct_limit(MIN_MT5_FREE_MARGIN_OPEN, self._day_base("mt5"),
+                                     "MIN_MT5_FREE_MARGIN_OPEN")
             if (MIN_MARGIN_LEVEL_MT5 > 0 and mm.level is not None
                     and mm.level < MIN_MARGIN_LEVEL_MT5):
                 reasons.append(f"MT5 margin level {mm.level:.0f}% < {MIN_MARGIN_LEVEL_MT5:g}%")
             if (mt5_free_min and mm.free is not None and mm.free < mt5_free_min):
                 reasons.append(f"MT5 free margin {mm.free:.0f} < {mt5_free_min:.0f}"
-                               + (f" ({float(MIN_MT5_FREE_MARGIN_OPEN):g}% of equity)"
-                                  if RISK_PCT else ""))
+                               + (f" ({float(MIN_MT5_FREE_MARGIN_OPEN):g}% of the day's equity)"
+                                  if limit_pct("MIN_MT5_FREE_MARGIN_OPEN") else ""))
         except Exception as e:
             reasons.append(f"MT5 margin read failed ({e})")
         try:
@@ -3065,13 +3343,13 @@ class ArbBot:
         try:
             self._read_venue_margin()
             am = self.venue_available_margin
-            am_min = pct_limit(MIN_VENUE_AVAILABLE_MARGIN_USD,
-                               getattr(self, "venue_margin_equity", None))
+            am_min = pct_limit(MIN_VENUE_AVAILABLE_MARGIN_USD, self._day_base("venue"),
+                               "MIN_VENUE_AVAILABLE_MARGIN_USD")
             if (self.is_perp and am_min and am is not None and am < am_min):
                 reasons.append(f"{EXCHANGE_ID} available margin {am:.0f} "
                                f"{self.venue.quote} < {am_min:.0f}"
-                               + (f" ({float(MIN_VENUE_AVAILABLE_MARGIN_USD):g}% of equity)"
-                                  if RISK_PCT else ""))
+                               + (f" ({float(MIN_VENUE_AVAILABLE_MARGIN_USD):g}% of the day's "
+                                  f"equity)" if limit_pct("MIN_VENUE_AVAILABLE_MARGIN_USD") else ""))
             # spot, cash mode: the free quote balance is the margin
             fq = self.venue.free_quote
             if (not self.is_perp and not VENUE_LEVERAGE and MIN_QUOTE_FREE_OPEN > 0
@@ -3110,8 +3388,11 @@ class ArbBot:
                 reasons.append(f"close-only signal ({CLOSE_ONLY_FILE.name}): {why}")
         except OSError:
             pass
+        dlv = getattr(self, "delivery_close_reason", None)
+        if dlv:
+            reasons.append(dlv)         # no new entries this close to delivery
         if self.derisk_active:
-            reasons.append("margin de-risk latch (sticky until restart): "
+            reasons.append("liquidation threshold hit (sticky until restart): "
                            + "; ".join(self.derisk_reasons))
         if reasons != self.close_only_reasons:
             _log("entry gate: " + ("; ".join(reasons) if reasons else
@@ -3126,21 +3407,43 @@ class ArbBot:
         return None if v is None or m is None else float(v) + float(m)
 
     def _max_daily_loss(self) -> Optional[float]:
-        """MAX_DAILY_LOSS_USD in USD: as written, or (RISK_UNIT pct) that % of
-        the capital taken once per risk day, at the day's first reading."""
-        if not RISK_PCT:
-            return pct_limit(MAX_DAILY_LOSS_USD, None)
-        base = getattr(self, "_loss_base", None)
-        if base is None or base[0] != self.day.date:
-            cap = self._capital_usd()
-            if cap is None:
-                return None
-            self._loss_base = base = (self.day.date, cap)
-            if MAX_DAILY_LOSS_USD:
-                _log(f"daily loss limit: {float(MAX_DAILY_LOSS_USD):g}% of capital "
-                     f"{cap:,.2f} USD = {pct_limit(MAX_DAILY_LOSS_USD, cap):,.2f} USD "
-                     f"for {self.day.date}")
-        return pct_limit(MAX_DAILY_LOSS_USD, base[1])
+        """MAX_DAILY_LOSS_USD in USD: as written, or ('2%') that % of the
+        capital taken once per risk day (:meth:`_day_base`)."""
+        return self._limit("MAX_DAILY_LOSS_USD", MAX_DAILY_LOSS_USD)
+
+    def _limit(self, name: str, value) -> Optional[float]:
+        """A limit in its own currency, as the gates compare it: an amount as
+        written, or a percentage of its base (LIMIT_BASE) at the day's start.
+        Logged once per day for a percentage, with what it came to."""
+        if not limit_pct(name):
+            return pct_limit(value, None, name)
+        base = self._day_base(LIMIT_BASE[name])
+        out = pct_limit(value, base, name)
+        seen = self.__dict__.setdefault("_limit_logged", {})
+        if out is not None and seen.get(name) != self.day.date:
+            seen[name] = self.day.date
+            _log(f"{name}: {float(value):g}% of the day's {LIMIT_BASE[name]} "
+                 f"{base:,.2f} = {out:,.2f} for {self.day.date}")
+        return out
+
+    def _day_base(self, kind: str) -> Optional[float]:
+        """What a '%' limit is a percentage of, taken ONCE per risk day (the
+        day's first reading) and kept with the day's book, so a restart keeps
+        it: ``capital`` = Quote equity + Hedge equity in USD (the daily loss
+        and volumes), ``venue`` = the Quote account's margin equity, ``mt5`` =
+        the Hedge account's equity (its own currency). None until read."""
+        self._roll_day()                # a new day takes a new base
+        bases = self.day.bases
+        hit = bases.get(kind)
+        if hit is not None:
+            return hit
+        live = {"capital": self._capital_usd,
+                "venue": lambda: getattr(self, "venue_margin_equity", None),
+                "mt5": lambda: getattr(self, "mt5_equity_ccy", None)}[kind]()
+        if live is None or float(live) <= 0:
+            return None
+        bases[kind] = float(live)
+        return float(live)
 
     def _risk_banner(self) -> None:
         """Startup lines for the risk controls — what is armed, what is off,
@@ -3148,19 +3451,30 @@ class ArbBot:
         limits = []
         if MAX_DAILY_LOSS_USD:
             limits.append(f"max daily loss {float(MAX_DAILY_LOSS_USD):g}"
-                          + ("% of capital" if RISK_PCT else " USD"))
+                          + ("% of the day's capital" if limit_pct("MAX_DAILY_LOSS_USD")
+                             else " USD"))
         if MAX_DAILY_VENUE_VOLUME_USD:
-            limits.append(f"max daily quote-exchange volume "
-                          f"{float(MAX_DAILY_VENUE_VOLUME_USD):,.0f} USD")
+            limits.append(f"max daily Quote volume {float(MAX_DAILY_VENUE_VOLUME_USD):,.6g}"
+                          + ("% of the day's capital"
+                             if limit_pct("MAX_DAILY_VENUE_VOLUME_USD") else " USD"))
         if MAX_DAILY_MT5_VOLUME_USD:
-            limits.append(f"max daily MT5 volume "
-                          f"{float(MAX_DAILY_MT5_VOLUME_USD):,.0f} USD")
+            limits.append(f"max daily Hedge volume {float(MAX_DAILY_MT5_VOLUME_USD):,.6g}"
+                          + ("% of the day's capital"
+                             if limit_pct("MAX_DAILY_MT5_VOLUME_USD") else " USD"))
+        if UNITS_LEGACY:
+            _log("units: " + ", ".join(f"{n} {_units.literal(_cfg(n), UNITS[n])}"
+                                       for n in UNITS_LEGACY)
+                 + " - read in bps / % because the strategy-wide SPREAD_UNIT / RISK_UNIT "
+                   "says so; write the unit into each value instead (Save on the panel's "
+                   "settings form does it)")
         day_label = f"day in {RISK_TZ_LABEL}"
         if limits:
             _log(f"daily limits ({day_label} {self.day.date}): {', '.join(limits)} — "
                  f"a breach latches CLOSE-ONLY until the day rolls; PnL is "
-                 f"REALIZED only (closing fills + settled funding, both legs); "
-                 f"today so far: realized {self.day.realized_usd:+.2f} USD, volume "
+                 f"MARKED TO MARKET (realized: closing fills + settled funding, both "
+                 f"legs, less venue fees and MT5 commission + swap; plus the open "
+                 f"position's move since the day began); realized today so far: "
+                 f"{self.day.pnl():+.2f} USD (costs {self.day.costs_usd:+.2f}), volume "
                  f"{self.day.venue_volume_usd:,.0f} (perp) / "
                  f"{self.day.mt5_volume_usd:,.0f} (MT5) USD")
         else:
@@ -3170,7 +3484,8 @@ class ArbBot:
         if DERISK_VENUE_AVAILABLE_MARGIN_USD:
             derisk.append(f"venue available margin < "
                           f"{float(DERISK_VENUE_AVAILABLE_MARGIN_USD):g}"
-                          + ("% of equity" if RISK_PCT else " USD"))
+                          + ("% of the day's equity"
+                             if limit_pct("DERISK_VENUE_AVAILABLE_MARGIN_USD") else " USD"))
         if DERISK_VENUE_LIQ_DISTANCE_PCT:
             derisk.append(f"liquidation distance < {float(DERISK_VENUE_LIQ_DISTANCE_PCT):g}%"
                           + (" of the entry -> liquidation cushion"
@@ -3179,7 +3494,19 @@ class ArbBot:
             derisk.append(f"MT5 margin level < {float(DERISK_MT5_MARGIN_LEVEL):g}%")
         if DERISK_MT5_FREE_MARGIN:
             derisk.append(f"MT5 free margin < {float(DERISK_MT5_FREE_MARGIN):g}"
-                          + ("% of equity" if RISK_PCT else ""))
+                          + ("% of the day's equity" if limit_pct("DERISK_MT5_FREE_MARGIN")
+                             else ""))
+        if DERISK_VENUE_EXCESS_LIQUIDITY_USD:
+            derisk.append(f"Quote excess liquidity (now or at the next margin change) < "
+                          f"{float(DERISK_VENUE_EXCESS_LIQUIDITY_USD):g}"
+                          + ("% of the day's equity"
+                             if limit_pct("DERISK_VENUE_EXCESS_LIQUIDITY_USD") else " USD"))
+        if CLOSE_BEFORE_DELIVERY_DAYS:
+            derisk.append(f"{float(CLOSE_BEFORE_DELIVERY_DAYS):g} days before the "
+                          f"contract's first delivery day")
+        if CLOSE_BEFORE_DELIVERY_DATE:
+            derisk.append(f"from {CLOSE_BEFORE_DELIVERY_DATE:%Y-%m-%d %H:%M} UTC (a dated "
+                          f"future: CLOSE_BEFORE_DELIVERY_DATE)")
         _log(f"margin de-risk: {'; '.join(derisk)} -> exit the position with "
              f"reduce-only maker orders at the touch, then CLOSE-ONLY sticky "
              f"until this bot is restarted"
@@ -3192,8 +3519,23 @@ class ArbBot:
         one of them: that one survives the roll (it survives everything but a
         restart)."""
         if self.day.roll(_day()):
+            # the open position's unrealized at the boundary is the new day's
+            # baseline — taken here, before the fill that may have rolled the
+            # day is booked against the ledgers
+            self.day.unrealized_open_usd = self._unrealized_now()
+            self.risk_open_change_usd = None
             _log(f"new day {self.day.date} ({RISK_TZ_LABEL}) — "
                  f"daily risk counters and limit latches reset")
+
+    def _unrealized_now(self) -> Optional[float]:
+        """Both legs marked at the bot's own prices, plus the accrued
+        funding; None when an open leg cannot be priced."""
+        try:
+            mark = self.mark_px or (self.venue_ticker.mid if self.venue_ticker else None)
+            return combined_unrealized(self.venue_ledger, mark, self.mt5_ledger,
+                                       self.mt5_mid_k, self.venue_ufunding)
+        except Exception:
+            return None
 
     def _seed_ledgers(self) -> None:
         """Point both average-cost ledgers at what the venues actually hold
@@ -3219,9 +3561,13 @@ class ArbBot:
             rebased.append(f"MT5 {self.mt5_ledger.inv_units:+.4f} -> {mt5_units:+.4f} units")
             self.mt5_ledger.seed(mt5_units, mt5_px or self.mt5_mid_k)
         if rebased:
+            # a new basis moves the unrealized figure: the day's open move is
+            # re-based at the next priced reading (it starts again from 0)
+            self.day.unrealized_open_usd = None
             _log(f"risk ledgers re-seeded from the venues ({'; '.join(rebased)}) — "
                  f"realized PnL from here is measured against the venue basis "
-                 f"(booked so far today: {self.day.realized_usd:+.2f} USD)")
+                 f"(booked so far today: {self.day.realized_usd:+.2f} USD); the "
+                 f"daily loss's open move is re-based at the next mark")
 
     def _accrue_funding(self) -> None:
         """Recognise each funding period that settles. PERPETUAL ONLY — spot
@@ -3241,6 +3587,9 @@ class ArbBot:
         if settled:
             self._roll_day()
             self.day.funding_usd += settled
+            # the accrual just moved into the realized funding: not counted
+            # twice by the daily loss's open move until the re-read below
+            self.venue_ufunding = 0.0
             self._bal_dirty = True     # re-read the position: ufunding restarted
             self._persist_position()   # keep the day's book across a restart
             # into the REPORT too: funding is a real cash flow on a perp and
@@ -3347,14 +3696,20 @@ class ArbBot:
                 ledger.seed(ledger.inv_units, px)
                 _log(f"risk: {what} ledger had no basis for its "
                      f"{ledger.inv_units:+.4f} units — marked at {px:g}")
-        # reporting only (the loss limit is realized-only, as in sample_project)
-        self.risk_unrealized_usd = combined_unrealized(
-            self.venue_ledger, mark, self.mt5_ledger, self.mt5_mid_k, self.venue_ufunding)
-        self.risk_pnl_usd = self.day.pnl()
+        # the loss limit is mark-to-market: realized today + the open
+        # position's move since the day began. An unpriceable leg keeps the
+        # last priced move (a missing mark never shrinks a loss already seen)
+        self.risk_unrealized_usd = self._unrealized_now()
+        move = open_change(self.day, self.risk_unrealized_usd)
+        if move is not None:
+            self.risk_open_change_usd = move
+        self.risk_pnl_usd = self.day.pnl() + (self.risk_open_change_usd or 0.0)
         reasons = daily_limit_reasons(self.day, self.risk_pnl_usd,
                                       self._max_daily_loss(),
-                                      MAX_DAILY_VENUE_VOLUME_USD,
-                                      MAX_DAILY_MT5_VOLUME_USD)
+                                      self._limit("MAX_DAILY_VENUE_VOLUME_USD",
+                                                  MAX_DAILY_VENUE_VOLUME_USD),
+                                      self._limit("MAX_DAILY_MT5_VOLUME_USD",
+                                                  MAX_DAILY_MT5_VOLUME_USD))
         if reasons != self.risk_reasons:
             for r in reasons:
                 if r not in self.risk_reasons:
@@ -3362,6 +3717,7 @@ class ArbBot:
                          f"(exits keep quoting; the day roll clears it)")
             self.risk_reasons = reasons
             self._persist_position()    # the latches survive a restart
+        self.delivery_close_reason = self._delivery_close(now)
         self._update_derisk()           # ... then compose the gate from BOTH
         self._update_gate_reasons()
 
@@ -3386,18 +3742,26 @@ class ArbBot:
             self.liq_distance_pct = None    # no entry price: the measure cannot arm
         reasons = derisk_reasons(
             pos, venue_available=self.venue_available_margin,
-            venue_available_min=pct_limit(DERISK_VENUE_AVAILABLE_MARGIN_USD,
-                                          getattr(self, "venue_margin_equity", None)),
+            venue_available_min=self._limit("DERISK_VENUE_AVAILABLE_MARGIN_USD",
+                                            DERISK_VENUE_AVAILABLE_MARGIN_USD),
             liq_pct=self.liq_distance_pct, liq_pct_min=DERISK_VENUE_LIQ_DISTANCE_PCT,
             mt5_level=self.mt5_margin_level, mt5_level_min=DERISK_MT5_MARGIN_LEVEL,
             mt5_free=self.mt5_free_margin,
-            mt5_free_min=pct_limit(DERISK_MT5_FREE_MARGIN,
-                                   getattr(self, "mt5_equity_ccy", None)))
+            mt5_free_min=self._limit("DERISK_MT5_FREE_MARGIN", DERISK_MT5_FREE_MARGIN),
+            excess=getattr(self, "venue_excess_liquidity", None),
+            excess_ahead=getattr(self, "venue_excess_ahead", None),
+            excess_min=self._limit("DERISK_VENUE_EXCESS_LIQUIDITY_USD",
+                                   DERISK_VENUE_EXCESS_LIQUIDITY_USD))
+        # a dated future inside CLOSE_BEFORE_DELIVERY_DAYS: closed like any
+        # threshold (the venue would otherwise close it, or deliver)
+        dlv = getattr(self, "delivery_close_reason", None)
+        if dlv and abs(pos) >= max(self.amount_min, POS_EPS):
+            reasons = reasons + [dlv]
         if reasons and not self.derisk_active:
             self.derisk_active = True
             self.derisk_since = _utcnow()
             self.derisk_reasons = reasons
-            _log(f"RISK LATCH: {'; '.join(reasons)} — cancelling the strategy's "
+            _log(f"LIQUIDATION THRESHOLD: {'; '.join(reasons)} — cancelling the strategy's "
                  f"quotes and exiting {pos:+.4f} units with reduce-only maker orders "
                  f"at the touch; the MT5 hedge follows. CLOSE-ONLY, sticky until "
                  f"this bot is restarted.")
@@ -3405,27 +3769,191 @@ class ArbBot:
             self.derisk_reasons = reasons
         if self.derisk_active and abs(pos) < max(self.amount_min, POS_EPS):
             self._log_once("derisk_flat",
-                           f"RISK LATCH: perp position flat (armed at "
+                           f"LIQUIDATION THRESHOLD: Quote position flat (hit at "
                            f"{self.derisk_since}) — nothing is quoted; the latch "
                            f"stays until this bot is restarted")
 
+    def _delivery_date(self) -> Optional[datetime]:
+        """When the quoting contract delivers: the market's first delivery
+        day (the IBKR gateway's ``firstDeliveryDate``, else the first weekday
+        of its ``contractMonth``), else its expiry; None for a market with
+        neither (a perpetual, spot). A strategy type that knows better (grid
+        futures: ``CARRY_DELIVERY``) overrides it."""
+        try:
+            m = self.venue.exchange.market(self.venue.symbol) or {}
+        except Exception:                                   # noqa: BLE001
+            return None
+        info = m.get("info") or {}
+        first = info.get("firstDeliveryDate")
+        if not first and info.get("contractMonth"):
+            from ..common.delivery import first_delivery_day
+            d = first_delivery_day(info["contractMonth"])
+            first = d.strftime("%Y%m%d") if d else None
+        if first:
+            try:
+                d = datetime.strptime(str(first)[:8], "%Y%m%d")
+                return d.replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        ms = m.get("expiry")
+        if ms:
+            return datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
+        return None
+
+    def _delivery_close(self, now: float) -> Optional[str]:
+        """The reason to close a dated future before delivery, or None:
+        inside ``CLOSE_BEFORE_DELIVERY_DAYS`` of :meth:`_delivery_date` the
+        position is closed (through the liquidation threshold's exit) and no
+        entry rests; likewise from ``CLOSE_BEFORE_DELIVERY_DATE`` on, whichever
+        comes first. Off, or a market that never delivers: None."""
+        try:
+            days = float(CLOSE_BEFORE_DELIVERY_DAYS) if CLOSE_BEFORE_DELIVERY_DAYS else 0.0
+        except (TypeError, ValueError):
+            days = 0.0
+        on = CLOSE_BEFORE_DELIVERY_DATE
+        if days <= 0 and on is None:
+            return None
+        when = self._delivery_date()
+        if when is None:
+            return None             # a perpetual or spot never delivers
+        if on is not None and now >= on.timestamp():
+            return (f"close date {on:%Y-%m-%d %H:%M} UTC reached "
+                    f"(CLOSE_BEFORE_DELIVERY_DATE; the contract delivers "
+                    f"{when.strftime('%Y-%m-%d')})")
+        if days <= 0:
+            return None
+        left = (when.timestamp() - now) / 86400.0
+        if left > days:
+            return None
+        return (f"Quote contract delivers {when.strftime('%Y-%m-%d')} "
+                f"({left:.1f} days, CLOSE_BEFORE_DELIVERY_DAYS {days:g})")
+
     def _flatten_orders(self) -> list[DesiredOrder]:
-        """The de-risk order set: ONE reduce-only post-only order for the
-        whole perp position, priced AT THE TOUCH — join the best ask to sell
-        a long, the best bid to buy back a short. It is expressed as a
-        spread level (the engine prices every order as ``MT5 reference +
-        level``) recomputed from the live book on every pass, so the order
-        follows the touch through the ordinary amend path and stays a maker
-        order the venue cannot reject as crossing.
+        """The liquidation-threshold exit's order set, by LIQUIDATION_EXIT_MODE: one
+        maker order pegged at the touch (:meth:`_flatten_maker`), or capped
+        chunks (:meth:`_flatten_chunk`). A market-pair strategy rests
+        nothing, so it always chunks."""
+        if LIQUIDATION_EXIT_MODE == "market-chunks" or MARKET_PAIR:
+            return self._flatten_chunk(time.time())
+        self._exit_taking = False
+        return self._flatten_maker()
+
+    def _flatten_chunk(self, now: float) -> list[DesiredOrder]:
+        """One chunk every EXIT_CHUNK_INTERVAL_S: a reduce-only limit that
+        may take, priced EXIT_MAX_SLIPPAGE_BPS from the mid — what the book
+        holds inside that fills, the rest is cancelled by the next pass
+        (which wants nothing until the interval is up). Empty between chunks
+        and while there is nothing to price off."""
+        pos = self._position_units()
+        k = self.venue_ticker
+        if (abs(pos) < max(self.amount_min, POS_EPS) or k is None
+                or self.ref_bid is None or self.ref_ask is None):
+            return []
+        if not getattr(self, "_exit_taking", False):
+            self._exit_taking = True
+            _log(f"LIQUIDATION THRESHOLD: closing {pos:+.4f} {UNIT_LABEL} in chunks every "
+                 f"{EXIT_CHUNK_INTERVAL_S:g} s, each at most {EXIT_MAX_SLIPPAGE_BPS:g} bp "
+                 f"from the mid" + (f" and {float(EXIT_MAX_BOOK_SHARE):g} of the book's depth"
+                                    if EXIT_MAX_BOOK_SHARE else ""))
+        last = getattr(self, "_exit_chunk_t", None)
+        if last is not None and now - last < EXIT_CHUNK_INTERVAL_S:
+            return []                  # between chunks: the last one's rest is cancelled
+        chunk = self._exit_chunk(pos, k)
+        if chunk is None:
+            return []
+        side, price, size, depth = chunk
+        self._exit_chunk_t = now
+        ref = self.ref_bid if side == "buy" else self.ref_ask
+        _log(f"LIQUIDATION THRESHOLD: chunk {side} {size:g} {UNIT_LABEL} at up to {price:g} "
+             f"(position {pos:+.4f}" + (f", {depth:g} within the cap in the book"
+                                        if depth is not None else ", no book: order size")
+             + ")")
+        return [DesiredOrder(key=RISK_FLAT_KEY, side=side, purpose="exit",
+                             level_index=0, level=round(price - ref, 10) + 0.0,
+                             size=round(size, 8))]
+
+    def _exit_chunk(self, pos: float, k) -> Optional[tuple]:
+        """``(side, limit price, size, depth within it or None)`` of the next
+        chunk, or None when nothing can be taken now (the book holds less
+        than the venue's minimum inside the price cap)."""
+        side = "sell" if pos > 0 else "buy"
+        mid = getattr(k, "mid", None) or ((k.bid + k.ask) / 2.0 if k.bid and k.ask else None)
+        if not mid:
+            return None
+        cap = max(EXIT_MAX_SLIPPAGE_BPS, 0.0) / 10_000.0
+        price = mid * (1.0 - cap) if side == "sell" else mid * (1.0 + cap)
+        size = abs(pos)
+        try:
+            clip = float(self._clip_units() or 0.0)
+        except Exception:                                   # noqa: BLE001
+            clip = 0.0
+        if clip > 0:
+            size = min(size, clip)
+        depth = self._book_depth(side, price)
+        if depth is not None and EXIT_MAX_BOOK_SHARE:
+            size = min(size, depth * float(EXIT_MAX_BOOK_SHARE))
+        size = self.venue.amount_to_precision(size)
+        if size < max(self.amount_min, POS_EPS):
+            self._log_once("exit_thin", f"LIQUIDATION THRESHOLD: the book holds "
+                                        f"{depth if depth is not None else 0:g} {UNIT_LABEL} "
+                                        f"within {EXIT_MAX_SLIPPAGE_BPS:g} bp of the mid — "
+                                        f"waiting for the next chunk")
+            return None
+        self._last_msgs.pop("exit_thin", None)
+        return side, price, size, depth
+
+    def _book_depth(self, side: str, limit: float) -> Optional[float]:
+        """Base units the book holds on the side a ``side`` order takes from,
+        at prices no worse than ``limit`` (a sell takes bids >= it, a buy asks
+        <= it). None without a book from the gateway."""
+        get_book = getattr(getattr(self, "feed", None), "get_book", None)
+        try:
+            book = get_book() if get_book else None
+        except Exception:                                   # noqa: BLE001
+            book = None
+        if not isinstance(book, dict):
+            return None
+        rows = book.get("bids") if side == "sell" else book.get("asks")
+        if not rows:
+            return None
+        total = 0.0
+        for r in rows:
+            try:
+                px, sz = float(r[0]), float(r[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if (side == "sell" and px < limit) or (side == "buy" and px > limit):
+                break
+            total += self.venue.to_units(sz)
+        return total
+
+    def _flatten_maker(self) -> list[DesiredOrder]:
+        """The de-risk order set: ONE reduce-only post-only order of the
+        strategy's order size (:meth:`_clip_units`; the whole position when
+        that is smaller or unknown), priced AT THE TOUCH — join the best ask
+        to sell a long, the best bid to buy back a short — and the next one
+        of that size once it fills, until flat. A remainder the venue could
+        not trade on its own (under its minimum) goes with the last slice.
+        It is expressed as a spread level (the engine prices every order as
+        ``MT5 reference + level``) recomputed from the live book on every
+        pass, so the order follows the touch through the ordinary amend path
+        and stays a maker order the venue cannot reject as crossing.
 
         Empty when there is nothing to exit or nothing to price it off —
         the pass then simply rests nothing, and the next one retries."""
         pos = self._position_units()
         size = abs(pos)
         k = self.venue_ticker
-        if (size < max(self.amount_min, POS_EPS) or k is None
+        floor = max(self.amount_min, POS_EPS)
+        if (size < floor or k is None
                 or self.ref_bid is None or self.ref_ask is None):
             return []
+        try:
+            clip = float(self._clip_units() or 0.0)
+        except Exception:                                   # noqa: BLE001
+            clip = 0.0
+        if clip > 0 and size - clip >= floor:
+            size = clip
         if pos > 0:
             side, level = "sell", k.ask - self.ref_ask
         else:
@@ -3606,7 +4134,8 @@ class ArbBot:
         ``ALLOW_TAKER_EXIT``). The de-risk exit is always a maker order: it is
         priced at the touch by design."""
         if d.key == RISK_FLAT_KEY:
-            return False
+            # the liquidation-threshold exit takes only in its chunk stage
+            return bool(getattr(self, "_exit_taking", False))
         return ALLOW_TAKER_EXIT if d.purpose == "exit" else ALLOW_TAKER_ENTRY
 
     def _taker_price(self, side: str, level: float) -> Optional[float]:
@@ -3678,7 +4207,7 @@ class ArbBot:
         once a day (after the risk day rolls, at the first break in quoting
         within BPS_REANCHOR_WAIT_S, else then) and on BPS_REANCHOR_DRIFT_PCT.
         False while no anchor exists yet (nothing may be quoted)."""
-        if SPREAD_UNIT != "bps":
+        if not BPS_ON:
             return True
         ref = self._bps_ref()
         anchor = getattr(self, "bps_anchor", None)
@@ -5422,10 +5951,42 @@ class ArbBot:
                                 if trade is not None else ""))
             if trade is not None and trade.fee is None and self._defer_until_fee(tid, record):
                 return
-            self.reporter.record_fill(record)
+            self._record_report_fill(record)
         except Exception as e:
             self._log_once("report_fill", f"warning: fill not reported: "
                                           f"{type(e).__name__}: {e}")
+
+    def _record_report_fill(self, record: dict) -> None:
+        """Write one fill record and, when it is NEW, book its venue fee into
+        the day's risk book — once per trade, with the fee the venue reported
+        (a fee that follows the fill — IBKR — is booked when it arrives)."""
+        if not self.reporter.record_fill(record):
+            return
+        fee = record.get("fee_usd")
+        if not fee or _reporting.accounting.inferred_fill(record):
+            return
+        self._roll_day()
+        if _day(float(record.get("ts") or time.time())) == self.day.date:
+            self.day.fees_venue_usd += float(fee)
+
+    def _book_mt5_costs(self, rep) -> None:
+        """Book the MT5 commission + broker fee + swap of the bot's OWN deals
+        the reporter just recorded (each once: only new records) into the
+        day's risk book, in USD at the deal's rate (else the live one). A
+        deal dated before today (a late read) belongs to its own day and is
+        not counted."""
+        new, rep.last_new_deals = rep.last_new_deals, []
+        if not new:
+            return
+        self._roll_day()
+        for d in new:
+            if d.get("magic") != MT5_MAGIC or d.get("adjust"):
+                continue
+            costs = float(d.get("costs") or 0.0)
+            if not costs or _day(float(d.get("ts") or 0.0)) != self.day.date:
+                continue
+            rate = d.get("usd_rate") or rep.mt5_usd_rate or 1.0
+            self.day.mt5_costs_usd += costs * float(rate)
 
     def _defer_until_fee(self, tid: str, record: dict) -> bool:
         """A fill from a venue whose fee follows it (IBKR: TWS's commission
@@ -5451,7 +6012,7 @@ class ArbBot:
             fee = _reporting.fee_usd(tr.fee, tr.fee_currency, float(record["price"]),
                                      base, quote)
             record["fee_usd"] = 0.0 if fee is None else float(fee)
-            self.reporter.record_fill(record)
+            self._record_report_fill(record)
         except Exception as e:
             self._log_once("report_fill", f"warning: fill not reported: "
                                           f"{type(e).__name__}: {e}")
@@ -5464,7 +6025,7 @@ class ArbBot:
         for tid in [t for t, (_r, due) in waits.items() if final or now >= due]:
             record, _due = waits.pop(tid)
             try:
-                self.reporter.record_fill(record)
+                self._record_report_fill(record)
             except Exception:                                   # noqa: BLE001
                 pass
             self._log_once("fee_missing", f"note: no fee from {EXCHANGE_ID} for fill {tid} "
@@ -5621,6 +6182,7 @@ class ArbBot:
         REPORT_DEALS_S and right after a hedge / close-by, the 1 m bars,
         and the snapshot every REPORT_SNAPSHOT_S. ``final`` writes the last
         snapshot (alive=False) at teardown."""
+        self._flush_inferred(now, final)   # with no reporter it only empties the wait
         rep = getattr(self, "reporter", None)
         if rep is None:
             return
@@ -5635,6 +6197,16 @@ class ArbBot:
             self._report_deals_dirty = False
             if getattr(self.mt5, "is_connected", False):
                 rep.read_mt5_deals(self.mt5, SYMBOL_MT5, self._srv_offset_s)
+                self._book_mt5_costs(rep)       # commission + swap → the day's loss
+                if not final:
+                    # the account currency's daily closes, so a past deal
+                    # converts at its own day's rate (every FX_DAILY_EVERY_S)
+                    rep.refresh_fx_daily(self.mt5, self._srv_offset_s, now)
+            vc = self._mt5_quote_client()
+            if vc is not None:
+                # an MT5 quote leg: its terminal's own deals, so its realized
+                # is the broker's booked profit like the hedge's
+                rep.read_venue_deals(vc, EXCHANGE_ID)
         k = self.venue_ticker
         # a venue feed that is down has no price: its last mid is not recorded
         # as one (quiet is not dead — only the connection's health counts)
@@ -5722,7 +6294,15 @@ class ArbBot:
                 r.order_id, r.side, r.price, r.amount, r.remaining,
                 reduce_only=bool(self.is_perp and REDUCE_ONLY_EXITS and r.purpose == "exit"),
                 key=r.key, purpose=r.purpose, level=r.level)
-                for r in self.orders.values()])
+                for r in self.orders.values()],
+            magic=getattr(self._mt5_quote_client(), "magic", None))
+
+    def _mt5_quote_client(self):
+        """The venue's connector when the quote leg is an MT5 symbol
+        (:class:`atjte.clients.gateway.MT5VenueClient`: it books its deals),
+        else None."""
+        vc = getattr(getattr(self, "venue", None), "client", None)
+        return vc if getattr(vc, "books_venue_deals", False) else None
 
     # ── monitoring snapshot ──────────────────────────────────────────────────
     def dump_state(self) -> None:
@@ -5877,27 +6457,40 @@ class ArbBot:
             # the risk controls: what the daily limits are measured on, and
             # the margin de-risk latch (atjte.engines.common.risk)
             # the spread unit (bps: the anchor every price gap is taken at)
-            "spread_unit": {"unit": SPREAD_UNIT,
+            "spread_unit": {"unit": "bps" if BPS_ON else "abs",
+                            "bps": sorted(BPS_ORIG),
                             "anchor": getattr(self, "bps_anchor", None)},
             "risk": {
                 "day": self.day.date, "day_utc": RISK_TZ_NAME == "UTC",
                 "day_tz": RISK_TZ_LABEL,
-                # the gated figure: REALIZED only (closing fills + settled
-                # funding), the sample_project convention
+                # the gated figure: MARK-TO-MARKET — today's realized (both
+                # legs, settled funding, costs) + the open position's move
+                # since the day began (unrealized_usd − unrealized_open_usd)
                 "pnl_usd": None if self.risk_pnl_usd is None
                 else round(self.risk_pnl_usd, 4),
-                "realized_only": True,
+                "realized_only": False,
+                "realized_pnl_usd": round(self.day.pnl(), 4),
+                "open_change_usd": None if self.risk_open_change_usd is None
+                else round(self.risk_open_change_usd, 4),
+                "unrealized_open_usd": None if self.day.unrealized_open_usd is None
+                else round(self.day.unrealized_open_usd, 4),
                 "realized_usd": round(self.day.realized_usd, 4),
                 "realized_venue_usd": round(self.day.realized_venue_usd, 4),
                 "realized_mt5_usd": round(self.day.realized_mt5_usd, 4),
                 "funding_usd": round(self.day.funding_usd, 4),
-                # the open position marked to market — REPORTING ONLY, no
-                # part of pnl_usd or of any gate
+                # the day's trading costs, inside pnl_usd: venue fees (paid
+                # = +) and MT5 commission + swap (as credited, charged = −)
+                "fees_venue_usd": round(self.day.fees_venue_usd, 4),
+                "mt5_costs_usd": round(self.day.mt5_costs_usd, 4),
+                # the open position marked to market now (its change since
+                # the day began is in pnl_usd)
                 "unrealized_usd": None if self.risk_unrealized_usd is None
                 else round(self.risk_unrealized_usd, 4),
                 "max_daily_loss_usd": MAX_DAILY_LOSS_USD,
                 # RISK_UNIT pct: the loss limit / floors as the gates use them
                 "unit": "pct" if RISK_PCT else "abs",
+                "units": {n: UNITS[n] for n in LIMIT_BASE if n in UNITS},
+                "day_bases": dict(self.day.bases),
                 "max_daily_loss_effective_usd": (self._max_daily_loss()
                                                  if MAX_DAILY_LOSS_USD else None),
                 "loss_latched": self.day.loss_latched,
@@ -5916,11 +6509,22 @@ class ArbBot:
                     "since_utc": self.derisk_since,
                     "liq_distance_pct": None if self.liq_distance_pct is None
                     else round(self.liq_distance_pct, 3),
+                    "exit_stage": (None if not self.derisk_active else
+                                   "chunks" if getattr(self, "_exit_taking", False)
+                                   else "maker"),
                     "thresholds": {
                         "venue_available_margin_usd": DERISK_VENUE_AVAILABLE_MARGIN_USD,
                         "liq_distance_pct": DERISK_VENUE_LIQ_DISTANCE_PCT,
                         "mt5_margin_level": DERISK_MT5_MARGIN_LEVEL,
-                        "mt5_free_margin": DERISK_MT5_FREE_MARGIN},
+                        "mt5_free_margin": DERISK_MT5_FREE_MARGIN,
+                        "venue_excess_liquidity_usd": DERISK_VENUE_EXCESS_LIQUIDITY_USD,
+                        "close_before_delivery_days": CLOSE_BEFORE_DELIVERY_DAYS,
+                        "close_before_delivery_date": (
+                            CLOSE_BEFORE_DELIVERY_DATE.strftime("%Y-%m-%d %H:%M")
+                            if CLOSE_BEFORE_DELIVERY_DATE else None)},
+                    "venue_excess_liquidity": getattr(self, "venue_excess_liquidity", None),
+                    "venue_excess_ahead": getattr(self, "venue_excess_ahead", None),
+                    "delivery_close": getattr(self, "delivery_close_reason", None),
                 },
             },
             # always present (the rolling averages); ``enabled``/``armed`` say

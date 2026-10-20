@@ -331,13 +331,18 @@ class MT5Client(UniversalClient):
                       symbol: Optional[str] = None) -> list[dict]:
         """The raw BUY/SELL deals between ``frm`` and ``to`` as dicts
         (``TradeDeal._asdict()``), oldest first — what :mod:`atjte.reporting`
-        records. The bounds are read by the terminal in the BROKER's clock
+        records — and the symbol's ADJUSTMENTS (dividend, tax, charge,
+        interest, commission, correction: :data:`atjte.reporting.MT5_ADJUST_TYPES`),
+        which move its PnL with no trade. Never a balance, credit or bonus
+        operation. The bounds are read by the terminal in the BROKER's clock
         (labelled as UTC), and so are the deals' own timestamps; the caller
         shifts both (:func:`atjte.reporting.server_offset_s`)."""
+        from atjte.reporting import MT5_ADJUST_TYPES
         deals = mt5.history_deals_get(frm, to) or ()
         out = []
         for d in deals:
-            if d.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL):
+            if (d.type not in (mt5.DEAL_TYPE_BUY, mt5.DEAL_TYPE_SELL)
+                    and d.type not in MT5_ADJUST_TYPES):
                 continue
             if symbol and d.symbol != symbol:
                 continue

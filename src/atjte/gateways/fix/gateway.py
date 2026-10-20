@@ -193,6 +193,11 @@ class FixGateway:
         self._clients: dict[str, _Client] = {}
         self._by_clordid: dict[str, _ClientOrder] = {}
         self._by_orderid: dict[str, _ClientOrder] = {}
+        #: order_id -> (client, final order dict, t): orders this session saw
+        #: finish (filled / cancelled / expired). A bot cancelling one a
+        #: moment after it filled is answered with that final state, not
+        #: "not on this gateway session" (PAXG_PERP's exit chunks, 2026-10-19)
+        self._finished: dict[str, tuple[str, dict, float]] = {}
         self._pending: dict[str, tuple[_Client, int]] = {}
         #: when each pending request went on the wire (AFTER pacing), so the
         #: venue's reply time is measured on its own -- the one number that
@@ -545,6 +550,8 @@ class FixGateway:
                 c.send(P.reply_err(req, f"the venue: {K.reject_text(msg)}",
                                    "invalid_order"))
             return
+        if rec is not None and done and (rec.order_id or order_id):
+            self._note_finished(rec.order_id or order_id, rec.client, order)
         if waiting and order_id and exec_type != "A":
             c, req = waiting
             c.send(P.reply_ok(req, order))
@@ -690,6 +697,15 @@ class FixGateway:
                 "OrderCancelReplaceRequest (35=G) is not served on Kraken "
                 f"{self.dialect.name} FIX -- re-price by cancel + place")
         order_id = str(msg.get("order_id") or "")
+        if op == P.CANCEL:
+            final = self._finished_order(client, order_id)
+            if final is not None:
+                # it filled (or was cancelled) before this cancel came: say so,
+                # with the final state, rather than "not on this session"
+                self.counters["cancel_already_final"] = (
+                    self.counters.get("cancel_already_final", 0) + 1)
+                client.send(P.reply_ok(req, final))
+                return
         rec = self._own_order(client, order_id)
         cl = self._ids.next()
         with self._lock:
@@ -725,6 +741,35 @@ class FixGateway:
             self._pending_t[cl] = self._clock()
             self.session.send("F", body)
             self.counters["cancelled"] += 1
+
+    #: how long, and how many, finished orders are remembered
+    FINISHED_KEEP_S = 600.0
+    FINISHED_MAX = 1000
+
+    def _note_finished(self, order_id: str, client: str, order: dict) -> None:
+        with self._lock:
+            self._finished[order_id] = (client, order, self._clock())
+            if len(self._finished) > self.FINISHED_MAX:
+                cutoff = self._clock() - self.FINISHED_KEEP_S
+                kept = {k: v for k, v in self._finished.items() if v[2] > cutoff}
+                if len(kept) > self.FINISHED_MAX:   # newest first survive
+                    kept = dict(sorted(kept.items(), key=lambda kv: kv[1][2])
+                                [-self.FINISHED_MAX:])
+                self._finished = kept
+
+    def _finished_order(self, client: _Client, order_id: str) -> Optional[dict]:
+        """The final state of THIS client's order that this session saw
+        finish and no longer tracks, else None. Another client's finished
+        order is None too: _own_order then refuses it as before."""
+        with self._lock:
+            if not order_id or order_id in self._by_orderid:
+                return None
+            hit = self._finished.get(order_id)
+        if hit is None or hit[0] != client.name:
+            return None
+        if self._clock() - hit[2] > self.FINISHED_KEEP_S:
+            return None
+        return hit[1]
 
     def _own_order(self, client: _Client, order_id: str) -> _ClientOrder:
         """The order, if it is this client's. One bot may never touch

@@ -27,6 +27,10 @@ once and write down. So every engine owns a :class:`Reporter` and keeps a
     average entry at that moment, and the MT5 hedge book — the basis every
     fill after it is accounted against (:mod:`atjte.accounting`). Delete
     the whole ``report/`` folder to start the history over, never one file.
+``report/fx_daily.json``
+    a non-USD MT5 account's currency in USD per day (the D1 closes of its
+    FX pair, :meth:`Reporter.refresh_fx_daily`, and a backfill's), so a past
+    deal converts at its own day's rate, not today's.
 
 The reader side is :class:`Report`: hand it a strategy folder and it serves
 the snapshot (with its age), the trade history, the bars and the seed, plus
@@ -72,7 +76,21 @@ to take from the bars. Funding record: ``{"kind": "funding", "venue", "symbol",
 "ts", "usd"}`` — one per settlement, negative paid. Deal record: ``{"kind": "deal", "venue": "mt5", "id" (the
 ticket as text), "ticket", "symbol", "ts" (true UTC), "side", "lots",
 "price", "profit", "costs" (commission + fee + swap), "commission", "fee",
-"swap", "entry", "magic", "position_id", "order", "comment"}``.
+"swap", "entry", "magic", "position_id", "order", "comment"}``, plus
+``"usd_rate"`` (the account currency's live USD rate, on a deal recorded
+while fresh). An ADJUSTMENT on the symbol (dividend, tax, charge, interest,
+commission, correction) is a deal record with ``"adjust"`` naming it,
+``side`` / ``entry`` None and ``lots`` 0.
+
+Venue deal record (an MT5 QUOTE leg — Blueberry ``XAUUSD247.i`` — only):
+the deal record's shape with ``"kind": "venue_deal"``, ``"venue"`` the
+exchange id and ``"id"`` = ``"quote:<ticket>"`` (never one of the hedge's
+ids), every deal on the quote symbol on that terminal, account-wide like
+the hedge's; ``usd_rate`` is the account currency in the market's quote
+currency. The venue leg's realized PnL is the broker's ``profit`` on them
+(:func:`atjte.accounting.daily_pnl`), so both MT5 legs are booked the way
+their brokers paired the tickets. The snapshot's ``venue.magic`` names the
+bot's magic on that terminal.
 
 Timestamps are epoch seconds UTC. MT5 labels deals, positions and ticks
 with the broker server's clock as if it were UTC; :func:`server_offset_s`
@@ -116,6 +134,22 @@ FX_VARIANTS = ("{ccy}USD", "{ccy}USD.a", "{ccy}USD.r", "{ccy}USD.raw")
 #: the same pairs quoted the other way round — brokers list USDJPY, USDCHF,
 #: USDCAD, never JPYUSD: the account currency per USD, used as 1 / mid
 FX_INVERSE_VARIANTS = ("USD{ccy}", "USD{ccy}.a", "USD{ccy}.r", "USD{ccy}.raw")
+#: MT5 deal types that move trading money without a trade — recorded (with
+#: ``adjust``) and counted in the PnL. Balance (2: deposits, withdrawals),
+#: credit (3), bonus (6) and the cancelled deals (13, 14) are not PnL.
+MT5_ADJUST_TYPES = {4: "charge", 5: "correction", 7: "commission",
+                    8: "commission_daily", 9: "commission_monthly",
+                    10: "commission_agent_daily", 11: "commission_agent_monthly",
+                    12: "interest", 15: "dividend", 16: "dividend_franked", 17: "tax"}
+#: a deal recorded within this long of its own time is stamped with the
+#: account currency's live USD rate (``usd_rate``); an older one takes its
+#: day's close from ``fx_daily.json`` when the reader converts it
+FX_STAMP_MAX_S = 2 * 3600.0
+#: ``report/fx_daily.json``: the account currency's USD rate per day (the D1
+#: closes of its FX pair), refreshed this often by the bot and by a backfill
+FX_DAILY_FILE = "fx_daily.json"
+FX_DAILY_EVERY_S = 6 * 3600.0
+FX_DAILY_MAX_DAYS = 400
 
 Log = Optional[Callable[[str], None]]
 
@@ -337,15 +371,32 @@ def funding_record(venue: str, *, ts: float, usd: float,
 
 def deal_record(raw: dict, srv_offset_s: float) -> Optional[dict]:
     """An MT5 deal (``TradeDeal._asdict()``) as a report record, its
-    server-clock timestamp corrected to UTC. None for a non-trade deal
-    (balance operation, correction, ...)."""
-    if raw.get("type") not in (0, 1):
+    server-clock timestamp corrected to UTC. A BUY / SELL is a trade; an
+    ADJUSTMENT (:data:`MT5_ADJUST_TYPES` — dividend, tax, charge, interest,
+    commission, correction) is recorded with its name in ``adjust``, no
+    side, no volume and no entry. None for a money movement that is not
+    trading PnL (balance — deposits, withdrawals —, credit, bonus) or a
+    cancelled deal."""
+    dtype = raw.get("type")
+    adjust = MT5_ADJUST_TYPES.get(dtype) if dtype not in (0, 1) else None
+    if dtype not in (0, 1) and adjust is None:
         return None
     ts_ms = raw.get("time_msc")
     ts = (float(ts_ms) / 1000.0 if ts_ms else float(raw.get("time") or 0.0)) - srv_offset_s
     commission = float(raw.get("commission") or 0.0)
     fee = float(raw.get("fee") or 0.0)
     swap = float(raw.get("swap") or 0.0)
+    if adjust:
+        return {"kind": "deal", "venue": "mt5", "id": str(raw.get("ticket")),
+                "ticket": int(raw.get("ticket") or 0), "symbol": raw.get("symbol"),
+                "ts": ts, "adjust": adjust, "side": None, "lots": 0.0, "price": 0.0,
+                "profit": float(raw.get("profit") or 0.0),
+                "costs": commission + fee + swap,
+                "commission": commission, "fee": fee, "swap": swap,
+                "entry": None, "magic": int(raw.get("magic") or 0),
+                "position_id": int(raw.get("position_id") or 0),
+                "order": int(raw.get("order") or 0),
+                "comment": raw.get("comment") or ""}
     return {"kind": "deal", "venue": "mt5", "id": str(raw.get("ticket")),
             "ticket": int(raw.get("ticket") or 0), "symbol": raw.get("symbol"),
             "ts": ts, "side": "buy" if raw.get("type") == 0 else "sell",
@@ -361,6 +412,20 @@ def deal_record(raw: dict, srv_offset_s: float) -> Optional[dict]:
             "comment": raw.get("comment") or ""}
 
 
+def venue_deal_record(raw: dict, srv_offset_s: float, venue: str) -> Optional[dict]:
+    """A deal on an MT5 QUOTE leg's terminal (:func:`deal_record`'s shape)
+    as a ``venue_deal`` record: its own kind, so no reader takes it for a
+    hedge deal (the two terminals may even share the magic), and its own id
+    space, so a ticket number both brokers happen to use is never one row."""
+    rec = deal_record(raw, srv_offset_s)
+    if rec is None:
+        return None
+    rec["kind"] = "venue_deal"
+    rec["venue"] = str(venue or "mt5")
+    rec["id"] = f"quote:{rec['ticket']}"
+    return rec
+
+
 def server_offset_s(tick_ts: Optional[float], now: float,
                     step_s: float = 1800.0) -> Optional[float]:
     """The broker clock's offset from UTC, inferred from a LIVE tick's
@@ -369,6 +434,63 @@ def server_offset_s(tick_ts: Optional[float], now: float,
     if tick_ts is None:
         return None
     return round((float(tick_ts) - float(now)) / step_s) * step_s
+
+
+def fx_candidates(ccy: str) -> list[tuple[str, bool]]:
+    """The MT5 symbols that may quote ``ccy`` against USD, each with whether
+    it is quoted the other way round (``USD<CCY>``: the rate is 1 / price)."""
+    return ([(v.format(ccy=ccy), False) for v in FX_VARIANTS]
+            + [(v.format(ccy=ccy), True) for v in FX_INVERSE_VARIANTS])
+
+
+def resolve_fx_symbol(client, ccy: str) -> Optional[tuple[str, bool]]:
+    """The first of :func:`fx_candidates` the terminal quotes, or None."""
+    for sym, inverse in fx_candidates(ccy):
+        try:
+            t = client.get_ticker(sym)
+        except Exception:
+            continue
+        if t and t.bid and t.ask:
+            return sym, inverse
+    return None
+
+
+def fx_daily_points(client, symbol: str, inverse: bool, since_ts: float,
+                    until_ts: float, srv_offset_s: float) -> list[list[float]]:
+    """``[[ts, rate]]``: each D1 bar of ``symbol`` over the window — its open
+    in UTC (the broker's midnight) and USD per account-currency unit at its
+    close (``1 / close`` for an inverse pair)."""
+    frm = datetime.fromtimestamp(since_ts + srv_offset_s, tz=timezone.utc)
+    to = datetime.fromtimestamp(until_ts + srv_offset_s, tz=timezone.utc)
+    out = []
+    for r in client.rates(symbol, frm, to, "D1") or []:
+        c = _f(r.get("close"))
+        if c and c > 0:
+            out.append([float(r["time"]) - srv_offset_s, 1.0 / c if inverse else c])
+    return out
+
+
+def read_fx_daily(rdir: Path) -> Optional[dict]:
+    """``fx_daily.json`` of a report folder: ``{"ccy", "symbol", "inverse",
+    "points": [[ts, rate]], "ts"}``, or None."""
+    doc = read_json(Path(rdir) / FX_DAILY_FILE)
+    return doc if isinstance(doc, dict) else None
+
+
+def write_fx_daily(rdir: Path, ccy: str, symbol: str, inverse: bool,
+                   points: list) -> int:
+    """Merge ``points`` into the folder's ``fx_daily.json`` (a bar fetched
+    again replaces its old value: the day's close may have been partial) and
+    write it atomically. Returns how many days the file holds."""
+    old = read_fx_daily(rdir) or {}
+    merged: dict[int, float] = {}
+    if old.get("ccy") == ccy:
+        merged.update({int(t): float(r) for t, r in old.get("points") or ()})
+    merged.update({int(t): float(r) for t, r in points})
+    doc = {"ccy": ccy, "symbol": symbol, "inverse": bool(inverse),
+           "points": [[t, merged[t]] for t in sorted(merged)], "ts": time.time()}
+    atomic_write_json(Path(rdir) / FX_DAILY_FILE, doc)
+    return len(merged)
 
 
 def minute(ts: float) -> int:
@@ -421,15 +543,21 @@ def venue_block(*, venue_id: str, symbol: str, market_kind: str, unit_label: str
                 margin: Optional[dict] = None, balances: Optional[dict] = None,
                 funding: Optional[dict] = None,
                 open_orders: Iterable[dict] = (),
-                book: Optional[dict] = None) -> dict:
+                book: Optional[dict] = None,
+                magic: Optional[int] = None) -> dict:
     """The snapshot's ``venue`` block. A leg that has NOT been read is
-    ``None`` (the reader shows "not read", never a flat 0)."""
-    return {"id": venue_id, "symbol": symbol, "market_kind": market_kind,
-            "unit_label": unit_label, "base": base, "quote": quote,
-            "contract_size": float(contract_size), "ts": time.time(),
-            "top": top, "book": book, "position": position, "margin": margin,
-            "balances": balances, "funding": funding,
-            "open_orders": list(open_orders)}
+    ``None`` (the reader shows "not read", never a flat 0). ``magic``: the
+    bot's magic on an MT5 quote leg's terminal (its venue deals are
+    attributed by it); absent on every other venue."""
+    out = {"id": venue_id, "symbol": symbol, "market_kind": market_kind,
+           "unit_label": unit_label, "base": base, "quote": quote,
+           "contract_size": float(contract_size), "ts": time.time(),
+           "top": top, "book": book, "position": position, "margin": margin,
+           "balances": balances, "funding": funding,
+           "open_orders": list(open_orders)}
+    if magic is not None:
+        out["magic"] = int(magic)
+    return out
 
 
 def position_block(size: Optional[float], entry_price: Optional[float] = None,
@@ -521,6 +649,8 @@ class Reporter:
         #: rolled-up row arriving later can be recognised (:func:`is_aggregate_of`)
         self._order_fills: dict[tuple[str, str], list[dict]] = {}
         self._last_deal_ts: Optional[float] = None
+        #: the newest venue deal on file (an MT5 quote leg's terminal)
+        self._last_venue_deal_ts: Optional[float] = None
         self._snapshot_t = 0.0
         self._bar_minute: Optional[int] = None
         self._bar_venue: Optional[float] = None
@@ -532,6 +662,14 @@ class Reporter:
         self._warned: set[str] = set()
         self._fx_symbol: Optional[str] = None
         self._fx_inverse = False       # _fx_symbol quotes USD in the account ccy
+        #: the MT5 account currency and its live USD rate (mt5_account)
+        self.mt5_ccy: Optional[str] = None
+        self.mt5_usd_rate: Optional[float] = None
+        self._first_deal_ts: Optional[float] = None
+        #: the deals the last :meth:`record_deals` call wrote (new ones only)
+        #: — what the engine books into its day's costs, each exactly once
+        self.last_new_deals: list[dict] = []
+        self._fx_daily_t = 0.0
         self.ok = True
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
@@ -576,6 +714,13 @@ class Reporter:
                 ts = _f(rec.get("ts"))
                 if ts is not None and (self._last_deal_ts is None or ts > self._last_deal_ts):
                     self._last_deal_ts = ts
+                if ts is not None and (self._first_deal_ts is None or ts < self._first_deal_ts):
+                    self._first_deal_ts = ts
+            if rec.get("kind") == "venue_deal":
+                ts = _f(rec.get("ts"))
+                if ts is not None and (self._last_venue_deal_ts is None
+                                       or ts > self._last_venue_deal_ts):
+                    self._last_venue_deal_ts = ts
         self.records_loaded = n
 
     def _note_order_fill(self, rec: dict) -> None:
@@ -675,11 +820,32 @@ class Reporter:
                 new.append(r)
             new.sort(key=lambda r: float(r.get("ts") or 0.0))
             n = self._append(new)
+            self.last_new_deals = new[:n]
             for r in new[:n]:
                 self._seen.add((str(r.get("venue")), str(r.get("id"))))
                 ts = _f(r.get("ts"))
                 if ts is not None and (self._last_deal_ts is None or ts > self._last_deal_ts):
                     self._last_deal_ts = ts
+                if ts is not None and (self._first_deal_ts is None or ts < self._first_deal_ts):
+                    self._first_deal_ts = ts
+            return n
+
+    def record_venue_deals(self, records: Iterable[dict]) -> int:
+        """Append the venue deals (:func:`venue_deal_record`) not yet on
+        file; returns how many were new. Kept apart from :meth:`record_deals`
+        so the hedge's incremental read and the day's MT5 costs never see
+        them."""
+        with self._lock:
+            new = [r for r in records if r is not None
+                   and (str(r.get("venue")), str(r.get("id"))) not in self._seen]
+            new.sort(key=lambda r: float(r.get("ts") or 0.0))
+            n = self._append(new)
+            for r in new[:n]:
+                self._seen.add((str(r.get("venue")), str(r.get("id"))))
+                ts = _f(r.get("ts"))
+                if ts is not None and (self._last_venue_deal_ts is None
+                                       or ts > self._last_venue_deal_ts):
+                    self._last_venue_deal_ts = ts
             return n
 
     # ── the seed ─────────────────────────────────────────────────────────────
@@ -903,6 +1069,7 @@ class Reporter:
         raw = acct.raw or {}
         ccy = (acct.currency or "USD").upper()
         rate: Optional[float] = 1.0 if ccy == "USD" else self._fx_rate(client, ccy)
+        self.mt5_ccy, self.mt5_usd_rate = ccy, rate
         return {"ccy": ccy, "usd_rate": rate, "equity": _f(acct.equity),
                 "balance": _f(acct.balance), "margin": _f(mm.used),
                 "margin_free": _f(mm.free), "margin_level": _f(mm.level),
@@ -918,8 +1085,7 @@ class Reporter:
         if self._fx_symbol:
             candidates = [(self._fx_symbol, self._fx_inverse)]
         else:
-            candidates = ([(v.format(ccy=ccy), False) for v in FX_VARIANTS]
-                          + [(v.format(ccy=ccy), True) for v in FX_INVERSE_VARIANTS])
+            candidates = fx_candidates(ccy)
         for sym, inverse in candidates:
             try:
                 t = client.get_ticker(sym)
@@ -978,8 +1144,90 @@ class Reporter:
         except Exception as e:
             self._warn("mt5_deals", f"MT5 deal history read failed: {e}")
             return 0
-        recs = [deal_record(d, srv_offset_s) for d in raw]
-        return self.record_deals(r for r in recs if r is not None)
+        recs = [r for r in (deal_record(d, srv_offset_s) for d in raw) if r is not None]
+        # a deal read while it is fresh carries the rate it was made at; an
+        # older one (a first read, a bot that was down) is left to its day's
+        # close (fx_daily.json) — today's rate would be the wrong day's
+        rate = self.mt5_usd_rate
+        if rate:
+            for r in recs:
+                if now - float(r["ts"]) <= FX_STAMP_MAX_S:
+                    r["usd_rate"] = rate
+        return self.record_deals(recs)
+
+    def read_venue_deals(self, client, venue: str) -> int:
+        """Incremental deal history of an MT5 QUOTE leg (``client`` an
+        :class:`atjte.clients.gateway.MT5VenueClient`: its terminal, its
+        symbol, account-wide), on the same window rule as
+        :meth:`read_mt5_deals`, recorded as ``venue_deal`` records. Needs
+        that terminal's own clock offset (it may differ from the hedge
+        broker's); nothing is read until a live tick gives it. Returns the
+        number of new deals recorded."""
+        if not self.ok:
+            return 0
+        try:
+            off = client.server_offset_s()
+        except Exception:                                   # noqa: BLE001
+            off = None
+        if off is None:
+            return 0
+        now = time.time()
+        since = (self._last_venue_deal_ts - DEALS_OVERLAP_S
+                 if self._last_venue_deal_ts is not None
+                 else now - DEALS_FIRST_LOOKBACK_S)
+        frm = datetime.fromtimestamp(since + off, tz=timezone.utc)
+        to = datetime.fromtimestamp(now + off + 300.0, tz=timezone.utc)
+        try:
+            raw = client.history_deals(frm, to)
+        except Exception as e:                              # noqa: BLE001
+            self._warn("venue_deals", f"quote terminal deal history read failed: {e}")
+            return 0
+        recs = [r for r in (venue_deal_record(d, off, venue) for d in raw) if r is not None]
+        try:
+            rate = client.account_rate()
+        except Exception:                                   # noqa: BLE001
+            rate = None
+        if rate:
+            for r in recs:
+                if now - float(r["ts"]) <= FX_STAMP_MAX_S:
+                    r["usd_rate"] = rate
+        return self.record_venue_deals(recs)
+
+    def refresh_fx_daily(self, client, srv_offset_s: Optional[float],
+                         now: Optional[float] = None, force: bool = False) -> int:
+        """Every ``FX_DAILY_EVERY_S``: the account currency's D1 closes from
+        the first deal on file (at most ``FX_DAILY_MAX_DAYS`` back) merged
+        into ``fx_daily.json``, so every past deal converts at its own day's
+        rate. Nothing for a USD account, before :meth:`mt5_account` has named
+        the currency, or without the server offset. Returns the days on
+        file (0 = nothing written)."""
+        now = time.time() if now is None else now
+        if (not self.ok or srv_offset_s is None or not self.mt5_ccy
+                or self.mt5_ccy in STABLE_USD):
+            return 0
+        if not force and now - self._fx_daily_t < FX_DAILY_EVERY_S:
+            return 0
+        self._fx_daily_t = now
+        if not self._fx_symbol:
+            found = resolve_fx_symbol(client, self.mt5_ccy)
+            if found is None:
+                self._warn("fx_daily", f"no {self.mt5_ccy}USD or USD{self.mt5_ccy} on the "
+                                       f"terminal — past MT5 deals convert at today's rate")
+                return 0
+            self._fx_symbol, self._fx_inverse = found
+        first = self._first_deal_ts if self._first_deal_ts is not None else now
+        since = max(first - 7 * 86400.0, now - FX_DAILY_MAX_DAYS * 86400.0)
+        try:
+            pts = fx_daily_points(client, self._fx_symbol, self._fx_inverse, since,
+                                  now + 86400.0, srv_offset_s)
+            if not pts:
+                return 0
+            return write_fx_daily(self.dir, self.mt5_ccy, self._fx_symbol,
+                                  self._fx_inverse, pts)
+        except Exception as e:
+            self._warn("fx_daily", f"daily FX history not read ({type(e).__name__}: {e}) — "
+                                   f"past MT5 deals convert at today's rate")
+            return 0
 
 
 # ── the reader ───────────────────────────────────────────────────────────────
@@ -1047,6 +1295,11 @@ class Report:
     def deals(self, since_ts: Optional[float] = None) -> list[dict]:
         return [r for r in self.trades(since_ts) if r.get("kind") == "deal"]
 
+    def venue_deals(self, since_ts: Optional[float] = None) -> list[dict]:
+        """An MT5 quote leg's own deals (``venue_deal`` records); empty on
+        every other venue."""
+        return [r for r in self.trades(since_ts) if r.get("kind") == "venue_deal"]
+
     def funding(self, since_ts: Optional[float] = None) -> list[dict]:
         return [r for r in self.trades(since_ts) if r.get("kind") == "funding"]
 
@@ -1077,27 +1330,60 @@ class Report:
         return accounting.position_summary(self.fills(), seed_pos=seed.get("pos") or 0.0,
                                            seed_avg=seed.get("avg_price"), mark=mark)
 
-    def daily_pnl(self, days: Optional[int] = None) -> dict:
+    def fx_series(self) -> accounting.FxSeries:
+        """The account currency's USD rate by day (``fx_daily.json``), for
+        the snapshot's currency; empty when there is none on file."""
+        doc = read_fx_daily(self.dir) or {}
+        ccy = (((self.snapshot() or {}).get("mt5") or {}).get("account") or {}).get("ccy")
+        if ccy and doc.get("ccy") and doc["ccy"] != ccy:
+            return accounting.FxSeries(())
+        return accounting.FxSeries(doc.get("points") or ())
+
+    def daily_pnl(self, days: Optional[int] = None, *, since_ts: Optional[float] = None,
+                  until_ts: Optional[float] = None) -> dict:
         """Realized PnL by local date over the recorded history
         (:func:`atjte.accounting.daily_pnl`), the last ``days`` days when
-        given. The MT5 leg is converted with the snapshot's USD rate."""
+        given (or from ``since_ts``). Each MT5 deal is converted at its own
+        recorded rate, else its day's close (:meth:`fx_series`), else the
+        snapshot's current USD rate. The summary says which (``mt5_ccy``,
+        ``mt5_fx_sources``, ``mt5_fx_missing`` when a non-USD account has no
+        rate at all and its figures are counted as if they were USD)."""
         snap = self.snapshot() or {}
         mt5 = snap.get("mt5") or {}
         magic = mt5.get("magic")
         acct = mt5.get("account") or {}
-        rate = _f(acct.get("usd_rate")) or 1.0
+        ccy = (acct.get("ccy") or "USD").upper()
+        spot = _f(acct.get("usd_rate"))
         contract = _f(mt5.get("contract")) or 100.0
         seed = (self.seed() or {}).get("venue") or {}
-        since = None
+        since = since_ts
         if days:
             from . import clock
             day0 = clock.now().replace(hour=0, minute=0, second=0, microsecond=0)
             since = (day0 - timedelta(days=days - 1)).timestamp()
-        return accounting.daily_pnl(self.fills(), self.deals(), magic,
-                                    funding=self.funding(), since_ts=since,
-                                    contract=contract, mt5_rate=rate,
-                                    seed_pos=seed.get("pos") or 0.0,
-                                    seed_avg=seed.get("avg_price"))
+        fx = self.fx_series() if ccy not in STABLE_USD else None
+        # an MT5 quote leg: its realized is the broker's profit on its
+        # magic's deals, at their rate, else the day's close of the SAME
+        # currency (fx_daily.json is the hedge account's), else today's
+        v = snap.get("venue") or {}
+        vm = v.get("margin") or {}
+        v_ccy = (vm.get("ccy") or "USD").upper()
+        v_fx = fx if (v_ccy == ccy and v_ccy not in STABLE_USD) else None
+        out = accounting.daily_pnl(self.fills(), self.deals(), magic,
+                                   funding=self.funding(), since_ts=since,
+                                   until_ts=until_ts, contract=contract,
+                                   mt5_rate=spot or 1.0, fx=fx,
+                                   seed_pos=seed.get("pos") or 0.0,
+                                   seed_avg=seed.get("avg_price"),
+                                   venue_deals=self.venue_deals(),
+                                   venue_magic=v.get("magic"),
+                                   venue_rate=_f(vm.get("usd_rate")) or 1.0,
+                                   venue_fx=v_fx)
+        sm = out["summary"]
+        sm["mt5_ccy"] = ccy
+        sm["mt5_fx_missing"] = (ccy not in STABLE_USD and not spot
+                                and bool(sm["mt5_fx_sources"].get("spot")))
+        return out
 
     def summary(self, days: Optional[int] = None) -> dict:
         """One dict with everything: identity, snapshot age, the position,

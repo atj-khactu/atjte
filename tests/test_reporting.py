@@ -47,6 +47,15 @@ class _FakeMt5:
         self.asked.append((frm, to, symbol))
         return [d for d in self.deals if not symbol or d["symbol"] == symbol]
 
+    #: D1 closes of EURUSD: {broker-clock bar open (s): close}
+    daily: dict = {}
+
+    def rates(self, symbol, frm, to, timeframe="M1"):
+        assert symbol == "EURUSD" and timeframe == "D1", (symbol, timeframe)
+        lo, hi = frm.timestamp(), to.timestamp()
+        return [{"time": t, "open": c, "high": c, "low": c, "close": c, "spread": 0}
+                for t, c in sorted(self.daily.items()) if lo <= t <= hi]
+
 
 def raw_deal(ticket, t_server_ms, magic=77006, entry=0, dtype=1, profit=0.0):
     return {"ticket": ticket, "order": ticket + 1, "time": t_server_ms // 1000,
@@ -104,6 +113,52 @@ class ReporterTest(unittest.TestCase):
         self.assertEqual(self.rep.read_mt5_deals(mt5, "XAUUSD", off), 0)
         frm2, _, _ = mt5.asked[1]
         self.assertAlmostEqual(frm2.timestamp(), t_true + 60 - R.DEALS_OVERLAP_S + off, places=0)
+
+    def test_an_mt5_quote_legs_deals_are_its_own_records(self):
+        """The quote terminal's deals: read on its own clock, recorded as
+        ``venue_deal`` under ``quote:<ticket>`` — never mistaken for a
+        hedge deal, even with the hedge broker's ticket number and magic."""
+        off = 2 * 3600.0
+        t_true = time.time() - 600
+
+        class Quote:
+            symbol, asked, offset = "XAUUSD247.i", [], None
+
+            def server_offset_s(self):
+                return self.offset
+
+            def history_deals(self, frm, to):
+                self.asked.append((frm, to))
+                d = raw_deal(1, int((t_true + off) * 1000), entry=3, profit=8.0)
+                return [{**d, "symbol": self.symbol}]
+
+            def account_rate(self):
+                return 1.12
+
+        q = Quote()
+        self.assertEqual(self.rep.read_venue_deals(q, "mt5"), 0)    # no clock: no read
+        self.assertEqual(q.asked, [])
+        q.offset = off
+        self.assertEqual(self.rep.read_venue_deals(q, "mt5"), 1)
+        self.assertEqual(self.rep.read_venue_deals(q, "mt5"), 0)    # read again: nothing new
+        self.assertGreater(q.asked[0][1].timestamp(), time.time() + off)
+        # a hedge deal with the same ticket number is a different record
+        self.assertEqual(self.rep.record_deals([R.deal_record(raw_deal(1, 0), 0.0)]), 1)
+        rows = R.read_jsonl(self.rep.trades_file)
+        v = next(r for r in rows if r["kind"] == "venue_deal")
+        self.assertEqual((v["venue"], v["id"], v["symbol"]), ("mt5", "quote:1", "XAUUSD247.i"))
+        self.assertAlmostEqual(v["ts"], t_true, places=2)
+        self.assertEqual(v["usd_rate"], 1.12)
+        report = R.Report(self.tmp)
+        self.assertEqual([d["ticket"] for d in report.deals()], [1])
+        self.assertEqual([d["id"] for d in report.venue_deals()], ["quote:1"])
+        # the hedge's incremental read follows the hedge deal (stamped 0),
+        # never the quote terminal's newer one
+        self.assertAlmostEqual(self.rep.last_deal_ts, 0.0)
+        again = R.Reporter(self.tmp, self.identity)
+        self.assertEqual(again.read_venue_deals(q, "mt5"), 0)        # known after a restart
+        self.assertAlmostEqual(q.asked[-1][0].timestamp(),
+                               t_true - R.DEALS_OVERLAP_S + off, places=0)
 
     def test_seed_once(self):
         self.assertTrue(self.rep.seed_once(1.5, 2400.0, -0.02, 2401.0, 100.0))
@@ -292,6 +347,37 @@ class ReportReaderTest(unittest.TestCase):
         self.assertIn("XAUT/USD:USD", text)
         self.assertIn("fills", text)
 
+    def test_an_mt5_quote_leg_is_booked_off_its_deals(self):
+        """With ``venue.magic`` in the snapshot, the venue leg's realized is
+        the quote broker's profit on that magic's deals at the venue
+        account's rate — not the replay's 10."""
+        t0 = time.time() - 600
+        tmp = Path(tempfile.mkdtemp())
+        rep = R.Reporter(tmp, {"strategy": "grid"})
+        rep.seed_once(1.0, 2400.0, 0.0, None, 100.0)
+        rep.record_fill(R.fill_record("mt5", trade_id="a", ts=t0, side="sell",
+                                      amount=1.0, price=2410.0, order_id="o"))
+        quote = {**raw_deal(7, int((t0 + 1) * 1000), magic=0, entry=3, profit=6.0),
+                 "symbol": "XAUUSD247.i"}
+        foreign = {**raw_deal(8, int((t0 + 2) * 1000), magic=5, entry=1, profit=99.0),
+                   "symbol": "XAUUSD247.i"}
+        # the close-by leg is claimed through a position this magic opened
+        opened = {**raw_deal(6, int((t0 - 5) * 1000), magic=77016, entry=0),
+                  "symbol": "XAUUSD247.i"}
+        rep.record_venue_deals([R.venue_deal_record(d, 0.0, "mt5")
+                                for d in (opened, quote, foreign)])
+        margin = {"ccy": "EUR", "usd_rate": 1.5}
+        rep.snapshot(R.venue_block(venue_id="mt5", symbol="XAUUSD247.i", market_kind="swap",
+                                   unit_label="oz", margin=margin, magic=77016),
+                     R.mt5_block(symbol="XAUUSD", magic=77016, ok=True, contract=100.0,
+                                 srv_offset_s=0.0, account=None, top=None, positions=[]))
+        out = R.Report(tmp).daily_pnl(days=2)
+        row = out["days"][-1]
+        self.assertEqual(row["kr_source"], "venue")
+        self.assertAlmostEqual(row["kr_realized"], 6.0 * 1.5)
+        self.assertAlmostEqual(row["kr_fees"], 0.07 * 2 * 1.5)    # both own deals' commission
+        self.assertEqual(row["mt5_deals"], 0)                     # never a hedge deal
+
     def test_missing_folder_is_empty_not_fatal(self):
         r = R.Report(self.tmp / "nowhere")
         self.assertFalse(r.exists())
@@ -323,6 +409,68 @@ class HelpersTest(unittest.TestCase):
         d = raw_deal(1, 1_800_000_000_000)
         d["type"] = 2
         self.assertIsNone(R.deal_record(d, 0.0))
+
+
+class FxAndAdjustmentTest(unittest.TestCase):
+    """2026-10-19, against the original Hyperliquid project's reporting: a
+    past MT5 deal converts at its own day's rate (fx_daily.json, or the rate
+    stamped on a fresh deal) — never today's — and the symbol's
+    adjustments (dividends, taxes) are recorded and counted."""
+
+    DAY = 86400.0
+
+    def test_adjustments_are_recorded_and_money_moves_are_not(self):
+        d = raw_deal(1, 1_800_000_000_000, magic=0, dtype=15, profit=-3.5)
+        rec = R.deal_record(d, 0.0)
+        self.assertEqual((rec["adjust"], rec["side"], rec["entry"], rec["lots"]),
+                         ("dividend", None, None, 0.0))
+        self.assertEqual(rec["profit"], -3.5)
+        for dtype in (2, 3, 6, 13, 14):          # balance, credit, bonus, cancelled
+            d["type"] = dtype
+            self.assertIsNone(R.deal_record(d, 0.0), dtype)
+
+    def test_a_fresh_deal_carries_its_rate_and_an_old_one_takes_its_day(self):
+        tmp = Path(tempfile.mkdtemp())
+        now = time.time()
+        day0 = (now // self.DAY - 3) * self.DAY             # three UTC midnights back
+        mt5 = _FakeMt5(deals=[raw_deal(1, int((day0 + 3600) * 1000), profit=100.0),
+                              raw_deal(2, int((now - 60) * 1000), profit=100.0)])
+        mt5.daily = {day0 + k * self.DAY: 1.05 + 0.01 * k for k in range(5)}
+        rep = R.Reporter(tmp, {"strategy": "grid", "project": "x", "engine": "arb"})
+        acct = rep.mt5_account(mt5)                           # EUR at 1.11 live
+        self.assertEqual(rep.read_mt5_deals(mt5, "XAUUSD", 0.0), 2)
+        rows = {r["id"]: r for r in R.read_jsonl(rep.trades_file)}
+        self.assertNotIn("usd_rate", rows["1"])                # three days old
+        self.assertAlmostEqual(rows["2"]["usd_rate"], 1.11)
+        self.assertGreaterEqual(rep.refresh_fx_daily(mt5, 0.0, now), 4)
+        self.assertEqual(rep.refresh_fx_daily(mt5, 0.0, now + 60), 0)   # not due yet
+        rep.snapshot(R.venue_block(venue_id="hyperliquid", symbol="XAUT/USDC:USDC",
+                                   market_kind="swap", unit_label="oz", top=None),
+                     R.mt5_block(symbol="XAUUSD", magic=77006, ok=True, contract=100.0,
+                                 srv_offset_s=0.0, account=acct, top=None, positions=[]))
+        out = R.Report(tmp).daily_pnl()
+        sm = out["summary"]
+        self.assertEqual(sm["mt5_fx_sources"], {"daily": 1, "deal": 1})
+        self.assertAlmostEqual(sm["mt5_realized"], (100.0 - 0.07) * (1.05 + 1.11))
+        self.assertFalse(sm["mt5_fx_missing"])
+
+    def test_the_daily_file_merges_and_a_refetched_day_replaces_its_close(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.assertEqual(R.write_fx_daily(tmp, "JPY", "USDJPY", True,
+                                          [[0, 0.0068], [86400, 0.0069]]), 2)
+        self.assertEqual(R.write_fx_daily(tmp, "JPY", "USDJPY", True,
+                                          [[86400, 0.0070], [172800, 0.0071]]), 3)
+        doc = R.read_fx_daily(tmp)
+        self.assertEqual(doc["points"], [[0, 0.0068], [86400, 0.0070], [172800, 0.0071]])
+        # another currency starts the file over
+        self.assertEqual(R.write_fx_daily(tmp, "EUR", "EURUSD", False, [[0, 1.1]]), 1)
+
+    def test_an_inverse_pair_is_inverted_and_shifted_to_utc(self):
+        class M:
+            def rates(self, symbol, frm, to, timeframe):
+                return [{"time": 7200, "close": 160.0}]
+        self.assertEqual(R.fx_daily_points(M(), "USDJPY", True, 0, 86400, 7200.0),
+                         [[0.0, 1 / 160.0]])
 
 
 class RolledUpFillTest(unittest.TestCase):

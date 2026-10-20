@@ -655,6 +655,17 @@ class UpstreamTest(unittest.TestCase):
         self.assertTrue(self.up.public_ok_for(MGC))            # quotes untouched
         self.assertEqual(self.up.status()["market_data_refused"], {})
 
+    def test_a_depth_reset_keeps_the_depth_book(self):
+        """317 = TWS restarts the book on the same request (2026-10-19 23:02):
+        the request stays and the symbol keeps its depth."""
+        self.up._symbols.add(MGC)
+        self.up._depth_reqs[77] = MGC
+        self.up._on_error(77, 317, "Market depth data has been RESET. Please empty "
+                          "deep book contents before applying any new entries.",
+                          self.up._contracts[MGC])
+        self.assertIn(77, self.up._depth_reqs)
+        self.assertNotIn(MGC, self.up.status()["depth"]["unavailable"])
+
     def test_a_market_data_refusal_takes_the_symbol_down(self):
         self.up._symbols.add(MGC)
         self.assertTrue(self.up.public_ok)

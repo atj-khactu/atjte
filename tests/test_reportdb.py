@@ -112,6 +112,25 @@ class IngestTest(Case):
         self.assertEqual(self.db.scalar("SELECT COUNT(*) FROM funding WHERE strategy = ?",
                                         (KEY,)), 2)
 
+    def test_a_quote_terminals_deal_is_its_own_row_and_reads_back(self):
+        """An MT5 quote leg's deal (``venue_deal``) shares the deals table
+        under ``quote:<ticket>``: the hedge broker's deal with the same
+        ticket number stays a row of its own, and each reads back as it was."""
+        from atjte.reportdb.reader import DbReport, ReadOnlyDb
+        self.snapshot()
+        vd = {**deal(501), "kind": "venue_deal", "id": "quote:501", "symbol": "XAUUSD247.i",
+              "profit": 8.0}
+        self.write_trades([deal(501), vd])
+        r = self.ing.run_pass()
+        self.assertEqual(r.deals, 2, r.errors)
+        self.assertEqual(sorted(d["ticket"] for d in self.db.query("SELECT ticket FROM deals")),
+                         ["501", "quote:501"])
+        ro = ReadOnlyDb(self.db.path)
+        self.addCleanup(ro.close)
+        b = DbReport(ro, self.rep.parent, KEY)
+        self.assertEqual([d["ticket"] for d in b.deals()], [501])
+        self.assertEqual(b.venue_deals(), [vd])
+
     def test_appended_lines_are_read_from_where_the_last_pass_stopped(self):
         self.write_trades([fill(1)])
         self.ing.run_pass()

@@ -113,6 +113,14 @@ class OrderTest(unittest.TestCase):
         sym, side, lots, otype, kw = c.gateway.sent[0]
         self.assertEqual((sym, lots, otype), ("XAUUSD247.i", 0.01, OrderType.MARKET))
         self.assertEqual(kw["deviation"], 20)
+        self.assertEqual(kw["comment"], "atjte quote")   # no comment option given
+
+    def test_an_empty_comment_is_sent_empty(self):
+        c = _client()
+        c.comment = MT5VenueClient(symbol="XAUUSD247.i", magic=77020, gateway_port=5623,
+                                   gateway_token="t", comment="").comment
+        c.place_order("XAUUSD247.i", OrderSide.SELL, 0.01, OrderType.MARKET)
+        self.assertEqual(c.gateway.sent[0][4]["comment"], "")
 
     def test_an_unfilled_market_order_is_rejected(self):
         lease = FakeLease()
@@ -178,6 +186,31 @@ class AccountTest(unittest.TestCase):
         self.assertAlmostEqual(v.position_units, 30.0)
         self.assertAlmostEqual(v.entry_px, 4160.0)              # the net cost, not the last ticket
         self.assertAlmostEqual(v.upnl, 150.0 * 1.16)            # every ticket, in USD
+
+
+class DealHistoryTest(unittest.TestCase):
+    """The broker's booked results: the report reads them on this
+    terminal's clock (:meth:`atjte.reporting.Reporter.read_venue_deals`)."""
+
+    def test_the_symbols_deals_on_the_terminals_own_clock(self):
+        lease = FakeLease()
+        lease.asked = []
+        lease.history_deals = lambda frm, to, symbol=None: (lease.asked.append(symbol)
+                                                           or [{"ticket": 1}])
+        c = _client(lease)
+        self.assertTrue(c.books_venue_deals)
+        self.assertEqual(c.history_deals(None, None), [{"ticket": 1}])
+        self.assertEqual(lease.asked, ["XAUUSD247.i"])
+        self.assertAlmostEqual(c.account_rate(), 1.16)           # EUR → USD at EURUSD.i
+        # the clock: only from a LIVE tick, then kept through a quiet market
+        import time as _t
+        self.assertIsNone(c.server_offset_s())                    # no tick time at all
+        live = (_t.time() + 3 * 3600 + 2) * 1000
+        lease.get_ticker = lambda s: types.SimpleNamespace(raw={"time_msc": live})
+        self.assertEqual(c.server_offset_s(), 3 * 3600)
+        stale = (_t.time() + 3 * 3600 - 900) * 1000               # a tick 15 min old
+        lease.get_ticker = lambda s: types.SimpleNamespace(raw={"time_msc": stale})
+        self.assertEqual(c.server_offset_s(), 3 * 3600)           # the last good one
 
 
 class MarginRateTest(unittest.TestCase):

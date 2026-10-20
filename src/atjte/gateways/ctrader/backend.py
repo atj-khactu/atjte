@@ -655,7 +655,8 @@ class CTraderBackend:
             raise ValueError("the cTrader gateway sends market hedges only")
         magic = int(kwargs.get("magic") or 0)
         label = str(magic) if magic else ""
-        comment = str(kwargs.get("comment") or "atjte hedge")
+        # "" = the caller's "no comment" (MT5_COMMENT None); not given = ours
+        comment = str(kwargs.get("comment", "atjte hedge") or "")
         sid = self._sid(symbol)
         want = self._volume(sid, amount)
         side_pb = MM.BUY if side is OrderSide.BUY else MM.SELL

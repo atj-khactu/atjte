@@ -5,8 +5,8 @@ no network, no credentials, no strategy folder needed:
     .venv\\Scripts\\python.exe -m pytest projects\\<project>\\bot_core\\test_risk.py
 
 Covers the average-cost ledger both legs share, the day's book and its
-roll, the day-PnL definition (REALIZED only — closing fills + settled
-funding, the ``sample_project`` convention), the sticky daily limits and the
+roll, the day-PnL definition (marked to market — realized today plus the
+open position's move since the day began, :func:`open_change`), the sticky daily limits and the
 margin de-risk trigger's two deliberate asymmetries (flat never fires it, a
 figure that could not be read never fires it).
 """
@@ -22,7 +22,7 @@ if str(_PROJECT) not in sys.path:
 
 from atjte.engines.arb.risk import (  # noqa: E402
     DayBook, Ledger, combined_unrealized, daily_limit_reasons, day_key,
-    derisk_reasons, funding_settled, liq_distance_pct,
+    derisk_reasons, funding_settled, liq_distance_pct, open_change,
 )
 
 
@@ -150,6 +150,24 @@ class DayBookTest(unittest.TestCase):
         self.assertAlmostEqual(led.unrealized(4300.0), -100.0)
         self.assertAlmostEqual(day.pnl(), 17.5)
 
+    def test_fees_commission_and_swap_count_in_the_days_loss(self):
+        """2026-10-19: the daily loss counts what trading cost — the venue's
+        fees (paid = +) and MT5 commission + swap (as credited, charged = −)
+        — besides the realized PnL and the funding."""
+        day = DayBook(date="d", realized_venue_usd=0.0, realized_mt5_usd=-4.0,
+                      funding_usd=-0.5, fees_venue_usd=1.5, mt5_costs_usd=-2.0)
+        self.assertAlmostEqual(day.costs_usd, -3.5)
+        self.assertAlmostEqual(day.pnl(), -8.0)
+        # the realized legs and funding alone (-4.5) would not reach a 6 USD
+        # limit; with what the day cost it is reached
+        self.assertTrue(daily_limit_reasons(day, day.pnl(), 6.0, None, None))
+        self.assertEqual(daily_limit_reasons(DayBook(date="d"), day.realized_usd, 6.0,
+                                             None, None), [])
+        back = DayBook.from_dict(day.to_dict())
+        self.assertEqual((back.fees_venue_usd, back.mt5_costs_usd), (1.5, -2.0))
+        self.assertTrue(day.roll("e"))
+        self.assertEqual((day.fees_venue_usd, day.mt5_costs_usd), (0.0, 0.0))
+
     def test_a_position_carried_in_books_its_whole_pnl_on_the_closing_day(self):
         # sample_project's convention (closedPnl / MT5 deal profit): a long
         # opened yesterday at 4300 and sold today at 4360 books +60 TODAY
@@ -168,6 +186,34 @@ class DayBookTest(unittest.TestCase):
         # a file written before the realized-only change carries extra keys
         self.assertEqual(DayBook.from_dict({"date": "d", "unrealized_base_usd": 5.0,
                                             "realized_venue_usd": "junk"}).date, "d")
+
+
+class OpenChangeTest(unittest.TestCase):
+    def test_first_priced_reading_is_the_baseline(self):
+        day = DayBook(date="d")
+        self.assertIsNone(open_change(day, None))         # unpriced: no baseline yet
+        self.assertIsNone(day.unrealized_open_usd)
+        self.assertEqual(open_change(day, -40.0), 0.0)    # baseline taken
+        self.assertAlmostEqual(open_change(day, -140.0), -100.0)
+        self.assertIsNone(open_change(day, None))         # baseline kept
+        self.assertEqual(day.unrealized_open_usd, -40.0)
+
+    def test_carried_position_counts_only_todays_move(self):
+        # long 1 @ 4300 carried in, marked 4350 at midnight; closed at 4320:
+        # realized +20 from the cost, the baseline +50 -> today -30
+        led = Ledger()
+        led.seed(1.0, 4300.0)
+        day = DayBook(date="d")
+        open_change(day, led.unrealized(4350.0))
+        day.realized_venue_usd += led.apply("sell", 1.0, 4320.0)
+        self.assertAlmostEqual(day.pnl() + open_change(day, led.unrealized(4320.0)), -30.0)
+
+    def test_roll_clears_and_dict_keeps_the_baseline(self):
+        day = DayBook(date="d", unrealized_open_usd=-12.5)
+        self.assertEqual(DayBook.from_dict(day.to_dict()).unrealized_open_usd, -12.5)
+        self.assertIsNone(DayBook.from_dict({"date": "d"}).unrealized_open_usd)
+        day.roll("e")
+        self.assertIsNone(day.unrealized_open_usd)
 
 
 class DailyLimitTest(unittest.TestCase):
@@ -259,11 +305,22 @@ class DeriskTest(unittest.TestCase):
                                         mt5_level=None, mt5_level_min=200.0,
                                         mt5_free=None, mt5_free_min=1000.0), [])
 
+    def test_excess_liquidity_now_or_at_the_next_margin_change(self):
+        self.assertEqual(derisk_reasons(5.0, excess=3000.0, excess_ahead=2500.0,
+                                        excess_min=2000.0), [])
+        (r,) = derisk_reasons(5.0, excess=1000.0, excess_ahead=500.0, excess_min=2000.0)
+        self.assertIn("Quote excess liquidity 1000", r)          # now wins, once
+        (r,) = derisk_reasons(5.0, excess=3000.0, excess_ahead=500.0, excess_min=2000.0)
+        self.assertIn("next margin change", r)
+        self.assertEqual(derisk_reasons(5.0, excess=None, excess_ahead=None,
+                                        excess_min=2000.0), [])  # unread: never fires
+        self.assertEqual(derisk_reasons(0.0, excess=1.0, excess_min=2000.0), [])  # flat
+
     def test_each_threshold_fires_on_its_own(self):
         self.assertIn("available margin",
                       derisk_reasons(5.0, venue_available=100.0,
                                      venue_available_min=500.0)[0])
-        self.assertIn("liquidation distance",
+        self.assertIn("distance to liquidation",
                       derisk_reasons(5.0, liq_pct=2.0, liq_pct_min=5.0)[0])
         self.assertIn("margin level",
                       derisk_reasons(5.0, mt5_level=120.0, mt5_level_min=200.0)[0])

@@ -412,6 +412,53 @@ def fetch_mt5_deals(client, symbol: str, since_ts: float, offset_s: float,
     return out
 
 
+def fetch_venue_deals(client, venue: str, since_ts: float, offset_s: float,
+                      until_ts: Optional[float] = None) -> list[dict]:
+    """An MT5 QUOTE leg's deals (``client`` an ``MT5VenueClient``: its own
+    terminal and symbol) between ``since_ts`` and now (UTC), as report
+    ``venue_deal`` records — where its realized PnL is read from."""
+    until = time.time() if until_ts is None else until_ts
+    frm = datetime.fromtimestamp(since_ts + offset_s, tz=timezone.utc)
+    to = datetime.fromtimestamp(until + offset_s + 300.0, tz=timezone.utc)
+    return [r for r in (reporting.venue_deal_record(d, offset_s, venue)
+                        for d in client.history_deals(frm, to)) if r is not None]
+
+
+def fetch_fx_daily(client, rdir: Path, since_ts: float, offset_s: float,
+                   log: Callable[[str], None] = lambda m: None) -> int:
+    """The MT5 account currency's daily USD rates from a week before
+    ``since_ts`` to now, merged into the report's ``fx_daily.json`` — what
+    converts each past deal at its own day's rate. 0 for a USD account (or
+    when the terminal quotes no pair for its currency: the reader then falls
+    back to today's rate, and says so). Never raises."""
+    try:
+        ccy = (client.get_account().currency or "USD").upper()
+    except Exception as e:
+        log(f"MT5 FX: account currency not read ({type(e).__name__}: {e})")
+        return 0
+    if ccy in reporting.STABLE_USD:
+        return 0
+    found = reporting.resolve_fx_symbol(client, ccy)
+    if found is None:
+        log(f"MT5 FX: no {ccy}USD or USD{ccy} on the terminal — past deals convert "
+            f"at today's rate")
+        return 0
+    sym, inverse = found
+    now = time.time()
+    try:
+        pts = reporting.fx_daily_points(client, sym, inverse, since_ts - 7 * 86400.0,
+                                        now + 86400.0, offset_s)
+    except Exception as e:
+        log(f"MT5 FX: {sym} daily bars not read ({type(e).__name__}: {e})")
+        return 0
+    if not pts:
+        log(f"MT5 FX: {sym} returned no daily bars")
+        return 0
+    n = reporting.write_fx_daily(rdir, ccy, sym, inverse, pts)
+    log(f"MT5 FX: {len(pts)} daily {sym} closes read ({ccy} → USD), {n} days on file")
+    return n
+
+
 # ── the seed ─────────────────────────────────────────────────────────────────
 def rewrite_seed(report_dir: Path, earliest_ts: float, pos: float = 0.0,
                  avg: Optional[float] = None, note: str = "") -> dict:
@@ -569,6 +616,29 @@ def run(strategy_dir: Path, *, since_ts: Optional[float] = None, venue: bool = T
         except Exception as e:
             summary["errors"].append(f"venue records: {type(e).__name__}: {e}")
             log(f"venue records failed: {type(e).__name__}: {e}")
+        qc = getattr(vc, "client", vc)          # the Venue's connector
+        if qc is not None and getattr(qc, "books_venue_deals", False):
+            # an MT5 quote leg: its terminal's deals carry the realized PnL
+            try:
+                offset = qc.server_offset_s()
+                if offset is None:
+                    raise RuntimeError("the quote terminal's clock offset cannot be inferred "
+                                       "(no live tick — market closed?)")
+                start = since_ts if since_ts is not None else time.time() - 365 * 86400.0
+                vdeals = fetch_venue_deals(qc, ident["exchange_id"], start, offset)
+                summary["venue_deals_fetched"] = len(vdeals)
+                if not dry_run:
+                    summary["venue_deals_new"] = rep.record_venue_deals(vdeals)
+                else:
+                    seen = {(str(x.get("venue")), str(x.get("id")))
+                            for x in reporting.read_jsonl(rep.trades_file)}
+                    summary["venue_deals_new"] = sum(1 for r in vdeals
+                                                     if (r["venue"], r["id"]) not in seen)
+                log(f"venue: {summary['venue_deals_fetched']} quote-terminal deals fetched, "
+                    f"{summary['venue_deals_new']} new")
+            except Exception as e:
+                summary["errors"].append(f"venue deals: {type(e).__name__}: {e}")
+                log(f"venue deals failed: {type(e).__name__}: {e}")
 
     # ── MT5 deals ──
     if mt5 and ident["symbol_mt5"]:
@@ -590,6 +660,8 @@ def run(strategy_dir: Path, *, since_ts: Optional[float] = None, venue: bool = T
                 seen = {(str(x.get("venue")), str(x.get("id"))) for x in reporting.read_jsonl(rep.trades_file)}
                 summary["mt5_new"] = sum(1 for r in deals if ("mt5", r["id"]) not in seen)
             log(f"MT5: {summary['mt5_fetched']} deals fetched, {summary['mt5_new']} new")
+            if not dry_run:
+                summary["fx_days"] = fetch_fx_daily(mc, rep.dir, start, offset, log)
         except Exception as e:
             summary["errors"].append(f"mt5: {type(e).__name__}: {e}")
             log(f"MT5 leg failed: {type(e).__name__}: {e}")
@@ -639,6 +711,8 @@ def format_summary(s: dict) -> str:
              f"  on file:     {s.get('fills_on_file', 0)} fills, {s.get('deals_on_file', 0)} deals"
              + (f", earliest fill {s['earliest_fill_utc']}" if s.get("earliest_fill_utc") else ""),
              f"  seed:        {s['seed']}"]
+    if s.get("fx_days"):
+        lines.append(f"  MT5 FX:      {s['fx_days']} daily rates on file")
     if s.get("replay_position") is not None:
         lines.append(f"  replay:      position {s['replay_position']} @ {s.get('replay_avg_price')}")
     for e in s.get("errors") or ():

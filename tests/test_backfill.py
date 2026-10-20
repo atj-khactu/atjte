@@ -348,6 +348,31 @@ class RunTest(unittest.TestCase):
         self.td.cleanup()
         self._sleep.stop()
 
+    def test_an_mt5_quote_legs_deals_come_from_its_own_terminal(self):
+        """The Venue's connector is an MT5 quote leg: its terminal's deals
+        are recorded as ``venue_deal`` records on its own clock, and a second
+        run adds nothing."""
+        import types
+        off = 2 * 3600.0
+        raw = [{**_deal(5, int((T0 + off) * 1000)), "symbol": "XAUUSD247.i"}]
+        quote = types.SimpleNamespace(
+            books_venue_deals=True, server_offset_s=lambda: off,
+            history_deals=lambda frm, to: raw)
+        vc = types.SimpleNamespace(exchange=self.venue, base="XAUT", quote="USD",
+                                   creds_source="x", client=quote)
+        kw = {"mt5": False, "log": lambda m: None, "venue_factory": lambda i: vc,
+              "mt5_factory": self.factories["mt5_factory"]}
+        s = B.run(self.sd, **kw)
+        self.assertEqual((s["venue_deals_fetched"], s["venue_deals_new"]), (1, 1), s["errors"])
+        v = R.Report(self.sd).venue_deals()
+        self.assertEqual([(d["id"], d["symbol"]) for d in v], [("quote:5", "XAUUSD247.i")])
+        self.assertAlmostEqual(v[0]["ts"], T0)
+        self.assertEqual(R.Report(self.sd).deals(), [])
+        self.assertEqual(B.run(self.sd, **kw)["venue_deals_new"], 0)
+        # a quote terminal with no live tick: said, not guessed
+        quote.server_offset_s = lambda: None
+        self.assertTrue(any("clock offset" in e for e in B.run(self.sd, **kw)["errors"]))
+
     def test_a_partial_venue_leg_keeps_the_fills_but_not_the_seed(self):
         import types
         flaky = FlakyExchange(self.trades, "krakenfutures", fail_after=1)     # 100 newest, then refused

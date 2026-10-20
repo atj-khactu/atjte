@@ -1185,6 +1185,38 @@ class HedgeCommentTest(unittest.TestCase):
         self.assertTrue(long.startswith("hedge XYZ-JP225 fixed"))
         self.assertEqual(self.comment("", "grid"), "hedge grid")   # no symbol: as before
 
+    def test_none_sends_no_comment_and_empty_keeps_the_default(self):
+        self.assertEqual(self.comment("XYZ-EUR/USDC:USDC", explicit=None), "")
+        self.assertEqual(self.comment("XYZ-EUR/USDC:USDC", explicit=""), "hedge XYZ-EUR grid")
+
+
+class QuoteCommentTest(unittest.TestCase):
+    """An MT5 quote leg's order comment, per strategy: MT5_QUOTE_COMMENT,
+    else the connector option, else "quote <market> <key>"."""
+
+    def setUp(self):
+        self._orig = (pb.SYMBOL_VENUE, pb.MT5_QUOTE_COMMENT, pb.VENUE_CLIENT_OPTIONS)
+
+    def tearDown(self):
+        pb.SYMBOL_VENUE, pb.MT5_QUOTE_COMMENT, pb.VENUE_CLIENT_OPTIONS = self._orig
+
+    def comment(self, explicit="", option=None):
+        pb.SYMBOL_VENUE, pb.MT5_QUOTE_COMMENT = "XAUUSD247.i", explicit
+        pb.VENUE_CLIENT_OPTIONS = {"comment": option} if option else {}
+        bot = make_bot()
+        bot.STRATEGY_KEY = "grid"
+        return bot.quote_comment
+
+    def test_setting_then_option_then_default(self):
+        self.assertEqual(self.comment(), "quote XAUUSD247.i grid")
+        self.assertEqual(self.comment(option="bb desk"), "bb desk")
+        self.assertEqual(self.comment("gold q", option="bb desk"), "gold q")
+        self.assertEqual(len(self.comment("x" * 40)), pb.MT5_COMMENT_MAX)
+
+    def test_none_sends_no_comment_over_the_option(self):
+        self.assertEqual(self.comment(None), "")
+        self.assertEqual(self.comment(None, option="bb desk"), "")
+
 
 class PlaceTest(unittest.TestCase):
     def setUp(self):
@@ -1737,39 +1769,138 @@ class HedgeThresholdFromMt5Test(unittest.TestCase):
         bot.volume_min, bot.contract_size = 0.01, 100.0
         bot._resolve_hedge_threshold()
         self.assertEqual(pb.HEDGE_THRESHOLD_UNITS, 0.005)
+        bot.contract_size = 50.0
+        bot._rederive_lot_gates()                       # an FX re-size
+        self.assertEqual(pb.HEDGE_THRESHOLD_UNITS, 0.005)
+
+    def test_a_gap_of_exactly_one_lot_clears_the_gates(self):
+        """xyz:JP225 2026-10-19: MT5 held 1 lot against a flat venue; the
+        drift (rounded to 8 places) read 0.00631536, the gate 0.006315364,
+        so 'drift cleared on re-check' every hour and the lot stayed."""
+        pb.HEDGE_THRESHOLD_UNITS = pb.RECONCILE_TOLERANCE_UNITS = None
+        bot = make_bot([])
+        bot.volume_min, bot.contract_size = 1.0, 1.0 / 158.344
+        bot._resolve_hedge_threshold()
+        drift = round(0.0 + 1.0 * bot.contract_size, 8)   # as _parity_drift_units
+        self.assertGreaterEqual(abs(drift), pb.RECONCILE_TOLERANCE_UNITS)
+        self.assertFalse(abs(-drift) < pb.HEDGE_THRESHOLD_UNITS)
+
+    def test_derived_gates_follow_an_fx_resize(self):
+        """Frozen at the start-up USDJPY (158.218), the gate outgrew one lot
+        once the rate rose (158.344): a whole-lot residue was carried."""
+        pb.HEDGE_THRESHOLD_UNITS = pb.RECONCILE_TOLERANCE_UNITS = None
+        bot = make_bot([])
+        bot.volume_min, bot.contract_size = 1.0, 1.0 / 158.218
+        bot._resolve_hedge_threshold()
+        bot.hedger = types.SimpleNamespace(threshold_units=pb.HEDGE_THRESHOLD_UNITS)
+        bot.contract_size = 1.0 / 158.344
+        bot._rederive_lot_gates()
+        one_lot = round(bot.contract_size, 8)
+        self.assertEqual(pb.HEDGE_THRESHOLD_UNITS, one_lot)
+        self.assertEqual(pb.RECONCILE_TOLERANCE_UNITS, one_lot)
+        self.assertEqual(bot.hedger.threshold_units, one_lot)
 
 
 class RiskUnitPctTest(unittest.TestCase):
-    """RISK_UNIT = "pct": the daily loss is a % of the capital taken once per
-    risk day, the margin floors a % of their account's equity."""
+    """A limit written as '2%' (2026-10-19, each setting its own unit): the
+    daily loss is a % of the capital, the margin floors a % of their
+    account's equity — each base taken ONCE per risk day and kept with the
+    day's book."""
 
     def setUp(self):
-        self._orig = (pb.RISK_PCT, pb.MAX_DAILY_LOSS_USD)
+        self._orig = (dict(pb.UNITS), pb.MAX_DAILY_LOSS_USD)
 
     def tearDown(self):
-        pb.RISK_PCT, pb.MAX_DAILY_LOSS_USD = self._orig
+        pb.UNITS.clear()
+        pb.UNITS.update(self._orig[0])
+        pb.MAX_DAILY_LOSS_USD = self._orig[1]
 
     def test_pct_limit(self):
-        pb.RISK_PCT = False
-        self.assertEqual(pb.pct_limit(500, None), 500.0)        # abs: as written
-        self.assertIsNone(pb.pct_limit(None, 1000))
-        self.assertIsNone(pb.pct_limit(0, 1000))                 # 0 = off
-        pb.RISK_PCT = True
-        self.assertAlmostEqual(pb.pct_limit(5, 20_000), 1000.0)
-        self.assertIsNone(pb.pct_limit(5, None))                 # no base yet: off
+        pb.UNITS["MAX_DAILY_LOSS_USD"] = "abs"
+        self.assertEqual(pb.pct_limit(500, None, "MAX_DAILY_LOSS_USD"), 500.0)
+        self.assertIsNone(pb.pct_limit(None, 1000, "MAX_DAILY_LOSS_USD"))
+        self.assertIsNone(pb.pct_limit(0, 1000, "MAX_DAILY_LOSS_USD"))     # 0 = off
+        pb.UNITS["MAX_DAILY_LOSS_USD"] = "pct"
+        self.assertAlmostEqual(pb.pct_limit(5, 20_000, "MAX_DAILY_LOSS_USD"), 1000.0)
+        self.assertIsNone(pb.pct_limit(5, None, "MAX_DAILY_LOSS_USD"))     # no base yet
 
     def test_the_loss_base_is_taken_once_per_day(self):
-        pb.RISK_PCT, pb.MAX_DAILY_LOSS_USD = True, 2
+        pb.UNITS["MAX_DAILY_LOSS_USD"], pb.MAX_DAILY_LOSS_USD = "pct", 2
         bot = make_bot([])
         bot.venue_margin_equity = 10_000.0
         bot._mt5_equity_usd = lambda: 15_000.0
         self.assertAlmostEqual(bot._max_daily_loss(), 500.0)    # 2% of 25,000
         bot.venue_margin_equity = 5_000.0                       # a losing day
         self.assertAlmostEqual(bot._max_daily_loss(), 500.0)    # still the day's base
-        bot._loss_base = ("1999-01-01", 1.0)                    # a new day
-        self.assertAlmostEqual(bot._max_daily_loss(), 400.0)    # 2% of 20,000
-        pb.RISK_PCT, pb.MAX_DAILY_LOSS_USD = False, 300
+        self.assertEqual(pb.DayBook.from_dict(bot.day.to_dict()).bases,
+                         {"capital": 25_000.0})                 # a restart keeps it
+        bot.day.date = "1999-01-01"                             # a new day ...
+        self.assertAlmostEqual(bot._max_daily_loss(), 400.0)    # ... 2% of 20,000
+        pb.UNITS["MAX_DAILY_LOSS_USD"], pb.MAX_DAILY_LOSS_USD = "abs", 300
         self.assertEqual(bot._max_daily_loss(), 300.0)
+
+    def test_each_floor_takes_its_own_accounts_day_base(self):
+        pb.UNITS["DERISK_MT5_FREE_MARGIN"] = "pct"
+        pb.UNITS["DERISK_VENUE_AVAILABLE_MARGIN_USD"] = "abs"
+        bot = make_bot([])
+        bot.mt5_equity_ccy, bot.venue_margin_equity = 8_000.0, 50_000.0
+        self.assertAlmostEqual(bot._limit("DERISK_MT5_FREE_MARGIN", 10), 800.0)
+        bot.mt5_equity_ccy = 4_000.0                            # the day's base stays
+        self.assertAlmostEqual(bot._limit("DERISK_MT5_FREE_MARGIN", 10), 800.0)
+        self.assertEqual(bot._limit("DERISK_VENUE_AVAILABLE_MARGIN_USD", 250), 250.0)
+
+
+class UnitsInValuesTest(unittest.TestCase):
+    """2026-10-19: each setting carries its own unit — '12bps', '2%', a plain
+    number an amount. At load the engine leaves the NUMBER in place (the
+    strategy types import these names as constants) and records the unit;
+    a plain number under the old strategy-wide SPREAD_UNIT / RISK_UNIT
+    keeps its old meaning; a unit a setting does not take stops the bot."""
+
+    def setUp(self):
+        self._orig = (pb._settings, pb._project, dict(pb.UNITS), list(pb.UNITS_LEGACY))
+
+    def tearDown(self):
+        pb._settings, pb._project = self._orig[0], self._orig[1]
+        pb.UNITS.clear()
+        pb.UNITS.update(self._orig[2])
+        pb.UNITS_LEGACY[:] = self._orig[3]
+
+    def _load(self, settings: dict, project: dict = None):
+        pb._settings = types.SimpleNamespace(**settings)
+        pb._project = types.SimpleNamespace(**(project or {}))
+        pb.UNITS.clear()
+        pb.UNITS_LEGACY.clear()
+        pb._normalize_units()
+        return pb._settings
+
+    def test_values_carry_their_units_and_become_numbers(self):
+        s = self._load({"GRID_STEP": "12bps", "MAX_DAILY_LOSS_USD": "2%",
+                        "MIN_MT5_FREE_MARGIN_OPEN": 1500, "BUY_SPREAD": -3.0})
+        self.assertEqual((s.GRID_STEP, s.MAX_DAILY_LOSS_USD), (12.0, 2.0))
+        self.assertEqual(pb.UNITS["GRID_STEP"], "bps")
+        self.assertEqual(pb.UNITS["MAX_DAILY_LOSS_USD"], "pct")
+        self.assertEqual(pb.UNITS["MIN_MT5_FREE_MARGIN_OPEN"], "abs")
+        self.assertEqual(pb.UNITS["BUY_SPREAD"], "abs")
+        self.assertEqual(pb.UNITS_LEGACY, [])
+
+    def test_the_strategy_file_wins_over_the_project(self):
+        self._load({"GRID_STEP": 1.5}, {"GRID_STEP": "10bps"})
+        self.assertEqual(pb.UNITS["GRID_STEP"], "abs")
+
+    def test_a_legacy_strategy_wide_unit_keeps_plain_numbers_meaning(self):
+        self._load({"SPREAD_UNIT": "bps", "RISK_UNIT": "pct", "GRID_STEP": 12,
+                    "BUY_SPREAD": 3.5, "MAX_DAILY_LOSS_USD": 2})
+        self.assertEqual(pb.UNITS["GRID_STEP"], "bps")
+        self.assertEqual(pb.UNITS["MAX_DAILY_LOSS_USD"], "pct")
+        self.assertIn("GRID_STEP", pb.UNITS_LEGACY)
+
+    def test_a_unit_a_setting_does_not_take_stops_the_bot(self):
+        with self.assertRaises(RuntimeError) as cm:
+            self._load({"GRID_STEP": "2%"})
+        self.assertIn("'12bps'", str(cm.exception))
+        with self.assertRaises(RuntimeError):
+            self._load({"MAX_DAILY_LOSS_USD": "5bps"})
 
 
 class SpreadUnitBpsTest(unittest.TestCase):
@@ -1780,14 +1911,14 @@ class SpreadUnitBpsTest(unittest.TestCase):
     def setUp(self):
         import types as _t
         self._t = _t
-        self._orig = (pb.SPREAD_UNIT, dict(pb.BPS_ORIG), pb.BASIS_RELEASE,
+        self._orig = (pb.BPS_ON, dict(pb.BPS_ORIG), pb.BASIS_RELEASE,
                       pb.REQUOTE_MIN_MOVE, pb.BPS_REANCHOR_DRIFT_PCT)
-        pb.SPREAD_UNIT, pb.BPS_REANCHOR_DRIFT_PCT = "bps", None
+        pb.BPS_ON, pb.BPS_REANCHOR_DRIFT_PCT = True, None
         pb.BPS_ORIG.clear()
         pb.BPS_ORIG.update({"BASIS_RELEASE": 2.0, "REQUOTE_MIN_MOVE": 0.5})
 
     def tearDown(self):
-        (pb.SPREAD_UNIT, orig, pb.BASIS_RELEASE, pb.REQUOTE_MIN_MOVE,
+        (pb.BPS_ON, orig, pb.BASIS_RELEASE, pb.REQUOTE_MIN_MOVE,
          pb.BPS_REANCHOR_DRIFT_PCT) = self._orig
         pb.BPS_ORIG.clear()
         pb.BPS_ORIG.update(orig)
@@ -1855,7 +1986,7 @@ class SpreadUnitBpsTest(unittest.TestCase):
             del _sys.modules[mod.__name__]
 
     def test_points_mode_is_untouched(self):
-        pb.SPREAD_UNIT = "abs"
+        pb.BPS_ON = False                  # no setting written in bps
         bot = self._bot(1.17)
         before = pb.BASIS_RELEASE
         self.assertTrue(bot._bps_tick(1000.0))
@@ -3058,19 +3189,47 @@ class DailyLimitWiringTest(unittest.TestCase):
         self.assertTrue(bot.day.venue_volume_latched)
         self.assertFalse(bot.day.mt5_volume_latched)
 
-    def test_an_open_drawdown_does_not_trip_the_loss_limit(self):
-        # realized-only, like sample_project: a 500 USD unrealized loss on
-        # the open perp leg is reported but never latches the gate
+    def test_an_open_drawdown_trips_the_loss_limit(self):
+        # marked to market (2026-10-19): the open position's move since the
+        # day began counts; the unrealized it carried in does not
         pb.MAX_DAILY_LOSS_USD = 100.0
         bot = make_bot([])
         bot.day.date = pb._day()
         bot.venue_ledger.seed(1.0, 4900.0)
         bot.mark_px = bot.xau_mid = 4400.0
         bot._refresh_risk(time.time())
-        self.assertAlmostEqual(bot.risk_unrealized_usd, -500.0)   # reported
-        self.assertEqual(bot.risk_pnl_usd, 0.0)                   # not gated
+        self.assertAlmostEqual(bot.risk_unrealized_usd, -500.0)
+        self.assertEqual(bot.day.unrealized_open_usd, -500.0)     # the baseline
+        self.assertEqual(bot.risk_pnl_usd, 0.0)                   # carried in: not today's
         self.assertFalse(bot.day.loss_latched)
-        self.assertEqual(bot.close_only_reasons, [])
+        bot.mark_px = 4350.0                                      # today: -50
+        bot._refresh_risk(time.time())
+        self.assertAlmostEqual(bot.risk_pnl_usd, -50.0)
+        self.assertFalse(bot.day.loss_latched)
+        bot.mark_px = 4290.0                                      # today: -110
+        bot._refresh_risk(time.time())
+        self.assertAlmostEqual(bot.risk_pnl_usd, -110.0)
+        self.assertTrue(bot.day.loss_latched)
+        self.assertTrue(any("daily loss" in r for r in bot.close_only_reasons))
+        bot.mark_px = 4900.0                                      # a recovery never re-opens
+        bot._refresh_risk(time.time())
+        self.assertTrue(bot.day.loss_latched)
+
+    def test_the_day_roll_takes_the_baseline_and_a_lost_mark_keeps_the_move(self):
+        pb.MAX_DAILY_LOSS_USD = 1000.0
+        bot = make_bot([])
+        bot.venue_ledger.seed(1.0, 4400.0)
+        bot.mark_px = bot.xau_mid = 4380.0
+        bot.day.date = "1999-01-01"
+        bot._roll_day()
+        self.assertAlmostEqual(bot.day.unrealized_open_usd, -20.0)
+        bot.mark_px = 4330.0
+        bot._refresh_risk(time.time())
+        self.assertAlmostEqual(bot.risk_pnl_usd, -50.0)
+        bot.mark_px = None
+        bot.venue_ticker = None
+        bot._refresh_risk(time.time())
+        self.assertAlmostEqual(bot.risk_pnl_usd, -50.0)           # last priced move kept
 
     def test_gate_sources_are_composed_not_overwritten(self):
         bot = make_bot([])
@@ -3080,7 +3239,7 @@ class DailyLimitWiringTest(unittest.TestCase):
         bot.derisk_reasons = ["liquidation distance 2.00% < 5%"]
         bot._update_gate_reasons()
         self.assertEqual(len(bot.close_only_reasons), 3)
-        self.assertTrue(any("de-risk latch" in r for r in bot.close_only_reasons))
+        self.assertTrue(any("liquidation threshold hit" in r for r in bot.close_only_reasons))
 
     def test_a_new_day_clears_the_latches(self):
         bot = make_bot([])
@@ -3450,11 +3609,14 @@ class HeartbeatRiskBlockTest(unittest.TestCase):
         state = json.loads(json.dumps(written, default=str))   # must serialize
         r = state["risk"]
         self.assertEqual(r["day"], bot.day.date)
-        self.assertTrue(r["realized_only"])
-        self.assertAlmostEqual(r["pnl_usd"], -42.0)
+        self.assertFalse(r["realized_only"])
+        self.assertAlmostEqual(r["pnl_usd"], -42.0)            # first mark = the baseline
+        self.assertAlmostEqual(r["realized_pnl_usd"], -42.0)
+        self.assertAlmostEqual(r["open_change_usd"], 0.0)
+        self.assertAlmostEqual(r["unrealized_open_usd"], 150.0)
         self.assertAlmostEqual(r["realized_venue_usd"], -42.0)
         self.assertAlmostEqual(r["venue_volume_usd"], 13_200.0)
-        self.assertAlmostEqual(r["unrealized_usd"], 150.0)     # reporting only
+        self.assertAlmostEqual(r["unrealized_usd"], 150.0)
         self.assertAlmostEqual(r["venue_ledger"]["inv_units"], 3.0)
         self.assertIn("mt5_ledger", r)
         self.assertFalse(r["derisk"]["active"])
@@ -3878,15 +4040,37 @@ class DeriskWiringTest(unittest.TestCase):
         bot = self._armed(3.0)
         (o,) = bot._flatten_orders()
         self.assertEqual((o.key, o.side, o.purpose), (pb.RISK_FLAT_KEY, "sell", "exit"))
-        self.assertAlmostEqual(o.size, 3.0)
+        self.assertAlmostEqual(o.size, 1.0)              # the order size, not the position
         # the level prices the order AT the touch: MT5 ask + level = the venue ask
         self.assertAlmostEqual(bot.xau_ask + o.level, bot.venue_ticker.ask)
         self.assertAlmostEqual(bot._maker_price("sell", o.level), bot.venue_ticker.ask)
         bot.venue_pos_units = -2.0
         (o,) = bot._flatten_orders()
-        self.assertEqual((o.side, o.size), ("buy", 2.0))
+        self.assertEqual((o.side, o.size), ("buy", 1.0))
         self.assertAlmostEqual(bot.xau_bid + o.level, bot.venue_ticker.bid)
         self.assertAlmostEqual(bot._maker_price("buy", o.level), bot.venue_ticker.bid)
+
+    def test_the_pegged_exit_works_down_in_order_size_slices(self):
+        bot = self._armed(2.5)
+        sizes = []
+        while abs(bot.venue_pos_units) > 1e-9:
+            (o,) = bot._flatten_orders()
+            sizes.append(o.size)
+            bot.venue_pos_units = round(bot.venue_pos_units - o.size, 8)   # it filled
+        self.assertEqual(sizes, [1.0, 1.0, 0.5])
+        self.assertEqual(bot._flatten_orders(), [])
+
+    def test_a_remainder_under_the_venue_minimum_goes_with_the_last_slice(self):
+        bot = self._armed(1.05)
+        bot.venue.amount_min = 0.1
+        (o,) = bot._flatten_orders()
+        self.assertAlmostEqual(o.size, 1.05)             # 0.05 alone could never trade
+
+    def test_without_an_order_size_it_is_the_whole_position(self):
+        bot = self._armed(3.0)
+        bot._clip_units = lambda: 0.0
+        (o,) = bot._flatten_orders()
+        self.assertAlmostEqual(o.size, 3.0)
 
     def test_nothing_to_exit_or_nothing_to_price_it_off(self):
         bot = self._armed(0.0)
@@ -3925,19 +4109,157 @@ class DeriskWiringTest(unittest.TestCase):
         bot.mt5_margin_level = 150.0
         bot._update_derisk()
         self.assertTrue(bot.derisk_active)
-        self.assertTrue(any("RISK LATCH" in m for m in logs))
+        self.assertTrue(any("LIQUIDATION THRESHOLD" in m for m in logs))
         bot.mt5_margin_level = 900.0     # recovered, but still holding
         bot._update_derisk()
         self.assertTrue(bot.derisk_active)
         bot.venue_pos_units = 0.0            # flat: still latched, and quoting nothing
         bot._update_derisk()
         self.assertTrue(bot.derisk_active)
-        self.assertEqual(bot.derisk_reasons, ["MT5 margin level 150% < 200%"])
+        self.assertEqual(bot.derisk_reasons, ["Hedge margin level 150% < 200%"])
         self.assertEqual(bot._flatten_orders(), [])
         bot._target_orders = _orders
         self.assertEqual(bot._desired_orders(), [])
         bot._update_gate_reasons()       # ... and it says so in the entry gate
-        self.assertTrue(any("de-risk latch" in r for r in bot.close_only_reasons))
+        self.assertTrue(any("liquidation threshold hit" in r for r in bot.close_only_reasons))
+
+    def test_maker_pegged_rests_one_order_size_at_the_touch(self):
+        """LIQUIDATION_EXIT_MODE 'maker-pegged': one maker order of the order
+        size at a time (2026-10-19; was the whole position), however long it
+        takes."""
+        bot = self._armed(3.0)
+        with mock.patch.object(pb, "LIQUIDATION_EXIT_MODE", "maker-pegged"),                 mock.patch.object(pb, "MARKET_PAIR", False):
+            (o,) = bot._flatten_orders()
+            self.assertEqual(o.size, 1.0)
+            self.assertFalse(bot._taker_allowed(o))
+
+    def test_chunks_take_capped_slices_at_an_interval(self):
+        """LIQUIDATION_EXIT_MODE 'market-chunks' (2026-10-19; was 'chunks'): one chunk per
+        EXIT_CHUNK_INTERVAL_S — a limit that may take, at most
+        EXIT_MAX_SLIPPAGE_BPS from the mid, sized to the smallest of the
+        position, the order size and a share of the book's depth inside that
+        price; nothing between chunks (the last one's rest is cancelled)."""
+        bot = self._armed(3.0)
+        bot.venue_ticker = types.SimpleNamespace(mid=4450.5, bid=4450.4, ask=4450.6)
+        # bids: 0.4 at 4450.4, 0.4 at 4445, 9 at 4430 (beyond a 25 bp cap: 4439.4)
+        bot.feed = types.SimpleNamespace(get_book=lambda: {
+            "bids": [[4450.4, 0.4], [4445.0, 0.4], [4430.0, 9.0]],
+            "asks": [[4450.6, 1.0]]})
+        with mock.patch.object(pb, "LIQUIDATION_EXIT_MODE", "market-chunks"),                 mock.patch.object(pb, "EXIT_CHUNK_INTERVAL_S", 5.0),                 mock.patch.object(pb, "EXIT_MAX_SLIPPAGE_BPS", 25.0),                 mock.patch.object(pb, "EXIT_MAX_BOOK_SHARE", 0.5),                 mock.patch.object(pb, "MARKET_PAIR", False),                 mock.patch.object(pb.time, "time") as clock:
+            clock.return_value = 1000.0
+            (o,) = bot._flatten_orders()
+            self.assertTrue(bot._taker_allowed(o))
+            self.assertEqual(o.side, "sell")
+            # half of the 0.8 the book holds within 25 bp of 4450.5 (>= 4439.37);
+            # below the order size (1.0) and the position (3.0)
+            self.assertAlmostEqual(o.size, 0.4)
+            price = bot.ref_ask + o.level
+            self.assertAlmostEqual(price, 4450.5 * (1 - 0.0025), places=6)
+            clock.return_value = 1003.0                       # between chunks
+            self.assertEqual(bot._flatten_orders(), [])
+            clock.return_value = 1005.5                       # the next chunk
+            self.assertEqual(len(bot._flatten_orders()), 1)
+            # a deep book: the order size caps it
+            bot.feed = types.SimpleNamespace(get_book=lambda: {
+                "bids": [[4450.4, 50.0]], "asks": [[4450.6, 1.0]]})
+            clock.return_value = 1011.0
+            (o,) = bot._flatten_orders()
+            self.assertAlmostEqual(o.size, 1.0)
+
+    def test_a_market_pair_strategy_always_chunks(self):
+        bot = self._armed(3.0)
+        bot.feed = types.SimpleNamespace(get_book=lambda: None)   # no book: the order size
+        with mock.patch.object(pb, "MARKET_PAIR", True),                 mock.patch.object(pb, "LIVE_TRADING", True),                 mock.patch.object(pb, "LIQUIDATION_EXIT_MODE", "maker-pegged"):
+            (o,) = bot._flatten_orders()
+            self.assertEqual(o.size, 1.0)                     # the clip, not 3.0
+
+    def test_ibkr_excess_liquidity_arms_it_now_or_ahead(self):
+        """2026-10-19: IBKR liquidates on the account's excess liquidity; a
+        fall below the floor NOW or at IBKR's next margin change (the
+        look-ahead, e.g. the overnight requirement) closes the position."""
+        with mock.patch.object(pb, "DERISK_VENUE_EXCESS_LIQUIDITY_USD", 2000.0):
+            bot = self._armed(3.0)
+            bot.venue_excess_liquidity, bot.venue_excess_ahead = 5000.0, 6000.0
+            bot._update_derisk()
+            self.assertFalse(bot.derisk_active)
+            bot.venue_excess_ahead = 1500.0                  # tonight's requirement
+            bot._update_derisk()
+            self.assertTrue(bot.derisk_active)
+            self.assertIn("next margin change", bot.derisk_reasons[0])
+
+    def test_a_dated_future_is_closed_before_delivery(self):
+        """2026-10-19: inside CLOSE_BEFORE_DELIVERY_DAYS of the first delivery
+        day the position is closed through the threshold's exit, and a flat
+        book rests no entry; outside it, nothing happens."""
+        from datetime import timedelta, timezone as tz
+        bot = self._armed(3.0)
+        now = time.time()
+        when = datetime.fromtimestamp(now, tz=tz.utc) + timedelta(days=5)
+        bot._delivery_date = lambda: when
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DAYS", 3):
+            self.assertIsNone(bot._delivery_close(now))
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DAYS", 7):
+            why = bot._delivery_close(now)
+            self.assertIn("delivers", why)
+            bot.delivery_close_reason = why
+            bot._update_derisk()
+            self.assertTrue(bot.derisk_active)
+            self.assertEqual(bot._flatten_orders()[0].side, "sell")
+            flat = self._armed(0.0)
+            flat.delivery_close_reason = why
+            flat._update_derisk()
+            self.assertFalse(flat.derisk_active)             # nothing to close ...
+            flat._update_gate_reasons()
+            self.assertIn(why, flat.close_only_reasons)      # ... and no entry rests
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DAYS", None):
+            self.assertIsNone(bot._delivery_close(now))
+        bot._delivery_date = lambda: None                    # a perpetual never delivers
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DAYS", 7):
+            self.assertIsNone(bot._delivery_close(now))
+
+    def test_a_dated_future_is_closed_on_a_fixed_date(self):
+        """2026-10-19: from CLOSE_BEFORE_DELIVERY_DATE on, the same close (and
+        through the same exit, so LIQUIDATION_EXIT_MODE applies); before it,
+        nothing; with the days too, whichever comes first; never on a market
+        that does not deliver."""
+        from datetime import timedelta, timezone as tz
+        bot = self._armed(3.0)
+        now = time.time()
+        today = datetime.fromtimestamp(now, tz=tz.utc)
+        bot._delivery_date = lambda: today + timedelta(days=30)
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DAYS", None):
+            with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DATE", today + timedelta(hours=1)):
+                self.assertIsNone(bot._delivery_close(now))
+            with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DATE", today - timedelta(hours=1)):
+                why = bot._delivery_close(now)
+                self.assertIn("CLOSE_BEFORE_DELIVERY_DATE", why)
+                bot.delivery_close_reason = why
+                bot._update_derisk()
+                self.assertTrue(bot.derisk_active)
+                with mock.patch.object(pb, "LIQUIDATION_EXIT_MODE", "market-chunks"):
+                    with mock.patch.object(bot, "_flatten_chunk", return_value=["chunk"]) as fc:
+                        self.assertEqual(bot._flatten_orders(), ["chunk"])
+                        fc.assert_called_once()
+        # the days reach first: the days' reason, the date not yet due
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DAYS", 40), \
+                mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DATE", today + timedelta(days=5)):
+            self.assertIn("CLOSE_BEFORE_DELIVERY_DAYS", bot._delivery_close(now))
+        bot._delivery_date = lambda: None                    # a perpetual never delivers
+        with mock.patch.object(pb, "CLOSE_BEFORE_DELIVERY_DATE", today - timedelta(days=1)):
+            self.assertIsNone(bot._delivery_close(now))
+
+    def test_the_delivery_date_comes_from_the_market(self):
+        bot = self._armed(1.0)
+        markets = {"info": {"firstDeliveryDate": "20261201"}, "expiry": None}
+        bot.venue = types.SimpleNamespace(symbol="MGC", exchange=types.SimpleNamespace(
+            market=lambda s: markets))
+        self.assertEqual(bot._delivery_date().strftime("%Y-%m-%d"), "2026-12-01")
+        markets["info"] = {"contractMonth": "202612"}
+        self.assertEqual(bot._delivery_date().strftime("%Y-%m-%d"), "2026-12-01")
+        markets["info"], markets["expiry"] = {}, 1_798_502_400_000      # 2026-12-29
+        self.assertEqual(bot._delivery_date().strftime("%Y-%m-%d"), "2026-12-29")
+        markets["expiry"] = None
+        self.assertIsNone(bot._delivery_date())
 
     def test_liquidation_distance_arms_it(self):
         pb.DERISK_VENUE_LIQ_DISTANCE_PCT = 5.0
@@ -4361,6 +4683,191 @@ class HedgeSplitAndRefusalTest(unittest.TestCase):
             bot = make_bot()
             with mock.patch.object(pb, "PROJECT_DIR", root / "mine"):
                 self.assertEqual(bot._other_project_magics(), {2: "other"})
+
+
+class DailyLimitEnforcementTest(unittest.TestCase):
+    """2026-10-19: a LIVE bot never starts without a max daily loss and a
+    daily volume cap on each exchange, and the day's loss counts the venue
+    fees and the MT5 commission + swap — each booked exactly once."""
+
+    def test_which_limits_are_missing(self):
+        self.assertEqual(pb.daily_limits_missing(100, 5e4, 5e4), [])
+        self.assertEqual(pb.daily_limits_missing(None, 5e4, 5e4), ["MAX_DAILY_LOSS_USD is off"])
+        out = pb.daily_limits_missing(100, 0, None)
+        self.assertEqual(len(out), 1)
+        self.assertIn("the quote exchange and MT5", out[0])
+        self.assertEqual(len(pb.daily_limits_missing(-1, 5e4, "x")), 2)
+
+    def test_a_live_start_is_refused_and_a_dry_run_is_not(self):
+        bot = make_bot()
+        with mock.patch.object(pb, "LIVE_TRADING", True), \
+                mock.patch.object(pb, "MAX_DAILY_LOSS_USD", None):
+            with self.assertRaises(RuntimeError) as cm:
+                bot._assert_daily_limits()
+            self.assertIn("LIVE start refused", str(cm.exception))
+        with mock.patch.object(pb, "LIVE_TRADING", False), \
+                mock.patch.object(pb, "MAX_DAILY_LOSS_USD", None):
+            bot._assert_daily_limits()
+        with mock.patch.object(pb, "LIVE_TRADING", True), \
+                mock.patch.object(pb, "MAX_DAILY_LOSS_USD", 100), \
+                mock.patch.object(pb, "MAX_DAILY_VENUE_VOLUME_USD", 5e4), \
+                mock.patch.object(pb, "MAX_DAILY_MT5_VOLUME_USD", 5e4):
+            bot._assert_daily_limits()
+
+    def test_a_new_fills_fee_is_booked_once(self):
+        bot = make_bot()
+        bot._roll_day()
+        written = []
+
+        class Rep:
+            def record_fill(self, rec):
+                if rec["id"] in written:
+                    return False
+                written.append(rec["id"])
+                return True
+        bot.reporter = Rep()
+        rec = {"id": "t1", "ts": time.time(), "fee_usd": 0.25, "venue": "hyperliquid"}
+        bot._record_report_fill(dict(rec))
+        bot._record_report_fill(dict(rec))                   # a replay: no second fee
+        bot._record_report_fill({"id": "o:rest:1", "order": "o", "ts": time.time(),
+                                 "fee_usd": 9.0, "inferred": True})
+        bot._record_report_fill({"id": "old", "ts": time.time() - 3 * 86400,
+                                 "fee_usd": 5.0})            # another day's fill
+        self.assertAlmostEqual(bot.day.fees_venue_usd, 0.25)
+
+    def test_the_bots_own_mt5_costs_are_booked_in_usd(self):
+        bot = make_bot()
+        bot._roll_day()
+        now = time.time()
+        rep = types.SimpleNamespace(mt5_usd_rate=1.10, last_new_deals=[
+            {"magic": pb.MT5_MAGIC, "ts": now, "costs": -2.0},                 # live rate
+            {"magic": pb.MT5_MAGIC, "ts": now, "costs": -1.0, "usd_rate": 1.2},
+            {"magic": pb.MT5_MAGIC, "ts": now - 3 * 86400, "costs": -50.0},    # not today
+            {"magic": 12345, "ts": now, "costs": -7.0},                        # not ours
+            {"magic": pb.MT5_MAGIC, "ts": now, "costs": 4.0, "adjust": "dividend"}])
+        bot._book_mt5_costs(rep)
+        self.assertAlmostEqual(bot.day.mt5_costs_usd, -2.0 * 1.10 - 1.0 * 1.2)
+        self.assertEqual(rep.last_new_deals, [])
+        bot._book_mt5_costs(rep)                             # consumed: nothing twice
+        self.assertAlmostEqual(bot.day.mt5_costs_usd, -3.4)
+
+
+class InferredFillThenVenueTradeTest(unittest.TestCase):
+    """PAXG_PERP's market-chunks exit, 2026-10-19: a reduce-only taker chunk
+    filled in two ws parts. The first booked; the cancel of the remainder
+    was refused ("not on this gateway session"), the REST read said fully
+    filled, and the unseen part was booked AND reported as a synthetic
+    "signal off" fill at the limit price. The second ws part then arrived
+    for a retired order and was reported again, with no purpose: 7.833
+    units in the report for 5.0 traded."""
+
+    class GatewayRefusal(StubVenue):
+        def cancel(self, order_id):
+            self.cancelled.append(order_id)
+            raise Exception(f"order {order_id} not found: it is not on this gateway "
+                            f"session — it was placed before the session came up, "
+                            f"or by something else")
+
+        def cancel_final(self, order_id):
+            self.cancel(order_id)
+
+    def _bot(self, venue):
+        bot = make_bot([])
+        bot.venue = venue
+        rows = []
+        bot.reporter = types.SimpleNamespace(record_fill=lambda r: rows.append(r) or True)
+        bot.fill_q = queue.Queue()
+        bot.counters["fill_events"] = 0
+        bot._hedge = lambda: None
+        bot.dump_state = lambda: None
+        bot._started_utc = datetime(2000, 1, 1)
+        bot.venue_ledger.seed(0.275, 4100.0)       # the long the chunk reduces
+        rec = OrderRec(key="risk-flatten", side="sell", purpose="exit", level_index=0,
+                       level=-15.38, order_id="o1", price=4130.1, amount=0.275, taker=True)
+        bot.orders[rec.key] = rec
+        return bot, rec, rows
+
+    @staticmethod
+    def _trade(tid, amount, price):
+        return types.SimpleNamespace(symbol=None, order_id="o1", trade_id=tid,
+                                     amount=amount, price=price, timestamp=None,
+                                     side=types.SimpleNamespace(value="sell"),
+                                     fee=None, fee_currency=None, realized_pnl=None,
+                                     taker_or_maker="taker")
+
+    def _incident(self, venue):
+        bot, rec, rows = self._bot(venue)
+        bot._process_fill_events(self._trade("t1", 0.073, 4140.0))
+        bot._settle(rec.key, cancel_first=True, reason="signal off", defer_read=True)
+        self.assertAlmostEqual(bot.pos_units, -0.275)          # position took it at once
+        self.assertEqual([r["source"] for r in rows], ["ws"])   # ... the report waits
+        bot._process_fill_events(self._trade("t2", 0.03, 4139.8))
+        bot._process_fill_events(self._trade("t3", 0.172, 4139.8))
+        bot._flush_inferred(time.time() + 3600)
+        return bot, rows
+
+    def _assert_reported_once(self, bot, rows, ids=("t1", "t2", "t3")):
+        self.assertAlmostEqual(bot.pos_units, -0.275)          # never booked twice
+        self.assertEqual([r["id"] for r in rows], list(ids))
+        self.assertFalse(any(r.get("inferred") for r in rows))
+        self.assertEqual({r["purpose"] for r in rows}, {"exit"})   # purpose kept
+        self.assertEqual({r["key"] for r in rows}, {"risk-flatten"})
+        self.assertAlmostEqual(sum(r["amount"] for r in rows), 0.275)
+        self.assertEqual(bot._inferred_wait, {})
+        # the ledger is at the trades' prices, not the limit's
+        want = (4140.0 - 4100.0) * 0.073 + (4139.8 - 4100.0) * 0.202
+        self.assertAlmostEqual(bot.venue_ledger.realized_usd, want, places=6)
+        self.assertAlmostEqual(bot.day.realized_venue_usd, want, places=6)
+        self.assertAlmostEqual(bot.venue_ledger.inv_units, 0.0)
+
+    def test_a_refused_cancel_then_late_ws_parts_report_each_trade_once(self):
+        venue = self.GatewayRefusal(StubExchange(),
+                                    order=StubOrder(0.275, status=OrderStatus.FILLED))
+        bot, rows = self._incident(venue)
+        self._assert_reported_once(bot, rows)
+
+    def test_a_cancel_answered_with_the_final_state_then_late_ws_parts(self):
+        venue = StubVenue(StubExchange())
+        venue.cancel_final_result = StubOrder(0.275, status=OrderStatus.FILLED)
+        bot, rows = self._incident(venue)
+        self._assert_reported_once(bot, rows)
+
+    def test_a_late_part_on_a_parked_order_keeps_its_purpose(self):
+        # the cancel took; the slow tick's read books the rest; ws then lands
+        venue = StubVenue(StubExchange(), order=StubOrder(0.275, status=OrderStatus.FILLED))
+        bot, rec, rows = self._bot(venue)
+        bot._process_fill_events(self._trade("t1", 0.073, 4140.0))
+        bot._settle(rec.key, cancel_first=True, reason="signal off", defer_read=True)
+        bot._drain_settling(time.time())
+        bot._process_fill_events(self._trade("t2", 0.202, 4139.8))
+        bot._flush_inferred(time.time() + 3600)
+        self._assert_reported_once(bot, rows, ids=("t1", "t2"))
+
+    def test_a_part_no_venue_trade_ever_covers_is_reported_once_as_inferred(self):
+        venue = self.GatewayRefusal(StubExchange(),
+                                    order=StubOrder(0.275, status=OrderStatus.FILLED))
+        bot, rec, rows = self._bot(venue)
+        bot._process_fill_events(self._trade("t1", 0.073, 4140.0))
+        bot._settle(rec.key, cancel_first=True, reason="signal off", defer_read=True)
+        bot._flush_inferred(time.time())                       # inside the wait: nothing
+        self.assertEqual(len(rows), 1)
+        bot._flush_inferred(time.time() + pb.INFERRED_FILL_WAIT_S + 1)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[1].get("inferred"))
+        self.assertEqual(rows[1]["source"], "signal off")
+        self.assertEqual(rows[1]["purpose"], "exit")
+        self.assertAlmostEqual(rows[1]["amount"], 0.202)
+        bot._flush_inferred(time.time() + 3600, final=True)    # never twice
+        self.assertEqual(len(rows), 2)
+
+    def test_teardown_reports_what_is_still_waiting(self):
+        venue = self.GatewayRefusal(StubExchange(),
+                                    order=StubOrder(0.275, status=OrderStatus.FILLED))
+        bot, rec, rows = self._bot(venue)
+        bot._settle(rec.key, cancel_first=True, reason="signal off", defer_read=True)
+        bot._flush_inferred(time.time(), final=True)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["amount"], 0.275)
 
 
 if __name__ == "__main__":

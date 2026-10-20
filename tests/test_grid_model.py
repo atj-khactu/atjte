@@ -17,7 +17,7 @@ from atjte.engines.common.grid_model import (
     DesiredOrder, bollinger_ladder_orders, dynamic_level_units, bollinger_orders,
     bollinger_short_ladder_orders, bollinger_short_orders, bollinger_two_sided,
     fixed_entry_exit_levels, grid_long_orders, grid_short_orders, grid_two_sided,
-    level_fills, one_per_side, round_to_step,
+    held_level_units, level_fills, one_per_side, round_to_step,
 )
 
 
@@ -345,6 +345,32 @@ class TestDynamicLevelUnits(unittest.TestCase):
         self.assertEqual(dynamic_level_units(1500.0, 3, 1000.0), 1000.0)   # 0.5 lot -> 1
         self.assertIsNone(dynamic_level_units(3000.0, 3, 1000.0, min_size=1500.0))
         self.assertEqual(dynamic_level_units(3000.0, 3, 1000.0, min_size=1000.0), 1000.0)
+
+
+class TestHeldLevelUnits(unittest.TestCase):
+    """The day's held level size (GRID_LEVEL_DAILY): equity noise cannot
+    move it; a real fall in the cap still shrinks it."""
+
+    def test_noise_keeps_the_held_size(self):
+        # EURUSD 2026-10-19: the cap breathed 358k-365k, 119k-122k a level
+        for cap in (358181.0, 364976.0, 361268.0, 362298.0):
+            fresh = dynamic_level_units(cap, 3, 1000.0)
+            self.assertEqual(held_level_units(121000.0, fresh, cap, 3, 10.0), 121000.0)
+
+    def test_nothing_kept_takes_the_fresh_size(self):
+        self.assertEqual(held_level_units(None, 120000.0, 361000.0, 3, 10.0), 120000.0)
+
+    def test_a_cap_well_below_shrinks_at_once(self):
+        # 121k held; share 107k < 121k x 0.9 = 108.9k -> shrink to 107k
+        self.assertEqual(held_level_units(121000.0, 107000.0, 321000.0, 3, 10.0), 107000.0)
+        # 110k share is inside the 10 % band: held
+        self.assertEqual(held_level_units(121000.0, 110000.0, 330000.0, 3, 10.0), 121000.0)
+
+    def test_it_never_grows_intraday(self):
+        self.assertEqual(held_level_units(100000.0, 150000.0, 450000.0, 3, 10.0), 100000.0)
+
+    def test_no_fresh_size_holds_entries(self):
+        self.assertIsNone(held_level_units(121000.0, None, None, 3, 10.0))
 
 
 class TestLevelFills(unittest.TestCase):

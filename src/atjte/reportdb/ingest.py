@@ -120,7 +120,11 @@ def fill_row(rec: dict, strategy: str, t: float) -> dict:
 
 
 def deal_row(rec: dict, t: float) -> dict:
-    return {"ticket": str(rec.get("ticket") or rec.get("id") or ""),
+    # an MT5 quote leg's deal (``venue_deal``) is keyed by its record id
+    # (``quote:<ticket>``): another broker's ticket space, never a hedge row
+    key = (rec.get("id") if rec.get("kind") == "venue_deal"
+           else rec.get("ticket") or rec.get("id"))
+    return {"ticket": str(key or ""),
             "symbol": rec.get("symbol"), "ts": _f(rec.get("ts")),
             "ts_utc": iso_utc(_f(rec.get("ts"))), "side": rec.get("side"),
             **{k: _f(rec.get(k)) for k in ("lots", "price", "profit", "commission", "fee",
@@ -229,7 +233,7 @@ class Ingestor:
             kind = r.get("kind")
             if kind == "fill" and r.get("id") is not None:
                 fills.append(fill_row(r, s.key, t))
-            elif kind == "deal" and (r.get("ticket") or r.get("id")):
+            elif kind in ("deal", "venue_deal") and (r.get("ticket") or r.get("id")):
                 deals.append(deal_row(r, t))
             elif kind == "funding":
                 funding.append(funding_row(r, s.key, t))

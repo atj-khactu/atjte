@@ -54,6 +54,13 @@ GRID_LEVEL_UNITS = 1.0           # units per grid level ("Exposure per Grid");
                              # >= one MT5 min lot so every fill can be hedged.
                              # Unused with DYNAMIC_ALLOCATION on: each level is
                              # then the dynamic cap / GRID_LEVELS
+# DYNAMIC_ALLOCATION only: take that level size ONCE per risk day (the
+# day's first cap) and hold it. A size that follows every cap re-derivation
+# breathes with the equity, and each move of the boundary between two held
+# levels was a sell and a buy at one spread (one level's entry is the next
+# one's take-profit). A cap 10 % below the held size still shrinks it the
+# same day; it never grows before the next day. False = follow every cap.
+GRID_LEVEL_DAILY = True
 # units per resting ORDER, entries and exits alike. The exposure a level holds
 # stays GRID_LEVEL_UNITS; a level bigger than one order fills in several orders
 # of this size, each sized to what the level still lacks (2 units level, 1 units
@@ -111,6 +118,12 @@ CARRY_UPDATE_UTC = "00:05"   # daily update time: "HH:MM" (UTC) or "HH:MM Area/C
 # flat) — a resting quote must never carry a position into the contract's
 # last days. 0 = quote entries to the end.
 CARRY_LAST_ENTRY_DTE = 1.0
+# Close the position on this date and enter nothing from then on:
+# 'YYYY-MM-DD' (00:00 UTC) or 'YYYY-MM-DD HH:MM' (UTC), closed through the
+# LIQUIDATION_EXIT_MODE, the Hedge following. Set it ahead of the contract's
+# first delivery day (CARRY_DELIVERY) — IBKR closes a delivering future itself
+# ahead of delivery, at a time of its choosing. None = off.
+CLOSE_BEFORE_DELIVERY_DATE = None
 
 # Hard caps on the position (base units), each side. Entries are trimmed
 # deepest level first so resting orders can never fill past a cap — set
@@ -165,18 +178,18 @@ SELL_MIN_SPREAD = None
 FUNDING_RATE_MAX_ABS = None
 
 # --- Risk controls: daily limits (engine feature; None = off) ---
-# Measured on the bot's OWN trading, in USD, REALIZED ONLY (the convention
-# of sample_project's get_daily_pnl_usd): the closing fills of both legs
-# plus each funding period that settles. An open drawdown never trips it,
-# and a position carried across midnight books its whole PnL on the day it
-# is closed. A breach latches
+# Measured on the bot's OWN trading, in USD, MARKED TO MARKET: today's
+# realized PnL (closing fills of both legs, settled funding, fees, MT5
+# commission + swap) plus the open position's move since the day began, so
+# an open drawdown trips it; a position carried across midnight counts only
+# today's move. A breach latches
 # CLOSE-ONLY — exits keep quoting, no new entry — until the day rolls; the
 # day's book is persisted with the position state, so a restart resumes the
 # same day instead of starting the count again. The day boundary is the
 # machine's LOCAL midnight (the dashboard's "today"); True = UTC midnight.
 # Scale hint: one round trip of ORDER_VOLUME units moves ~4.4 kUSD of notional
 # through EACH venue, so the two volume caps are also a cap on churn.
-MAX_DAILY_LOSS_USD = None            # e.g. 200 -> close-only below -200 USD today
+MAX_DAILY_LOSS_USD = None            # REQUIRED live: e.g. 200 -> close-only below -200 USD today
 MAX_DAILY_VENUE_VOLUME_USD = None   # e.g. 500000 -> perp notional traded today
 MAX_DAILY_MT5_VOLUME_USD = None      # e.g. 500000 -> MT5 hedge notional traded today
 

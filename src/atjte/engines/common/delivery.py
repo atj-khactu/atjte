@@ -19,7 +19,7 @@ setting ``CARRY_DELIVERY`` overrides the date when one matters.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 
@@ -36,3 +36,22 @@ def first_delivery_day(contract_month) -> Optional[date]:
     while d.weekday() >= 5 or (d.month == 1 and d.day == 1):
         d += timedelta(days=1)
     return d
+
+
+def parse_close_date(value) -> Optional[datetime]:
+    """``CLOSE_BEFORE_DELIVERY_DATE``: ``'2026-11-20'`` (00:00 UTC that day) or
+    ``'2026-11-20 14:30'`` (UTC) -> an aware UTC datetime; None / ``''`` ->
+    None (off). Anything else raises ValueError: a close date that is
+    misread must stop the bot, never silently switch the close off."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "none":
+        return None
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"CLOSE_BEFORE_DELIVERY_DATE {value!r}: write 'YYYY-MM-DD' or "
+                     f"'YYYY-MM-DD HH:MM' (UTC), or None")

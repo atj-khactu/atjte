@@ -26,27 +26,34 @@ tested without a market:
   itself a risk event), while a failed read already blocks entries through
   the engine's ordinary margin gate.
 
-**How the day's PnL is measured** — the convention of
-``sample_project/trading_bot_core`` (``get_daily_pnl_usd``), which this
-project mirrors: **REALIZED ONLY**. A position's PnL counts on the fill that
-closes it, so a position carried across midnight books its whole life PnL
-into the day it is closed; an open drawdown never trips the loss limit.
-Realized comes from the bot's own fills through the two ledgers (perp fills
+**How the day's PnL is measured** — MARK-TO-MARKET (2026-10-19; until then
+realized only, the ``sample_project`` convention): the day's realized PnL
+plus the CHANGE of the open position's unrealized PnL since the day began
+(:func:`open_change`). An open drawdown trips the loss limit as it happens,
+and a position carried across midnight counts only today's move: the
+unrealized it carried in is the day's baseline
+(``DayBook.unrealized_open_usd``), and when it is closed its realized PnL
+(measured from its cost) and that baseline cancel out to the move since
+midnight. Realized comes from the bot's own fills through the two ledgers (perp fills
 as they are booked, MT5 hedge executions as they are sent, each ledger
-seeded from the venue's own position basis) and from each funding period
-that settles (:func:`funding_settled`).
+seeded from the venue's own position basis), each funding period that
+settles (:func:`funding_settled`) and the COSTS of trading (2026-10-19):
+the venue's fee on each of the bot's fills (``fees_venue_usd``, paid =
+positive) and the MT5 commission + broker fee + swap on the bot's own
+hedge deals (``mt5_costs_usd``, as the broker credits them: a charge is
+negative), converted from the account currency at the deal's rate. A
+swap is in the deal that CLOSES a position, so it counts on that day, like
+the position's PnL.
 
-What this measure does NOT include, and the reference's does: MT5 swap and
-commission (the broker books those in the account currency, outside these
-USD/unit ledgers) and any trade on either leg this bot did not make. In
-exchange it costs no venue round-trip — it is accumulated as the bot
-trades. :func:`combined_unrealized` marks the open position for the
-heartbeat, deliberately OUTSIDE the gate.
+What it does NOT include: any trade on either leg this bot did not make.
+It costs no venue round-trip — it is accumulated as the bot trades;
+:func:`combined_unrealized` marks the open position at the bot's own
+prices.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -158,9 +165,8 @@ def combined_unrealized(perp: Ledger, mark: Optional[float],
                         mt5: Ledger, xau_mid: Optional[float],
                         funding_accrued: Optional[float] = 0.0) -> Optional[float]:
     """Both legs marked to market plus the perp's accrued (not yet settled)
-    funding. REPORTING ONLY — the daily loss limit is realized-only (see the
-    module docstring), so this figure is published in the heartbeat and
-    never gates anything. None when either leg holds a position that cannot
+    funding. Its change since the day began is part of the daily loss
+    (:func:`open_change`). None when either leg holds a position that cannot
     be priced (no fresh mark)."""
     a = perp.unrealized(mark)
     b = mt5.unrealized(xau_mid)
@@ -194,6 +200,14 @@ class DayBook:
     realized_venue_usd: float = 0.0
     realized_mt5_usd: float = 0.0
     funding_usd: float = 0.0          # settled funding (negative = paid)
+    fees_venue_usd: float = 0.0       # venue fees on the bot's fills (paid = +)
+    mt5_costs_usd: float = 0.0        # MT5 commission + fee + swap (charged = −)
+    #: the open position's unrealized PnL when the day began (or when it was
+    #: first priced that day): the baseline the day's open move is taken from
+    unrealized_open_usd: Optional[float] = None
+    #: what a '%' limit is a percentage of, taken once per day ("capital",
+    #: "venue", "mt5" -> amount); kept so a restart keeps the day's base
+    bases: dict = field(default_factory=dict)
     venue_volume_usd: float = 0.0    # perp notional traded today
     mt5_volume_usd: float = 0.0       # MT5 hedge notional traded today
     loss_latched: bool = False
@@ -207,6 +221,9 @@ class DayBook:
             return False
         self.date = today
         self.realized_venue_usd = self.realized_mt5_usd = self.funding_usd = 0.0
+        self.fees_venue_usd = self.mt5_costs_usd = 0.0
+        self.unrealized_open_usd = None
+        self.bases = {}
         self.venue_volume_usd = self.mt5_volume_usd = 0.0
         self.loss_latched = False
         self.venue_volume_latched = self.mt5_volume_latched = False
@@ -216,11 +233,18 @@ class DayBook:
     def realized_usd(self) -> float:
         return self.realized_venue_usd + self.realized_mt5_usd + self.funding_usd
 
+    @property
+    def costs_usd(self) -> float:
+        """The day's trading costs as PnL: MT5 commission + swap (as
+        credited) minus the venue's fees."""
+        return self.mt5_costs_usd - self.fees_venue_usd
+
     def pnl(self) -> float:
-        """The day's PnL in USD — realized on both legs plus settled funding,
-        and nothing else (see the module docstring: the open position's mark
-        is reported but never gated, as in ``sample_project``)."""
-        return self.realized_usd
+        """The day's PnL in USD — realized on both legs, settled funding,
+        venue fees, MT5 commission and swap, and nothing else (see the
+        module docstring: the open position's mark is reported but never
+        gated, as in ``sample_project``)."""
+        return self.realized_usd + self.costs_usd
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -231,6 +255,7 @@ class DayBook:
         out = cls()
         out.date = str(d.get("date") or "")
         for k in ("realized_venue_usd", "realized_mt5_usd", "funding_usd",
+                  "fees_venue_usd", "mt5_costs_usd",
                   "venue_volume_usd", "mt5_volume_usd"):
             try:
                 setattr(out, k, float(d.get(k, 0.0) or 0.0))
@@ -238,7 +263,27 @@ class DayBook:
                 pass
         for k in ("loss_latched", "venue_volume_latched", "mt5_volume_latched"):
             setattr(out, k, bool(d.get(k, False)))
+        try:
+            u = d.get("unrealized_open_usd")
+            out.unrealized_open_usd = None if u is None or isinstance(u, bool) else float(u)
+        except (TypeError, ValueError):
+            pass
+        bases = d.get("bases")
+        if isinstance(bases, dict):
+            out.bases = {str(k): float(v) for k, v in bases.items()
+                         if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0}
         return out
+
+
+def open_change(day: DayBook, unrealized: Optional[float]) -> Optional[float]:
+    """The open position's PnL move since the day began: ``unrealized``
+    minus the day's baseline. The first priced reading of a day becomes the
+    baseline (move 0). None when the position cannot be priced now."""
+    if unrealized is None:
+        return None
+    if day.unrealized_open_usd is None:
+        day.unrealized_open_usd = float(unrealized)
+    return float(unrealized) - day.unrealized_open_usd
 
 
 def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
@@ -287,6 +332,28 @@ def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
     return reasons
 
 
+def daily_limits_missing(max_loss, venue_volume, mt5_volume) -> list[str]:
+    """Which daily limits a LIVE bot is missing (empty = all set): the max
+    daily loss, and a volume cap on EACH exchange (``MAX_DAILY_VOLUME_USD``
+    covers both; a per-exchange name overrides it). Off = None, 0, negative
+    or not a number."""
+    def on(v) -> bool:
+        if v is None or isinstance(v, bool):
+            return False
+        try:
+            return float(v) > 0
+        except (TypeError, ValueError):
+            return False
+    out = []
+    if not on(max_loss):
+        out.append("MAX_DAILY_LOSS_USD is off")
+    if not on(venue_volume) or not on(mt5_volume):
+        which = [n for n, v in (("the quote exchange", venue_volume), ("MT5", mt5_volume))
+                 if not on(v)]
+        out.append(f"no daily volume cap on {' and '.join(which)} (MAX_DAILY_VOLUME_USD)")
+    return out
+
+
 # ── the margin de-risk trigger ───────────────────────────────────────────────
 def liq_distance_pct(pos_units: float, mark: Optional[float],
                      liq_price: Optional[float],
@@ -319,13 +386,20 @@ def derisk_reasons(pos_units: float,
                    mt5_level: Optional[float] = None,
                    mt5_level_min: Optional[float] = None,
                    mt5_free: Optional[float] = None,
-                   mt5_free_min: Optional[float] = None) -> list[str]:
+                   mt5_free_min: Optional[float] = None,
+                   excess: Optional[float] = None,
+                   excess_ahead: Optional[float] = None,
+                   excess_min: Optional[float] = None) -> list[str]:
     """Why the position should be EXITED now (empty = no reason).
 
-    Four independent thresholds, each off when its limit is None or <= 0:
+    Five independent thresholds, each off when its limit is None or <= 0:
     venue available margin (USD), the distance from the mark to the
-    perp's liquidation price (% of mark), the MT5 margin level (%) and the
-    MT5 free margin (account currency). Any one of them firing is enough.
+    perp's liquidation price (% of mark), the MT5 margin level (%), the
+    MT5 free margin (account currency) and — IBKR — the account's excess
+    liquidity (equity − maintenance margin: below zero IBKR liquidates),
+    checked now AND at IBKR's look-ahead (``excess_ahead``: the excess at
+    the next margin change, e.g. the overnight requirement). Any one of them
+    firing is enough.
 
     This function is stateless — it answers "is a threshold breached right
     now". The engine's latch on top of it is STICKY UNTIL THE PROCESS
@@ -348,16 +422,21 @@ def derisk_reasons(pos_units: float,
     out: list[str] = []
     if (venue_available_min and venue_available_min > 0 and venue_available is not None
             and venue_available < venue_available_min):
-        out.append(f"venue available margin {venue_available:.0f} USD < "
+        out.append(f"Quote available margin {venue_available:.0f} USD < "
                    f"{float(venue_available_min):g}")
     if (liq_pct_min and liq_pct_min > 0 and liq_pct is not None
             and liq_pct < liq_pct_min):
-        out.append(f"liquidation distance {liq_pct:.2f}% < {float(liq_pct_min):g}%")
+        out.append(f"Quote distance to liquidation {liq_pct:.2f}% < {float(liq_pct_min):g}%")
     if (mt5_level_min and mt5_level_min > 0 and mt5_level is not None
             and mt5_level < mt5_level_min):
-        out.append(f"MT5 margin level {mt5_level:.0f}% < {float(mt5_level_min):g}%")
+        out.append(f"Hedge margin level {mt5_level:.0f}% < {float(mt5_level_min):g}%")
     if (mt5_free_min and mt5_free_min > 0 and mt5_free is not None
             and mt5_free < mt5_free_min):
-        out.append(f"MT5 free margin {mt5_free:.0f} < {float(mt5_free_min):g}")
+        out.append(f"Hedge free margin {mt5_free:.0f} < {float(mt5_free_min):g}")
+    if excess_min and excess_min > 0:
+        for value, when in ((excess, ""), (excess_ahead, " at the next margin change")):
+            if value is not None and value < excess_min:
+                out.append(f"Quote excess liquidity{when} {value:.0f} < {float(excess_min):g}")
+                break
     return out
 

@@ -260,6 +260,29 @@ def dynamic_level_units(cap: Optional[float], levels: int, lot_step: float = 0.0
     return round(unit, 9) if unit >= max(min_size, EPS) else None
 
 
+def held_level_units(kept: Optional[float], fresh: Optional[float],
+                     cap: Optional[float], levels: int,
+                     shrink_pct: float) -> Optional[float]:
+    """The dynamic level size held for the day: ``kept`` (the size taken
+    earlier today) survives every re-derived ``fresh`` one, so equity noise
+    cannot move the boundary between two held levels back and forth — with
+    a take-profit of one step, the deeper level's exit and the shallower
+    level's entry share a spread, and every move of that boundary was one
+    sell and one buy at the same level (EURUSD 2026-10-19: 119k-122k EUR a
+    level, flapping all day). Exceptions: no fresh size (no cap, or below
+    one lot) holds entries as before (None); nothing kept takes ``fresh``;
+    and a cap/levels share more than ``shrink_pct`` % below ``kept`` takes
+    ``fresh`` at once — a falling account still shrinks the grid the same
+    day, and the shrunk size is then the one held."""
+    if fresh is None:
+        return None
+    if kept is None or cap is None or levels < 1:
+        return fresh
+    if cap / levels < kept * (1.0 - float(shrink_pct) / 100.0):
+        return fresh
+    return kept
+
+
 def level_fills(pos: float, levels: int, unit: float) -> tuple[list[float], list[float]]:
     """Split a signed position into per-level filled amounts (waterfall:
     level 1 fills first). Returns ``(long_fills, short_fills)``, each

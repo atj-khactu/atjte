@@ -176,6 +176,37 @@ class AttributionTest(GatewayCase):
             a.cancel("O-NEVER-EXISTED")
         self.assertIn("not on this gateway session", str(cm.exception))
 
+    def _fill_fully(self, cl, order_id):
+        self.session.exec_report(cl, order_id, exec_type="F", ord_status="2",
+                                 extra=[(14, "0.5"), (151, "0"), (32, "0.5"),
+                                        (31, "83000"), (K.TRADE_ID, "TID-9")])
+        deadline = time.time() + 3
+        while order_id in self.gw._by_orderid and time.time() < deadline:
+            time.sleep(0.01)
+
+    def test_cancelling_an_order_that_just_filled_answers_its_final_state(self):
+        """PAXG_PERP 2026-10-19: an exit chunk filled, the bot cancelled the
+        remainder a moment later and was told the order was 'not on this
+        gateway session' — it was, and it had simply finished."""
+        a = self.client("strat_a")
+        self.place(a, "O-AAA")
+        self._fill_fully(self.session.last("D")[11], "O-AAA")
+        before = len(self.session.sent)
+        reply = a.cancel("O-AAA")
+        self.assertEqual(reply["info"]["39"], "2")
+        self.assertEqual(reply["info"]["14"], "0.5")
+        self.assertAlmostEqual(reply["filled"], 0.5)
+        self.assertEqual(len(self.session.sent), before, "a cancel went to the venue")
+
+    def test_another_clients_finished_order_is_still_refused(self):
+        a = self.client("strat_a")
+        b = self.client("strat_b", symbol="PAXG/USD")
+        self.place(a, "O-AAA")
+        self._fill_fully(self.session.last("D")[11], "O-AAA")
+        with self.assertRaises(Exception) as cm:
+            b.cancel("O-AAA")
+        self.assertIn("not on this gateway session", str(cm.exception))
+
 
 class DeadMansSwitchTest(GatewayCase):
     """Kraken's own switch is account-wide and so unusable with more than one

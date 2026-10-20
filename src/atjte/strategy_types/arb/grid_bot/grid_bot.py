@@ -42,7 +42,9 @@ The grid (``atjte.engines.common.grid_model.grid_two_sided``, unit-tested):
 - Level size: ``GRID_LEVEL_UNITS``; with dynamic allocation in force
   (``DYNAMIC_ALLOCATION`` + ``ALLOCATION_PCT``) it is the engine's dynamic
   cap / ``GRID_LEVELS`` instead, rounded to the nearest MT5 lot step and
-  re-derived whenever the cap is (``ALLOCATION_REFRESH_S``) — the full grid
+  taken once per risk day and held (``GRID_LEVEL_DAILY``; it shrinks the
+  same day only when the cap falls ``GRID_LEVEL_SHRINK_PCT`` % below it,
+  and False re-derives it with every cap, ``ALLOCATION_REFRESH_S``) — the full grid
   then spans the allocation to within half a lot step per level, and the
   engine's exposure gate holds the position to that grid (``_exposure_cap``). Before the first cap (or with a share
   below one min lot) no entry rests; exits keep the last level size.
@@ -68,10 +70,10 @@ from pathlib import Path
 from typing import Optional
 
 from atjte.engines.common.grid_model import (                             # noqa: E402
-    DesiredOrder, dynamic_level_units, grid_two_sided, level_fills,
+    DesiredOrder, dynamic_level_units, grid_two_sided, held_level_units, level_fills,
 )
 from atjte.engines.arb.arb_bot import (                                  # noqa: E402
-    POS_EPS, UNIT_LABEL, ArbBot, _dyn_alloc_on, _log,
+    POS_EPS, UNIT_LABEL, ArbBot, _day, _dyn_alloc_on, _log,
 )
 import strategy_settings as _S                                            # noqa: E402
 from strategy_settings import (                                           # noqa: E402
@@ -108,6 +110,15 @@ TAKE_PROFIT_EFFECTIVE = (GRID_STEP if GRID_TAKE_PROFIT is None
 # center - 0.5 and the first sell at center + 0.5, every further level one
 # step beyond: no step skipped around the center (grid_model.grid_two_sided)
 GRID_FIRST_OFFSET = getattr(_S, "GRID_FIRST_OFFSET", None)
+# dynamic allocation: the level size is taken ONCE per risk day (the day's
+# first cap) and held, instead of following every cap re-derivation — a
+# size that breathes with the equity moves the boundary between two held
+# levels, and each move was a sell and a buy at one spread (S2's entry is
+# S3's take-profit). False = re-derived with every cap (the old behaviour).
+GRID_LEVEL_DAILY = bool(getattr(_S, "GRID_LEVEL_DAILY", True))
+#: a cap/levels share this % below the held size shrinks the level the same
+#: day (a falling account must still shrink the grid); it never grows intraday
+GRID_LEVEL_SHRINK_PCT = 10.0
 
 
 def _direction_allows(o) -> bool:
@@ -206,17 +217,23 @@ class GridBot(ArbBot):
     _dyn_level: Optional[float] = None
     _dyn_level_cap: Optional[float] = None
     _dyn_level_last: Optional[float] = None
+    #: the risk day the held level size belongs to (GRID_LEVEL_DAILY)
+    _dyn_level_day: Optional[str] = None
 
     # ── level size ───────────────────────────────────────────────────────────
     def _level_units(self) -> Optional[float]:
         """Units per grid level for NEW entries: ``GRID_LEVEL_UNITS``, or
         under dynamic allocation the cap / ``GRID_LEVELS`` (the nearest MT5
         lot step, the venue's precision). None = no dynamic size yet (no cap, or a
-        share below one min lot / the venue minimum): entries held."""
+        share below one min lot / the venue minimum): entries held. With
+        ``GRID_LEVEL_DAILY`` the size is held for the risk day
+        (:func:`held_level_units`): it re-derives at the day roll, or the
+        same day only when the cap falls ``GRID_LEVEL_SHRINK_PCT`` % below it."""
         if not _dyn_alloc_on():
             return GRID_LEVEL_UNITS
         cap = getattr(self, "dyn_cap_units", None)
-        if cap == self._dyn_level_cap:
+        day = _day() if GRID_LEVEL_DAILY else None
+        if cap == self._dyn_level_cap and day == self._dyn_level_day:
             return self._dyn_level
         self._dyn_level_cap = cap
         lot = (getattr(self, "volume_step", 0.0) or 0.0) * (getattr(self, "contract_size", 0.0) or 0.0)
@@ -227,9 +244,15 @@ class GridBot(ArbBot):
             unit = self.venue.amount_to_precision(unit)
             if unit < floor:
                 unit = None
+        if GRID_LEVEL_DAILY:
+            kept = self._dyn_level if self._dyn_level_day == day else None
+            unit = held_level_units(kept, unit, cap, GRID_LEVELS, GRID_LEVEL_SHRINK_PCT)
+        self._dyn_level_day = day
         if unit != self._dyn_level and cap is not None:
             _log(f"grid level size: {unit:g} {UNIT_LABEL} = dynamic cap {cap:g} / "
-                 f"{GRID_LEVELS} levels" if unit is not None else
+                 f"{GRID_LEVELS} levels"
+                 + (f" (held for {day})" if GRID_LEVEL_DAILY else "")
+                 if unit is not None else
                  f"WARNING: grid level size: dynamic cap {cap:g} {UNIT_LABEL} / "
                  f"{GRID_LEVELS} levels is below one order / MT5 min lot "
                  f"({floor:g}) — no entries until the allocation grows")
@@ -350,6 +373,8 @@ class GridBot(ArbBot):
             "step_usd": GRID_STEP, "levels": GRID_LEVELS,
             "level_units": unit, "center_usd": GRID_CENTER,
             "level_units_dynamic": _dyn_alloc_on(),
+            # the risk day the dynamic size is held for (None = not held)
+            "level_units_day": self._dyn_level_day if _dyn_alloc_on() else None,
             "order_volume_units": self._order_volume(unit),
             "take_profit_usd": TAKE_PROFIT_EFFECTIVE,
             "first_offset_usd": GRID_STEP - _shift(),

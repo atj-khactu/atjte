@@ -109,6 +109,10 @@ class Venue:
         self.ufunding: Optional[float] = None
         self.liq_px: Optional[float] = None
         self.available_margin: Optional[float] = None
+        #: IBKR: equity − maintenance margin (below 0 IBKR liquidates), now and
+        #: at its look-ahead (the next margin change); None elsewhere
+        self.excess_liquidity: Optional[float] = None
+        self.excess_liquidity_ahead: Optional[float] = None
         self.margin_equity: Optional[float] = None
         self.portfolio_value: Optional[float] = None
         self.initial_margin: Optional[float] = None
@@ -480,6 +484,8 @@ class Venue:
         # quote (an EUR MT5 account) converted the figures above; these say so
         self.account_ccy = str(flex.get("accountCurrency") or "") or None
         self.account_usd_rate = f("accountUsdRate")
+        self.excess_liquidity = f("excessLiquidity")
+        self.excess_liquidity_ahead = f("lookAheadExcessLiquidity")
 
     def _perp_dex_params(self) -> dict:
         """``{"dex": name}`` for a Hyperliquid HIP-3 perp (a builder-deployed

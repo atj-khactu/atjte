@@ -55,7 +55,8 @@ TABLES: dict[str, str] = {
             missing_from_source INTEGER DEFAULT 0,
             raw TEXT, first_ingested DOUBLE PRECISION, updated DOUBLE PRECISION,
             PRIMARY KEY (venue, trade_id))""",
-    # every MT5 deal on a hedge symbol (account-wide: every magic), forever
+    # every MT5 deal on a hedge symbol (account-wide: every magic), forever —
+    # and an MT5 QUOTE leg's (raw kind 'venue_deal', ticket 'quote:<n>')
     "deals": """
         CREATE TABLE IF NOT EXISTS deals (
             ticket VARCHAR(64) PRIMARY KEY,

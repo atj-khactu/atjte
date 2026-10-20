@@ -48,6 +48,8 @@ from .mt5_gateway import MT5GatewayClient
 #: how long connect() waits between attach attempts, and how often it says so
 ATTACH_POLL_S = 5.0
 ATTACH_LOG_EVERY_S = 30.0
+#: a tick this far off a half hour lags, and gives no clock offset
+SRV_OFFSET_TOL_S = 120.0
 
 
 class MT5Exchange(ccxt.Exchange):
@@ -100,26 +102,33 @@ class MT5VenueClient(GatewayConnector):
     #: applied and not used to judge an entry's margin
     broker_margin = True
     venue_label = "MT5 quote"
+    #: the terminal books each position's result (``profit`` on its deals):
+    #: the report records them and the venue leg's realized PnL is read off
+    #: them (:meth:`history_deals`)
+    books_venue_deals = True
     NETWORKS = ("mainnet", "live", "demo")
     TOKEN_NAME = "mt5_gateway_token"
     DEFAULT_GATEWAY_PORT = 5620
 
     def __init__(self, *args: Any, magic: int = 0, deviation: int = 20,
-                 comment: str = "", fx_symbol: str = "", **kwargs: Any) -> None:
+                 comment: Optional[str] = None, fx_symbol: str = "", **kwargs: Any) -> None:
         """``magic``: this bot's magic on THIS terminal (the gateway stamps
         it on every order and lets the bot close only its own tickets).
         ``fx_symbol``: the terminal's symbol that converts the account
         currency into the market's quote currency (``EURUSD.i`` for an EUR
-        account quoting USD); unneeded when they are the same."""
+        account quoting USD); unneeded when they are the same.
+        ``comment``: the orders' MT5 comment, sent as given ("" = none);
+        not given = "atjte quote"."""
         if int(magic or 0) <= 0:
             raise ValueError("MT5VenueClient needs VENUE_CLIENT_OPTIONS['magic'] — the "
                              "bot's magic on the quote terminal")
         self.magic = int(magic)
         self.deviation = int(deviation)
-        self.comment = str(comment or "")[:31]
+        self.comment = "atjte quote" if comment is None else str(comment)[:31]
         self.fx_symbol = str(fx_symbol or "")
         self._orders: dict[str, Order] = {}
         self._fx: Optional[float] = None
+        self._srv_off: Optional[float] = None
         super().__init__(*args, **kwargs)
 
     # ── the lease: an MT5 gateway client, not the venue-gateway wire ────────
@@ -259,14 +268,44 @@ class MT5VenueClient(GatewayConnector):
     def _server_offset_s(self) -> float:
         """The broker clock's offset from UTC, from the last tick (MT5
         stamps ticks in broker time), rounded to the half hour."""
+        off = self.server_offset_s()
+        return 0.0 if off is None else off
+
+    def server_offset_s(self) -> Optional[float]:
+        """The broker clock's offset from UTC, or None while no LIVE tick
+        gives it: a tick more than ``SRV_OFFSET_TOL_S`` off a half hour
+        lags (a session break) and would mis-key the deal history. The
+        last good offset is kept for the quiet hours."""
         try:
             t = self.gateway.get_ticker(self.symbol)
             ms = (t.raw or {}).get("time_msc") if isinstance(t.raw, dict) else None
             if ms:
-                return round((float(ms) / 1000.0 - time.time()) / 1800.0) * 1800.0
+                tick, now = float(ms) / 1000.0, time.time()
+                off = round((tick - now) / 1800.0) * 1800.0
+                if abs(tick - now - off) < SRV_OFFSET_TOL_S:
+                    self._srv_off = off
         except Exception:                                   # noqa: BLE001
             pass
-        return 0.0
+        return getattr(self, "_srv_off", None)
+
+    # ── history: the broker's own booked results ─────────────────────────────
+    def history_deals(self, frm: datetime, to: datetime) -> list:
+        """The terminal's deals on the symbol between two BROKER-clock
+        bounds (every magic: close-by legs carry magic 0) — the raw dicts
+        :func:`atjte.reporting.deal_record` reads. The venue leg's realized
+        PnL is the ``profit`` the broker booked on them, not a replay of the
+        fills (:meth:`atjte.reporting.Reporter.read_venue_deals`)."""
+        return list(self.gateway.history_deals(frm, to, symbol=self.symbol) or ())
+
+    def account_rate(self) -> Optional[float]:
+        """The account currency in the market's quote currency (1.0 when
+        they are the same; None while the FX symbol has no quote) — what a
+        deal's ``profit`` is multiplied by."""
+        try:
+            ccy = getattr(self.gateway.get_account(), "currency", "") or ""
+        except Exception:                                   # noqa: BLE001
+            return None
+        return self._fx_rate(ccy)
 
     # ── health ───────────────────────────────────────────────────────────────
     @property
@@ -361,7 +400,7 @@ class MT5VenueClient(GatewayConnector):
             raise RuntimeError("read-only lease: no orders")
         o = self.gateway.place_order(symbol or self.symbol, side, float(amount),
                                      OrderType.MARKET, deviation=self.deviation,
-                                     comment=self.comment or "atjte quote")
+                                     comment=self.comment)
         raw = o.raw if isinstance(o.raw, dict) else {}
         px = raw.get("price") or None
         out = Order(exchange=self.name, order_id=str(o.order_id or raw.get("order") or ""),

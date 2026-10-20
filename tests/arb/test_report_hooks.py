@@ -104,7 +104,10 @@ class ReportHooksTest(unittest.TestCase):
         rec.rest_cum = 0.4
         bot._book(rec, source="poll")          # nothing new to book: no record
         rec.rest_cum = 1.0
-        bot._book(rec, source="poll")          # the poll books the rest
+        bot._book(rec, source="poll")          # the poll books the rest ...
+        self.assertEqual(len(R.read_jsonl(bot.reporter.trades_file)), 1)
+        # ... and reports it once no venue trade has covered it in time
+        bot._flush_inferred(time.time() + pb.INFERRED_FILL_WAIT_S + 1)
         rows = R.read_jsonl(bot.reporter.trades_file)
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["id"], "t-1")
@@ -168,16 +171,18 @@ class ReportHooksTest(unittest.TestCase):
         """The poll inferred 0.6 of the order; the venue's trade for all 1.0
         arrives after. The replay skips the inferred record, so the venue's
         must be the whole 1.0 -- recorded as the 0.4 left to book, USDJPY
-        lost 89 units and booked phantom PnL."""
+        lost 89 units and booked phantom PnL. The trade covers the inferred
+        0.6, so the guess is never reported (PAXG_PERP 2026-10-19)."""
         bot = bot_with_reporter(self.tmp)
         rec = T.resting(amount=1.0)
         bot.orders[rec.key] = rec
         rec.rest_cum = 0.6
         bot._book(rec, source="poll")
         self._ws(bot, "t-9", 1.0)
+        bot._flush_inferred(time.time() + pb.INFERRED_FILL_WAIT_S + 1)
         rows = R.read_jsonl(bot.reporter.trades_file)
         self.assertEqual([(r["id"], r["amount"], bool(r.get("inferred"))) for r in rows],
-                         [("o1:poll:0.60000000", 0.6, True), ("t-9", 1.0, False)])
+                         [("t-9", 1.0, False)])
         self.assertAlmostEqual(bot.pos_units, -1.0)          # the position: once
 
     def test_a_venue_trade_for_a_settled_order_is_recorded(self):
