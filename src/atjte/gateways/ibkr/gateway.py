@@ -120,14 +120,24 @@ class IbkrGateway(HlGateway):
     def account_snapshot(self) -> dict:
         """The CCXT-shaped snapshot, plus IB's own account figures: equity is
         NetLiquidation, margin the summary's available funds and initial
-        requirement (the same read the connector's ``flex_account`` makes)."""
+        requirement (the same read the connector's ``flex_account`` makes) —
+        in USD, converted from the account's base currency at TWS's own rate,
+        and ``currency`` says so. Until 2026-10-26 they were the BASE
+        currency's figures unlabelled, and the panel added a EUR account's
+        equity to the NAV as USD (12 % short). No rate = None, never base
+        figures passed off as USD; the balances stay in the base currency."""
         snap = super().account_snapshot()
+        args = {"currency": "USD"}
         for acc in snap["accounts"]:
             a = acc["account"]
             try:
-                s = self._reads.get(a, ACCOUNT_SUMMARY, {},
-                                    lambda a=a: self.up.read(a, ACCOUNT_SUMMARY, {}))
+                s = self._reads.get(a, ACCOUNT_SUMMARY, args,
+                                    lambda a=a: self.up.read(a, ACCOUNT_SUMMARY, args))
+                acc["currency"] = s.get("currency")
+                acc["base_currency"] = s.get("baseCurrency")
+                acc["fx_rate"] = s.get("fxRate")
                 acc["equity"] = s.get("portfolioValue")
+                acc["unrealized"] = s.get("totalUnrealized")
                 acc["margin"] = {"used": s.get("initialMargin"),
                                  "free": s.get("availableMargin"), "level": None}
             except Exception as e:                          # noqa: BLE001

@@ -108,7 +108,9 @@ class FakeIbkr:
         if what == "account_summary":
             return {"availableMargin": 40000.0, "initialMargin": 2600.0,
                     "maintenanceMargin": 2400.0, "marginEquity": 50000.0,
-                    "portfolioValue": 50000.0, "totalUnrealized": 120.0, "pnl": 30.0}
+                    "portfolioValue": 50000.0, "totalUnrealized": 120.0, "pnl": 30.0,
+                    "currency": args.get("currency") or "USD", "baseCurrency": "USD",
+                    "fxRate": 1.0}
         if what == "fetch_balance":
             return {"free": {"USD": 40000.0}, "used": {"USD": 2600.0},
                     "total": {"USD": 50000.0}}
@@ -210,6 +212,14 @@ class GatewayTest(GatewayCase):
             c.place("buy", 1, 2649.0, post_only=True, reduce_only=True)
         o = c.place("sell", 2, 2651.0, post_only=True, reduce_only=True)
         self.assertEqual(o["status"], "open")
+
+    def test_the_account_snapshot_is_in_usd_and_says_so(self):
+        """2026-10-26: the snapshot published a EUR account's figures
+        unlabelled and the panel's NAV took them as USD. It asks for USD."""
+        acc = self.gw.account_snapshot()["accounts"][0]
+        self.assertIn(("main", "account_summary", {"currency": "USD"}), self.up.reads)
+        self.assertEqual((acc["currency"], acc["equity"], acc["unrealized"]),
+                         ("USD", 50000.0, 120.0))
 
     def test_no_account_switch_is_ever_armed(self):
         c = self.lease()
@@ -741,6 +751,51 @@ class UpstreamTest(unittest.TestCase):
         s = self.up.read("main", "account_summary", {"currency": "USD"})
         self.assertIsNone(s["availableMargin"])               # never EUR passed off as USD
         self.assertIsNone(s["marginEquity"])
+
+    def test_unrealized_falls_back_to_the_portfolio(self):
+        """2026-10-26: TWS sent no $LEDGER UnrealizedPnL, so the account's
+        unrealized was None. The portfolio's own P/L (the contract's USD at
+        TWS's rate) stands in — and only while every position has an item."""
+        from types import SimpleNamespace as NS
+        from ib_async import AccountValue, Position
+        def av(tag, value, currency):
+            return AccountValue(ACCOUNT_ID, tag, value, currency, "")
+        self.ib.summary = [av("NetLiquidation", "68794.02", "EUR")]
+        self.ib.values = [av("ExchangeRate", "1.00", "EUR"), av("ExchangeRate", "0.894", "USD")]
+        self.ib.accountValues = lambda account="": list(self.ib.values)
+        c = self.up._contracts[MGC]
+        self.ib._positions = [Position(ACCOUNT_ID, c, 12.0, 40833.36)]
+        s = self.up.read("main", "account_summary", {"currency": "USD"})
+        self.assertIsNone(s["totalUnrealized"])          # no portfolio item: unknown
+        self.ib.portfolio = lambda account="": [NS(contract=c, unrealizedPNL=5379.2,
+                                                   marketPrice=4531.6)]
+        s = self.up.read("main", "account_summary", {"currency": "USD"})
+        self.assertAlmostEqual(s["totalUnrealized"], 5379.2, places=6)
+        self.assertAlmostEqual(s["portfolioValue"], 68794.02 / 0.894, places=4)
+        s = self.up.read("main", "account_summary", {})
+        self.assertAlmostEqual(s["totalUnrealized"], 5379.2 * 0.894, places=6)   # EUR
+        self.ib._positions = []
+        self.assertEqual(self.up.read("main", "account_summary", {})["totalUnrealized"], 0.0)
+
+    def test_a_multi_account_login_subscribes_the_portfolio(self):
+        """ib_async subscribes the portfolio at connect only on a one-account
+        login; with several, the upstream asks for its account's itself."""
+        asked = []
+
+        async def connect(*_a, **_k):
+            return None
+
+        async def updates(account):
+            asked.append(account)
+        self.ib.connectAsync = connect
+        self.ib.reqAccountUpdatesAsync = updates
+        self.ib.reqMarketDataType = lambda _t: None
+        self.up._backfill_executions = lambda: asyncio.sleep(0)
+        for managed, want in (([ACCOUNT_ID], []), ([ACCOUNT_ID, "U999"], [ACCOUNT_ID])):
+            asked.clear()
+            self.ib.managedAccounts = lambda m=managed: list(m)
+            asyncio.run(self.up._connect())
+            self.assertEqual(asked, want, managed)
 
     def test_a_position_of_exactly_one_contract_is_a_position(self):
         """2026-10-09: _num() takes -1 for IB's "unset", so a position of

@@ -332,8 +332,26 @@ class IbkrUpstream:
                                f"the account(s) named by {', '.join(env_name(m) for m in missing)}"
                                f" ({len(managed)} account(s) on this login)")
         self.ib.reqMarketDataType(1)            # live: never quote off delayed data
+        if len(managed) > 1:
+            await self._subscribe_portfolio()
         self._connected_once = True
         await self._backfill_executions()
+
+    async def _subscribe_portfolio(self) -> None:
+        """The portfolio (each position's mark and unrealized P/L) for our
+        account. ib_async subscribes it at connect only on a login with ONE
+        account; on a login with several it subscribes the account VALUES
+        alone (``reqAccountUpdatesMulti``), so ``ib.portfolio`` stayed empty
+        and every position read with no mark and no unrealized (2026-10-26).
+        TWS keeps one such subscription per session: the first account."""
+        aid = next(iter(self._accounts.values()), "")
+        if not aid:
+            return
+        try:
+            await asyncio.wait_for(self.ib.reqAccountUpdatesAsync(aid), CONNECT_TIMEOUT_S)
+        except Exception as e:                              # noqa: BLE001
+            self._log(f"ib upstream: the portfolio subscription did not complete "
+                      f"({type(e).__name__}: {e}) — positions read without a mark until it does")
 
     async def _backfill_executions(self) -> None:
         """Keep every execution TWS still serves (today's; up to 7 days from
@@ -979,10 +997,14 @@ class IbkrUpstream:
         def g(tag):
             v = s.get(tag, (None, ""))[0]
             return None if v is None or rate is None else v * rate
+        upnl = g("UnrealizedPnL")
+        if upnl is None and rate is not None:
+            base_upnl = self._portfolio_upnl(account, base)
+            upnl = None if base_upnl is None else base_upnl * rate
         return {"availableMargin": g("AvailableFunds"), "initialMargin": g("InitMarginReq"),
                 "initialMarginWithOrders": g("InitMarginReq"),
                 "maintenanceMargin": g("MaintMarginReq"), "marginEquity": g("NetLiquidation"),
-                "portfolioValue": g("NetLiquidation"), "totalUnrealized": g("UnrealizedPnL"),
+                "portfolioValue": g("NetLiquidation"), "totalUnrealized": upnl,
                 "unrealizedFunding": None, "pnl": g("RealizedPnL"),
                 "excessLiquidity": g("ExcessLiquidity"), "cash": g("TotalCashValue"),
                 # the excess at IBKR's NEXT margin change (an overnight requirement,
@@ -992,6 +1014,28 @@ class IbkrUpstream:
                 "cushion": s.get("Cushion", (None, ""))[0],
                 "currency": want or None, "baseCurrency": base or None,
                 "fxRate": rate}
+
+    def _portfolio_upnl(self, account: str, base: str) -> Optional[float]:
+        """The account's unrealized P/L in its BASE currency, summed from the
+        portfolio (each item's own currency at TWS's ExchangeRate) — for when
+        the summary carries no ``UnrealizedPnL`` (it comes with the $LEDGER
+        rows, which TWS does not always send). None while a position has no
+        portfolio item or a currency no rate; no positions = 0."""
+        aid = self.account_id(account)
+        held = {p.contract.conId for p in self.ib.positions(aid) or [] if _qty(p.position)}
+        items = {p.contract.conId: p for p in self.ib.portfolio(aid) or []}
+        if not held <= set(items):
+            return None
+        total = 0.0
+        for cid in held:
+            p = items[cid]
+            v = _qty(p.unrealizedPNL)
+            ccy = str(getattr(p.contract, "currency", "") or "")
+            per = 1.0 if ccy == base else (self._base_per(account, ccy) if ccy else None)
+            if v is None or per is None:
+                return None
+            total += v * per
+        return total
 
     def _positions(self, account: str, symbols: Optional[list]) -> list[dict]:
         aid = self.account_id(account)
