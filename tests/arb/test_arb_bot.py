@@ -104,6 +104,7 @@ class StubVenue:
         self.price_tick = 0.1
         self.amount_step = 0.001
         self.amount_min = 0.001
+        self.amount_max = None
         self.im_rate = 0.02 if kind == "swap" else 0.0
         self.creds_source = "test"
         self._order = order
@@ -276,6 +277,11 @@ def make_bot(logs=None):
     bot.hedger = None                       # HEDGE_MODE = 'parity' unless a test builds one
     bot.hedge_refusal = None
     bot.volume_max = 0.0
+    # the pre-place check: MT5 healthy as of now, no volume limit unless a
+    # test sets one
+    bot.mt5_ok, bot._mt5_health_t = True, 1e12
+    bot.volume_limit, bot.mt5_netting = 0.0, False
+    bot.mt5_foreign, bot._mt5_foreign_t, bot._mt5_foreign_err = None, 0.0, None
     bot._hedge_results = queue.Queue()
     bot._mt5_settle_until = 0.0
     bot._mt5_settle_prev = 0.0
@@ -1410,6 +1416,124 @@ class PlaceTest(unittest.TestCase):
             RuntimeError("INSUFFICIENT_MARGIN"))
         bot._place("x1", self._t("exit"))
         self.assertEqual(bot._entry_pause_until, 0.0)
+
+
+class PreplaceHedgeCheckTest(unittest.TestCase):
+    """2026-10-26: a member's bot filled an entry on Hyperliquid that MT5's
+    volume limit then refused to hedge — one-legged until reset. The order
+    is now checked against the hedge BEFORE it is sent."""
+
+    def setUp(self):
+        self._live = (pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY)
+        pb.LIVE_TRADING = True
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = None, 1.0
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = self._live
+
+    def _t(self, purpose="entry", side="buy", amount=1.0):
+        return {"side": side, "purpose": purpose, "level_index": 1, "level": 0.5,
+                "price": 4450.0, "amount": amount}
+
+    def _bot(self, logs, limit=1.0, foreign=(0.0, 0.0), position=0.0):
+        """1 lot hedges 1 unit; MT5 allows ``limit`` lots per direction."""
+        bot = make_bot(logs)
+        bot.venue = StubVenue(StubExchange(), available_margin=1e9)
+        bot._venue_margin_t = 1e12
+        bot.contract_size = 1.0
+        bot.volume_limit = limit
+        bot.venue_pos_units = position
+        bot.mt5_foreign = pb.Mt5Book(*foreign)
+        bot._mt5_foreign_t = time.time()
+        return bot
+
+    def test_an_entry_within_the_limit_goes_out(self):
+        bot = self._bot([], limit=1.0)
+        bot._place("e1", self._t(amount=1.0))
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_an_entry_whose_hedge_passes_the_limit_is_not_sent(self):
+        logs = []
+        bot = self._bot(logs, limit=1.0, position=0.5)     # hedge short 0.5 lot
+        bot._place("e1", self._t(amount=0.6))               # -> short 1.1 lot
+        self.assertEqual(bot.venue.placed, [])
+        self.assertTrue(any("volume limit of 1 lot" in m for m in logs), logs)
+
+    def test_entries_already_resting_on_the_side_count(self):
+        bot = self._bot([], limit=1.0)
+        bot.orders["e0"] = resting("e0", amount=0.7, side="buy", purpose="entry")
+        bot._place("e1", self._t(amount=0.4))
+        self.assertEqual(bot.venue.placed, [])
+        bot._place("e1", self._t(amount=0.3))
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_other_magics_share_the_limit_on_a_hedging_account(self):
+        bot = self._bot([], limit=1.0, foreign=(0.0, 0.8))  # 0.8 lot short elsewhere
+        bot._place("e1", self._t(side="buy", amount=0.3))   # our hedge: short
+        self.assertEqual(bot.venue.placed, [])
+        bot._place("e2", self._t(side="sell", amount=0.9))  # our hedge: long, its own side
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_a_netting_account_counts_the_net(self):
+        bot = self._bot([], limit=1.0, foreign=(0.8, 0.0))
+        bot.mt5_netting = True
+        bot._place("e1", self._t(side="buy", amount=1.5))   # net 0.8 - 1.5 = -0.7
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_exits_pass_at_any_limit(self):
+        bot = self._bot([], limit=1.0, position=5.0)
+        bot._place("x1", self._t(purpose="exit", side="sell", amount=1.0))
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_no_limit_means_no_check(self):
+        bot = self._bot([], limit=0.0)
+        bot.mt5_foreign = None
+        bot._place("e1", self._t(amount=50.0))
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_an_unread_or_stale_mt5_book_holds_entries(self):
+        bot = self._bot([], limit=1.0)
+        bot._mt5_foreign_err = "TimeoutError: no answer"
+        bot._place("e1", self._t(amount=0.1))
+        self.assertEqual(bot.venue.placed, [])
+        bot._mt5_foreign_err, bot._mt5_foreign_t = None, time.time() - 60
+        bot._place("e1", self._t(amount=0.1))
+        self.assertEqual(bot.venue.placed, [])
+
+    def test_the_venue_max_order_is_respected(self):
+        bot = self._bot([], limit=0.0)
+        bot.venue.amount_max = 2.0
+        bot._place("e1", self._t(amount=2.5))
+        self.assertEqual(bot.venue.placed, [])
+        bot._place("e1", self._t(amount=2.0))
+        self.assertEqual(len(bot.venue.placed), 1)
+
+    def test_mt5_down_holds_every_order_and_a_stale_verdict_is_refreshed(self):
+        logs = []
+        bot = self._bot(logs, limit=0.0)
+        bot._mt5_health_t = 0.0                           # older than the max age
+        bot._retire_all_quotes = lambda why: None
+        bot._fresh_target = lambda key, t: t              # pricing is not under test
+        bot.mt5 = types.SimpleNamespace(health=lambda: {
+            "ok": False, "reachable": True, "reasons": ["Algo Trading is disabled"]})
+        bot._place("x1", self._t(purpose="exit", side="sell"))
+        self.assertEqual(bot.venue.placed, [])
+        self.assertTrue(any("MT5 cannot hedge (Algo Trading is disabled)" in m
+                            for m in logs), logs)
+
+    def test_resting_entries_past_a_limit_taken_since_are_cancelled(self):
+        logs = []
+        bot = self._bot(logs, limit=1.0)
+        bot.orders["e0"] = resting("e0", amount=0.7, side="buy", purpose="entry")
+        bot.orders["x0"] = resting("x0", amount=0.7, side="sell", purpose="exit")
+        settled = []
+        bot._settle = lambda k, cancel_first, reason, defer_read=False: settled.append(k)
+        other = types.SimpleNamespace(raw={"magic": 999}, size=0.5,
+                                      side=pb.PositionSide.SHORT, entry_price=1.0)
+        bot.mt5 = types.SimpleNamespace(get_positions=lambda sym: [other])
+        bot._refresh_mt5_foreign(time.time(), force=True)
+        self.assertEqual(settled, ["e0"])                 # 0.5 + 0.7 > 1; the exit stays
+        self.assertAlmostEqual(bot.mt5_foreign.foreign_short, 0.5)
 
 
 class PlaceMarginOffThePathTest(unittest.TestCase):

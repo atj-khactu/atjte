@@ -13,12 +13,14 @@ nothing; the Reporter stamps marks only on a fill booked live.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from atjte import reporting
 from atjte.reportdb import daemon as D
@@ -149,6 +151,45 @@ class IngestTest(Case):
         r = self.ing.run_pass()
         self.assertTrue(r.rereads)
         self.assertEqual(self.db.counts()["fills"], 3)
+        self.assertEqual(self.db.scalar("SELECT fee_usd FROM fills WHERE trade_id = 't1'"), 0.07)
+
+    def _settle_mtime(self, age_s: float) -> None:
+        """Give trades.jsonl an mtime ``age_s`` before the ingest clock."""
+        p = self.rep / "trades.jsonl"
+        os.utime(p, (NOW - age_s, NOW - age_s))
+
+    def test_an_untouched_quiet_file_is_not_opened(self):
+        self.write_trades([fill(1), fill(2)])
+        self._settle_mtime(10.0)
+        self.ing.run_pass()
+        # were the file opened, this wrong fingerprint would force a re-read
+        self.db.execute("UPDATE sources SET read_hash = 'x' WHERE kind = 'trades'")
+        with mock.patch("atjte.reportdb.ingest.hashlib.sha1",
+                        side_effect=AssertionError("opened and hashed")):
+            r = self.ing.run_pass()
+        self.assertEqual(r.rereads, [])
+        self.assertEqual(r.fills, 0)
+
+    def test_a_written_file_is_still_fingerprinted(self):
+        self.write_trades([fill(1), fill(2)])
+        self._settle_mtime(10.0)
+        self.ing.run_pass()
+        self.write_trades([fill(1, fee_usd=0.07), fill(2), fill(4)], mode="w")
+        self._settle_mtime(5.0)                    # a later write: a new mtime
+        r = self.ing.run_pass()
+        self.assertTrue(r.rereads)
+        self.assertEqual(self.db.scalar("SELECT fee_usd FROM fills WHERE trade_id = 't1'"), 0.07)
+
+    def test_a_same_size_rewrite_in_the_same_clock_tick_is_caught(self):
+        """Two writes inside one tick of the file system's clock share an
+        mtime: a file written just before the read is never skipped."""
+        self.write_trades([fill(1)])
+        self._settle_mtime(0.5)
+        self.ing.run_pass()
+        self.write_trades([fill(1, fee_usd=0.07)], mode="w")   # same length
+        self._settle_mtime(0.5)                                # same mtime
+        r = self.ing.run_pass()
+        self.assertTrue(r.rereads)
         self.assertEqual(self.db.scalar("SELECT fee_usd FROM fills WHERE trade_id = 't1'"), 0.07)
 
     def test_a_fill_without_a_stamp_takes_the_bar_of_its_minute(self):

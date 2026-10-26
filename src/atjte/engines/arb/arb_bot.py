@@ -584,6 +584,12 @@ MT5_STALE_S = _cfg("MT5_STALE_S")
 MT5_HEALTH_INTERVAL_S = float(_cfg("MT5_HEALTH_INTERVAL_S") or 5.0)
 MT5_HEALTH_RETRY_S = float(_cfg("MT5_HEALTH_RETRY_S") or 1.0)
 MT5_RECONNECT_S = 10.0          # a lost terminal channel is re-opened this often
+#: the pre-place check (_place, atjte.engines.common.hedge_capacity): an order
+#: goes out on an MT5 health verdict at most this old, and the lots the
+#: account's OTHER magics hold on SYMBOL_MT5 are re-read this often (an entry
+#: waits while that read is older than 3x this)
+PREPLACE_HEALTH_MAX_AGE_S = 1.0
+MT5_VOLUME_READ_S = 5.0
 BASIS_TRIGGER = _cfg("BASIS_TRIGGER")
 BASIS_WINDOW_S = _cfg("BASIS_WINDOW_S")
 BASIS_RELEASE = _cfg("BASIS_RELEASE")
@@ -1079,6 +1085,7 @@ def _price_nd(*prices) -> int:
 from ..common.hedge_gate import HEDGE_GATE_MAX_LOTS, hedge_gate_verdict  # noqa: E402,F401
 from ..common.hedge_orders import (IB_PERMANENT_CODES, PERMANENT_RETCODES, HedgeTooLarge,  # noqa: E402
                                    permanent_retcode, send_split)
+from ..common.hedge_capacity import Mt5Book, mt5_limit_breach, venue_amount_breach  # noqa: E402
 
 
 def _classify_order_error(exc: Exception) -> str:
@@ -1331,6 +1338,13 @@ class ArbBot:
         self.volume_min = 0.01
         self.volume_step = 0.01
         self.volume_max = 0.0                  # one MT5 order's cap (0 = none read)
+        #: the symbol's most per direction, every magic, positions + orders
+        #: (MT5's volume_limit; 0 = none) — the pre-place check's MT5 side
+        self.volume_limit = 0.0
+        self.mt5_netting = False               # the hedge account nets positions
+        self.mt5_foreign: Optional[Mt5Book] = None   # other magics' lots, None = unread
+        self._mt5_foreign_t = 0.0
+        self._mt5_foreign_err: Optional[str] = None
         #: the last hedge MT5 refused for the request itself (see _hedge)
         self.hedge_refusal: Optional[dict] = None
 
@@ -1775,6 +1789,14 @@ class ArbBot:
         self.volume_min = specs["volume_min"]
         self.volume_step = specs["volume_step"]
         self.volume_max = float(specs.get("volume_max") or 0.0)
+        self.volume_limit = float((specs.get("raw") or {}).get("volume_limit") or 0.0)
+        try:
+            acct_raw = getattr(self.mt5.get_account(), "raw", None) or {}
+            self.mt5_netting = acct_raw.get("margin_mode") in (0, 1)
+        except Exception as e:                              # noqa: BLE001
+            _log(f"MT5 account mode unread ({type(e).__name__}: {e}) — the volume "
+                 f"limit is counted per direction")
+        self._refresh_mt5_foreign(time.time(), force=True)
         self._resolve_hedge_threshold()      # before the hedger starts
         # a hedge gate worth many MT5 lots leaves that much unhedged, with no
         # error anywhere: warn about it before the hedger thread starts
@@ -1788,7 +1810,13 @@ class ArbBot:
                 + ", ")
              + f"min lot={self.volume_min:g}, step={self.volume_step:g}"
              + (f", max lot={self.volume_max:g} (a bigger hedge is split)"
-                if self.volume_max > 0 else ""))
+                if self.volume_max > 0 else "")
+             + (f", volume limit={self.volume_limit:g} lot per direction"
+                f"{' (net)' if self.mt5_netting else ''} — an entry whose hedge would "
+                f"pass it is not placed" if self.volume_limit > 0 else ""))
+        if self.venue.amount_max:
+            _log(f"{SYMBOL_VENUE}: max order {self.venue.amount_max:g} {UNIT_LABEL} — "
+                 f"a bigger order is not placed")
         if HEDGE_MODE == "event":
             self._start_event_hedger()       # needs the lot specs above
 
@@ -5295,6 +5323,113 @@ class ArbBot:
         self._last_msgs.pop(f"margin_{key}", None)
         return fit
 
+    # ── the pre-place check: can the hedge follow this order? ─────────────────
+    def _preplace_block(self, t: dict) -> Optional[str]:
+        """Why this order must not go out, else None. Every fill is hedged
+        on MT5 the moment it lands, so the order is checked against the
+        HEDGE before the venue sees it (atjte.engines.common.hedge_capacity):
+
+        - every order: MT5 can take a hedge NOW — the terminal's health
+          verdict, refreshed when older than PREPLACE_HEALTH_MAX_AGE_S (the
+          slow tick reads it only every MT5_HEALTH_INTERVAL_S);
+        - an entry: its size within the venue market's maximum order, and
+          the MT5 position it would leave — with every entry already resting
+          on the same side filled too — within the symbol's volume_limit,
+          counted with the account's other magics. Exits reduce both legs
+          and pass."""
+        now = time.time()
+        if now - getattr(self, "_mt5_health_t", 0.0) > PREPLACE_HEALTH_MAX_AGE_S:
+            self._check_mt5_health(now, force=True)
+        if not getattr(self, "mt5_ok", True):
+            why = "; ".join((getattr(self, "mt5_health", None) or {}).get("reasons") or [])
+            return f"MT5 cannot hedge ({why or 'unhealthy'})"
+        if t["purpose"] != "entry" or not LIVE_TRADING:
+            return None
+        if venue_amount_breach(t["amount"], self.venue.amount_max):
+            return (f"above {SYMBOL_VENUE}'s max order {self.venue.amount_max:g} "
+                    f"{UNIT_LABEL}")
+        if self.volume_limit <= 0:
+            return None
+        if self._mt5_foreign_err is not None or self.mt5_foreign is None:
+            return (f"cannot check {SYMBOL_MT5}'s volume limit: the MT5 positions "
+                    f"read failed ({self._mt5_foreign_err or 'not read yet'})")
+        if now - self._mt5_foreign_t > 3 * MT5_VOLUME_READ_S:
+            return (f"cannot check {SYMBOL_MT5}'s volume limit: the MT5 positions "
+                    f"read is {now - self._mt5_foreign_t:.0f}s old")
+        resting = self._resting_entry_units(t["side"])
+        breach = self._mt5_volume_breach(t["side"], resting + t["amount"])
+        if breach is None:
+            return None
+        after, limit = breach
+        return (f"its hedge would take {SYMBOL_MT5} to {after:g} lot, past the broker's "
+                f"volume limit of {limit:g} lot per direction"
+                + (f" ({resting:g} {UNIT_LABEL} of entries already resting on this side)"
+                   if resting > POS_EPS else "")
+                + " — an unhedgeable fill is never risked")
+
+    def _resting_entry_units(self, side: str) -> float:
+        """What the entries resting on ``side`` would still add if they filled."""
+        return sum(max(r.amount - r.booked, 0.0) for r in self.orders.values()
+                   if r.purpose == "entry" and r.side == side)
+
+    def _mt5_volume_breach(self, side: str, units: float) -> Optional[tuple[float, float]]:
+        """``(lots after, limit)`` when ``units`` more filled on ``side`` would
+        take the hedge past the symbol's volume_limit, else None. The bot's
+        hedge book is its parity target, -(venue exposure), in lots."""
+        sign = 1.0 if side == "buy" else -1.0
+        exposure = self._venue_exposure_units()
+        own_now = -exposure / self.contract_size
+        own_after = -(exposure + sign * units) / self.contract_size
+        return mt5_limit_breach(self.volume_limit, own_now, own_after,
+                                self.mt5_foreign, self.mt5_netting)
+
+    def _retire_unhedgeable_entries(self) -> None:
+        """After each read: the entries ALREADY resting on a side whose fills
+        together would now pass the volume limit (another strategy took the
+        room since they were placed) are cancelled; _place re-admits as many
+        as fit, one at a time."""
+        if not LIVE_TRADING:
+            return
+        for side in ("buy", "sell"):
+            resting = self._resting_entry_units(side)
+            if resting <= POS_EPS:
+                continue
+            breach = self._mt5_volume_breach(side, resting)
+            if breach is None:
+                continue
+            keys = [k for k, r in self.orders.items() if r.purpose == "entry" and r.side == side]
+            _log(f"{side} entries ({resting:g} {UNIT_LABEL} resting) would take {SYMBOL_MT5} "
+                 f"to {breach[0]:g} lot, past the broker's volume limit of {breach[1]:g} — "
+                 f"cancelled: {', '.join(keys)}")
+            for k in keys:
+                self._settle(k, cancel_first=True, reason="volume limit", defer_read=True)
+
+    def _refresh_mt5_foreign(self, now: float, force: bool = False) -> None:
+        """Every MT5_VOLUME_READ_S, when the symbol has a volume limit: the
+        lots the account's OTHER magics hold on SYMBOL_MT5, per direction —
+        what this bot's hedge shares the broker's limit with. A failed read
+        is kept as the reason entries wait (_preplace_block)."""
+        if self.volume_limit <= 0 or (not force and now - self._mt5_foreign_t < MT5_VOLUME_READ_S):
+            return
+        try:
+            book = Mt5Book()
+            for p in self.mt5.get_positions(SYMBOL_MT5) or ():
+                if _book_position(p):
+                    continue
+                if p.side is PositionSide.LONG:
+                    book.foreign_long += float(p.size)
+                else:
+                    book.foreign_short += float(p.size)
+        except Exception as e:                              # noqa: BLE001
+            self._mt5_foreign_err = f"{type(e).__name__}: {e}"
+            self._log_once("mt5_foreign", f"warning: MT5 positions read for the volume "
+                                          f"limit failed: {self._mt5_foreign_err} — "
+                                          f"entries wait")
+            return
+        self.mt5_foreign, self._mt5_foreign_t, self._mt5_foreign_err = book, now, None
+        self._last_msgs.pop("mt5_foreign", None)
+        self._retire_unhedgeable_entries()
+
     def _pause_entries(self, t: dict) -> None:
         """The venue refused an entry for insufficient margin: place no new
         entries for MARGIN_REJECT_PAUSE_S. Exits reduce and keep going."""
@@ -5312,6 +5447,11 @@ class ArbBot:
         t = self._fresh_target(key, {**t, "amount": amount})   # priced as of NOW
         if t is None:
             return
+        why = self._preplace_block(t)
+        if why is not None:
+            self._log_once(f"preplace_{key}", f"skip {key} {t['amount']:g} {UNIT_LABEL}: {why}")
+            return
+        self._last_msgs.pop(f"preplace_{key}", None)
         reduce_only = bool(REDUCE_ONLY_EXITS and t["purpose"] == "exit"
                            and self.venue.supports_reduce_only)
         try:
@@ -5943,6 +6083,7 @@ class ArbBot:
         if self.hedger is not None:
             self._phase("event_hedges", self._drain_event_hedges)   # book what it sent
         self._phase("mt5_settle", self._settle_mt5_book, now)   # after a hedge: pair + cache
+        self._phase("mt5_volume", self._refresh_mt5_foreign, now)   # the pre-place check's read
         self._phase("fx", self._refresh_fx, now)   # hourly: may re-size the hedge
         if self._hedge_dirty:
             self._phase("hedge", self._hedge)     # single attempt — a broken
@@ -6442,6 +6583,10 @@ class ArbBot:
                                if k not in ("t", "until")}
                               if self.hedge_refusal else None),
             "mt5_volume_max": self.volume_max or None,
+            "mt5_volume_limit": self.volume_limit or None,
+            "mt5_foreign_lots": ({"long": self.mt5_foreign.foreign_long,
+                                  "short": self.mt5_foreign.foreign_short}
+                                 if self.mt5_foreign is not None else None),
             "mt5_adopt_magics": list(MT5_ADOPT_MAGICS),
             # can the terminal take a hedge right now (and why not)
             "mt5_health": getattr(self, "mt5_health", None),

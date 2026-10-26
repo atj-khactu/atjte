@@ -14,8 +14,10 @@ before that point is fingerprinted, so a file rewritten underneath the
 reader (``atjte backfill`` rewrites ``trades.jsonl``; the bot prunes
 ``bars.jsonl``) is noticed — even an edit that keeps every length, a fee
 corrected from 0.05 to 0.07 — and read again from the start. Every row is
-keyed, so a second read corrects and never duplicates. (The report files
-are small: hashing what was read costs a pass next to nothing.)
+keyed, so a second read corrects and never duplicates. A file whose size
+and mtime are what the last read recorded is not opened at all: the
+fingerprint (a read and a hash of the whole file) is paid only after a
+write, never on every pass.
 
 Samples (snapshots, account files) are written once per minute, keyed by the
 minute, and only while the file is fresh: a stopped bot's last snapshot is
@@ -39,6 +41,9 @@ SAMPLE_FRESH_S = 120.0
 MARK_BAR_MAX_S = 120
 #: the daily PnL is recomputed from the files this often
 PNL_EVERY_S = 300.0
+#: a followed file unchanged since its last read is skipped unopened, if it
+#: had been quiet this long before that read (see _read_new)
+QUIET_BEFORE_SKIP_S = 2.0
 
 Log = Callable[[str], None]
 
@@ -180,8 +185,17 @@ class Ingestor:
             st = path.stat()
         except OSError:
             return []
-        cur = self.db.query("SELECT read_offset, read_hash FROM sources WHERE path = ?",
-                            (str(path),))
+        cur = self.db.query("SELECT read_offset, read_hash, size, mtime, updated FROM sources "
+                            "WHERE path = ?", (str(path),))
+        if (cur and not force and cur[0]["size"] == st.st_size
+                and cur[0]["mtime"] is not None and cur[0]["updated"] is not None
+                and abs(float(cur[0]["mtime"]) - st.st_mtime) < 1e-6
+                and float(cur[0]["updated"]) - st.st_mtime > QUIET_BEFORE_SKIP_S):
+            # untouched since the last read: nothing to read, nothing to
+            # fingerprint (any write, a rewrite too, moves the mtime). Only
+            # when the file had been quiet a while before that read: two
+            # writes inside one tick of the file system's clock share an mtime
+            return []
         offset = int(cur[0]["read_offset"] or 0) if cur and not force else 0
         with path.open("rb") as fh:
             whole = fh.read()

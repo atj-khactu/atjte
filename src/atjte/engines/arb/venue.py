@@ -100,6 +100,7 @@ class Venue:
         self.price_tick = 0.01
         self.amount_step = 0.001        # in BASE UNITS, not contracts
         self.amount_min = 0.001         # in BASE UNITS
+        self.amount_max: Optional[float] = None   # one order's max, BASE UNITS (None = none published)
         self.im_rate = DEFAULT_IM_RATE
 
         # live figures, filled in by read_position() / read_margin()
@@ -241,8 +242,10 @@ class Venue:
         # (contracts on a contract market); the engine works in base units.
         step = float(prec.get("amount") or 0.0) or 0.001
         lim_min = ((m.get("limits") or {}).get("amount") or {}).get("min")
+        lim_max = ((m.get("limits") or {}).get("amount") or {}).get("max")
         self.amount_step = step * self.contract_size
         self.amount_min = (float(lim_min) if lim_min else step) * self.contract_size
+        self.amount_max = float(lim_max) * self.contract_size if lim_max else None
         self.im_rate = self._read_im_rate(m)
 
     def _read_im_rate(self, m: dict) -> float:
