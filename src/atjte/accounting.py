@@ -216,7 +216,8 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
               fx: Optional[FxSeries] = None,
               seed_pos: float = 0.0, seed_avg: Optional[float] = None,
               venue_deals: Iterable[dict] = (), venue_magic: Optional[int] = None,
-              venue_rate: float = 1.0, venue_fx: Optional[FxSeries] = None) -> dict:
+              venue_rate: float = 1.0, venue_fx: Optional[FxSeries] = None,
+              mt5_price_rate: Optional[float] = None) -> dict:
     """Realized PnL per local date, both legs, no mark-to-market.
 
     The venue leg is avg-cost realized over EVERY fill (older fills feed the
@@ -238,13 +239,21 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
     :func:`deal_rate`: its own recorded rate, else its day's in ``fx``, else
     ``mt5_rate`` (today's).
 
+    Volume in USD beside the units: ``kr_vol_usd`` is each fill's amount ×
+    price × ``venue_rate`` (USD per venue quote currency); ``mt5_vol_usd``
+    each deal's units × price × ``mt5_price_rate`` (USD per unit of the MT5
+    symbol's PROFIT currency — the engine refuses a pair whose currencies
+    differ without FX_CONVERSION_SYMBOL, so it is ``venue_rate`` / the
+    engine's ``fx_rate``; None = ``venue_rate``).
+
     ``funding`` is the funding settlements (:func:`reporting.funding_record`,
     negative = paid) — a real cash flow on a perpetual that never arrives as
     a fill, so it is bucketed by date here like one.
 
     Returns ``{"days": [row...], "summary": {...}}``; a row holds ``date``,
-    ``kr_fills``, ``kr_vol``, ``kr_realized``, ``kr_fees``, ``mt5_deals``,
-    ``mt5_vol`` (in units, ``lots × contract``), ``mt5_realized``,
+    ``kr_fills``, ``kr_vol``, ``kr_vol_usd``, ``kr_realized``, ``kr_fees``,
+    ``mt5_deals``, ``mt5_vol`` (in units, ``lots × contract``),
+    ``mt5_vol_usd``, ``mt5_realized``,
     ``mt5_costs`` (commission + broker fee + swap, already INSIDE
     ``mt5_realized`` and reported beside it), ``mt5_adjust`` (the
     adjustments, also inside it), ``mt5_fx`` (the rate the date's last deal
@@ -252,6 +261,7 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
     (``kr_realized − kr_fees + mt5_realized + funding``) and ``cum``."""
     fills = sorted(fills, key=lambda f: float(f["ts"]))
     acc = avg_cost(fills, pos0=seed_pos, avg0=seed_avg)
+    price_rate = venue_rate if mt5_price_rate is None else mt5_price_rate
 
     def inside(ts: float) -> bool:
         return ((since_ts is None or ts >= since_ts)
@@ -265,6 +275,7 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
     def row(ts: float) -> dict:
         d = local_date(ts)
         return rows.setdefault(d, {"date": d, "kr_fills": 0, "kr_vol": 0.0,
+                                   "kr_vol_usd": 0.0, "mt5_vol_usd": 0.0,
                                    "kr_realized": 0.0, "kr_fees": 0.0,
                                    "kr_source": "avg_cost",   # a date the MT5
                                    "mt5_deals": 0, "mt5_vol": 0.0,   # leg opens
@@ -287,6 +298,7 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
             continue
         r["kr_fills"] += 1
         r["kr_vol"] += float(f["amount"])
+        r["kr_vol_usd"] += abs(float(f["amount"]) * float(f.get("price") or 0.0)) * venue_rate
         r["kr_fees"] += float(f.get("fee_usd") or 0.0)
         rp = f.get("realized_usd")
         venue_complete[d] = venue_complete.get(d, True) and rp is not None
@@ -351,7 +363,9 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
             continue
         r["mt5_deals"] += 1
         if d.get("entry") in (DEAL_ENTRY_IN, DEAL_ENTRY_OUT, DEAL_ENTRY_INOUT):
-            r["mt5_vol"] += float(d.get("lots") or 0.0) * contract
+            units = float(d.get("lots") or 0.0) * contract
+            r["mt5_vol"] += units
+            r["mt5_vol_usd"] += abs(units * float(d.get("price") or 0.0)) * price_rate
         costs = float(d.get("costs") or 0.0) * rate
         # commission + broker fee + swap. Kept INSIDE mt5_realized (it is what
         # the account was credited) and reported beside it, because "what did
@@ -376,6 +390,8 @@ def daily_pnl(fills: Iterable[dict], deals: Iterable[dict], magic: Optional[int]
         "days": len(days),
         "kr_fills": sum(r["kr_fills"] for r in days),
         "kr_vol": sum(r["kr_vol"] for r in days),
+        "kr_vol_usd": sum(r["kr_vol_usd"] for r in days),
+        "mt5_vol_usd": sum(r["mt5_vol_usd"] for r in days),
         "kr_realized": sum(r["kr_realized"] for r in days),
         "kr_fees": sum(r["kr_fees"] for r in days),
         "mt5_deals": sum(r["mt5_deals"] for r in days),

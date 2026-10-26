@@ -251,7 +251,7 @@ class DailyLimitTest(unittest.TestCase):
         day.mt5_volume_usd = 60_000.0
         self.assertEqual(len(daily_limit_reasons(day, 0.0, None, 50_000.0, 50_000.0)), 2)
 
-    def test_a_raised_volume_limit_releases_its_latch_the_loss_latch_stays(self):
+    def test_a_raised_volume_limit_releases_its_latch(self):
         """GC 2026-10-14: latched at a 2M cap, the operator raised it to 10M;
         5.4M traded is under the new cap, so entries may resume."""
         day = DayBook(date="d", venue_volume_usd=5_436_120.0, mt5_volume_usd=5_406_311.0)
@@ -262,10 +262,53 @@ class DailyLimitTest(unittest.TestCase):
         # trading on up to the new cap latches again
         day.venue_volume_usd = 10e6
         self.assertEqual(len(daily_limit_reasons(day, 0.0, None, 10e6, 10e6)), 1)
-        # the loss latch does NOT follow a raised limit
-        day.loss_latched = True
-        self.assertIn("daily loss limit",
-                      daily_limit_reasons(day, -10.0, 5000.0, None, None)[0])
+
+    def test_a_raised_loss_limit_releases_the_latch(self):
+        """MGC 2026-10-22: latched at 1,500, raised to 2,500; −1,688 is above
+        the new limit, so entries may resume."""
+        day = DayBook(date="d")
+        self.assertEqual(len(daily_limit_reasons(day, -1600.0, 1500.0, None, None)), 1)
+        self.assertEqual(day.loss_latched_cap, 1500.0)
+        # recovered under the SAME limit: stays latched
+        self.assertEqual(len(daily_limit_reasons(day, -1400.0, 1500.0, None, None)), 1)
+        # raised above today's loss: released
+        self.assertEqual(daily_limit_reasons(day, -1688.0, 2500.0, None, None), [])
+        self.assertFalse(day.loss_latched)
+        # losing past the new limit latches again, under the new limit
+        self.assertEqual(len(daily_limit_reasons(day, -2600.0, 2500.0, None, None)), 1)
+        self.assertEqual(day.loss_latched_cap, 2500.0)
+
+    def test_a_raised_loss_limit_still_under_water_keeps_the_latch(self):
+        day = DayBook(date="d")
+        daily_limit_reasons(day, -1600.0, 1500.0, None, None)
+        reasons = daily_limit_reasons(day, -2000.0, 1800.0, None, None)
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("<= -1800", reasons[0])
+        self.assertEqual(day.loss_latched_cap, 1800.0)
+
+    def test_a_lowered_loss_limit_never_releases(self):
+        day = DayBook(date="d")
+        daily_limit_reasons(day, -1600.0, 1500.0, None, None)
+        # lowered, then raised back to below the cap it latched at
+        self.assertEqual(len(daily_limit_reasons(day, +500.0, 1000.0, None, None)), 1)
+        self.assertEqual(len(daily_limit_reasons(day, +500.0, 1400.0, None, None)), 1)
+        self.assertTrue(day.loss_latched)
+
+    def test_a_latch_of_unknown_cap_follows_the_current_limit(self):
+        # state written before the cap was kept: from_dict gives cap 0
+        day = DayBook.from_dict({"date": "d", "loss_latched": True})
+        self.assertEqual(day.loss_latched_cap, 0.0)
+        self.assertEqual(daily_limit_reasons(day, -1688.0, 2500.0, None, None), [])
+        self.assertFalse(day.loss_latched)
+
+    def test_the_latched_cap_round_trips_and_rolls(self):
+        day = DayBook(date="d")
+        daily_limit_reasons(day, -200.0, 100.0, None, None)
+        back = DayBook.from_dict(day.to_dict())
+        self.assertTrue(back.loss_latched)
+        self.assertEqual(back.loss_latched_cap, 100.0)
+        back.roll("other-day")
+        self.assertEqual(back.loss_latched_cap, 0.0)
 
     def test_all_three_can_fire_together(self):
         day = DayBook(date="d", venue_volume_usd=9e5, mt5_volume_usd=9e5)

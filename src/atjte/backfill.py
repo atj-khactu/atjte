@@ -356,7 +356,7 @@ def to_fill_records(trades: list[dict], exchange_id: str, symbol: str,
             fee_usd=reporting.fee_usd(_f(fee.get("cost")), fee.get("currency"), price,
                                       base, quote),
             order_id=str(t["order"]) if t.get("order") else None, source="backfill",
-            realized_usd=reporting.venue_realized_pnl(t.get("info")),
+            realized_usd=reporting.venue_realized_pnl(t.get("info"), _f(fee.get("cost"))),
             taker_or_maker=str(t.get("takerOrMaker") or "")))
     return out
 

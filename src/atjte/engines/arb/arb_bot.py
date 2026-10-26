@@ -1031,6 +1031,15 @@ def _atomic_write(path: Path, obj: dict, indent: Optional[int] = 2) -> None:
     _reporting.atomic_write_json(path, obj, indent=indent)
 
 
+def _no_order_id(order_id) -> bool:
+    """A venue answer that names no order: CCXT's Hyperliquid
+    ``create_order_ws`` answers an empty order when the reply holds no
+    status, and older connectors carried it on as the string ``"None"``.
+    Nothing can cancel or read such an id; a cancel by it raised
+    ``decimal.ConversionSyntax`` on every pass, for good (2026-10-22)."""
+    return order_id is None or str(order_id).strip() in ("", "None")
+
+
 def _still_resting(o) -> bool:
     """The venue still has this order on the book with size left on it.
     ``UNKNOWN`` counts as resting: an order whose state we cannot read must
@@ -2292,6 +2301,10 @@ class ArbBot:
         an order still resting is cancelled again and kept; a transient read
         error keeps the record for the next tick."""
         for oid, (rec, reason) in list(self._settling.items()):
+            if _no_order_id(oid):
+                self._book(rec, source=reason)
+                self._retire_rec(rec)
+                continue
             try:
                 o = self.venue.get_order(oid)
             except Exception as e:
@@ -2377,6 +2390,20 @@ class ArbBot:
         the synchronous path below as before."""
         rec = self.orders.get(key)
         if rec is None:
+            return
+        if _no_order_id(rec.order_id):
+            # no id to cancel or read: book what is known and drop it. A
+            # real order behind it is untracked from here: the order poll
+            # cancels it, and the reconciler's parity check (venue position
+            # vs MT5) hedges anything it filled
+            _log(f"settle {key} ({reason}): the record has no order id — booking "
+                 f"what is known and dropping it")
+            try:
+                self._book(rec, source=reason)
+            except Exception as be:          # accounting must not strand the record
+                _log(f"WARNING: booking {key} while dropping it failed: {be}")
+            self._drop_rec(key)
+            self._bal_dirty = True
             return
         try:
             cancel_failed = False
@@ -4636,11 +4663,17 @@ class ArbBot:
         the magic that opened it: if SYMBOL_MT5's position there carries
         another magic (another bot, a manual trade), this bot would read its
         hedge as missing and hedge on top of it forever. Refuses to start
-        then; the gateway refuses the orders too. Hedging accounts pass."""
+        then; the gateway refuses the orders too. Hedging accounts pass, and
+        so does a netting account whose gateway keeps a book per magic
+        (``books: "ledger"``): each bot reads only its own book there."""
         try:
             raw = getattr(self.mt5.get_account(), "raw", None)
             mode = raw.get("margin_mode") if isinstance(raw, dict) else None
             if mode not in (0, 1):
+                return
+            if raw.get("books") == "ledger":
+                _log(f"MT5 hedge account: NETTING, one book per magic at the gateway — "
+                     f"{SYMBOL_MT5} may be shared with other strategies")
                 return
             foreign = sorted({int((p.raw or {}).get("magic") or 0)
                               for p in self.mt5.get_positions(SYMBOL_MT5)
@@ -5307,6 +5340,18 @@ class ArbBot:
             if "insufficient" in str(why).lower():
                 self._bal_dirty = True
                 self._pause_entries(t)
+            return
+        if _no_order_id(o.order_id):
+            # the venue's answer names no order (Hyperliquid's ws post with
+            # no status — reported with the request quota at its cap): nothing
+            # to track. Were it placed after all, the order poll finds it
+            # untracked and cancels it, and the reconciler's parity check
+            # hedges anything it filled
+            self._bal_dirty = True
+            self._log_once(f"place_{key}",
+                           f"WARNING: place {key} {t['amount']:g}@{t['price']}: the venue's "
+                           f"answer names no order (status {o.status.value}) — not "
+                           f"tracked; the order poll cancels it if it rests")
             return
         # keep the cached head-room honest until the next refetch
         if t["purpose"] == "entry":
@@ -6012,6 +6057,10 @@ class ArbBot:
             fee = _reporting.fee_usd(tr.fee, tr.fee_currency, float(record["price"]),
                                      base, quote)
             record["fee_usd"] = 0.0 if fee is None else float(fee)
+            # a venue whose realized PnL comes with the fee (IBKR's, net of
+            # its commissions, set by TWS's commission report) has it now
+            if record.get("realized_usd") is None and tr.realized_pnl is not None:
+                record["realized_usd"] = float(tr.realized_pnl)
             self._record_report_fill(record)
         except Exception as e:
             self._log_once("report_fill", f"warning: fill not reported: "
@@ -6069,7 +6118,7 @@ class ArbBot:
         return _reporting.mt5_block(
             symbol=SYMBOL_MT5, magic=MT5_MAGIC, ok=ok, contract=self.mt5_contract_size,
             hedge_ratio=HEDGE_RATIO, swap=getattr(self, "mt5_swap", None),
-            srv_offset_s=off, account=rep.mt5_account(self.mt5) if ok else None,
+            fx_rate=getattr(self, "fx_rate", 1.0), srv_offset_s=off, account=rep.mt5_account(self.mt5) if ok else None,
             top=top, positions=rep.mt5_positions(self.mt5, SYMBOL_MT5, off) if ok else None)
 
     # ── history, through the gateways ────────────────────────────────────────

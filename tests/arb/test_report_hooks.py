@@ -127,7 +127,7 @@ class ReportHooksTest(unittest.TestCase):
             to_units=lambda a: a, client=types.SimpleNamespace(fees_follow_fills=True))
         return bot
 
-    def _ws_fee_follows(self, bot, tid, fee):
+    def _ws_fee_follows(self, bot, tid, fee, realized=None):
         bot._hedge = lambda: None
         bot.dump_state = lambda: None
         bot.fill_q = queue.Queue()
@@ -137,7 +137,7 @@ class ReportHooksTest(unittest.TestCase):
         bot._process_fill_events(Trade(
             exchange=pb.EXCHANGE_ID, trade_id=tid, symbol=pb.SYMBOL_VENUE,
             side=OrderSide.SELL, amount=1.0, price=4450.0, order_id="o1", fee=fee,
-            fee_currency="USD", realized_pnl=None,
+            fee_currency="USD", realized_pnl=realized,
             timestamp=datetime(2027, 1, 1, tzinfo=timezone.utc)))
 
     def test_a_fill_whose_fee_follows_is_recorded_with_it(self):
@@ -154,6 +154,16 @@ class ReportHooksTest(unittest.TestCase):
                          [("e-1", 1.17, 1.0)])
         self.assertNotIn("realized_usd", rows[0])         # replayed at average cost
         self.assertAlmostEqual(bot.pos_units, -1.0)                      # not booked twice
+
+    def test_ibkrs_realized_rides_in_with_the_fee(self):
+        """TWS sets realizedPNL with its commission report: the fee push
+        carries IBKR's realized (before fees), and the ONE record has it."""
+        bot = self._ib_bot()
+        self._ws_fee_follows(bot, "e-9", None)
+        self._ws_fee_follows(bot, "e-9", 0.96, realized=68.833333)
+        rows = R.read_jsonl(bot.reporter.trades_file)
+        self.assertEqual([(r["id"], r["fee_usd"]) for r in rows], [("e-9", 0.96)])
+        self.assertAlmostEqual(rows[0]["realized_usd"], 68.833333)
 
     def test_a_fee_that_never_comes_is_not_waited_for_forever(self):
         bot = self._ib_bot()

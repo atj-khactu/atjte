@@ -1156,10 +1156,10 @@ def trade_from_ccxt(exchange_id: str, symbol: str, t: dict) -> Optional[Trade]:
         fee_currency=fee.get("currency"),
         # the venue's OWN realized PnL for this fill where it streams one
         # (Kraken Futures realized_pnl, Hyperliquid closedPnl — both before
-        # fees) — the figure the account was credited, so the report can use
-        # it instead of replaying an average cost whose opening basis it has
-        # to guess
-        realized_pnl=venue_realized_pnl(t.get("info")),
+        # fees; IBKR's realizedPNL with its two commissions added back) — the
+        # figure the account was credited, so the report can use it instead
+        # of replaying an average cost whose opening basis it has to guess
+        realized_pnl=venue_realized_pnl(t.get("info"), fee.get("cost")),
         # the venue's OWN maker/taker classification. A post-only strategy
         # cannot verify it is actually resting without this: the fee rate
         # alone moves with the volume tier too, so the two are not separable

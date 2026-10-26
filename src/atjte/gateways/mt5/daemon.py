@@ -93,9 +93,14 @@ def main(argv=None) -> int:
         + (" (and logging it in)" if cfg.logs_in else "")
         + (" — the account is checked against mt5_login" if cfg.login else ""))
     backend.connect()               # raises on a wrong account: refuse to serve it
+    ledger = None
+    if cfg.books == "ledger":
+        from atjte.gateways.ledger import HedgeLedger
+        ledger = HedgeLedger(cfg.dir / C.LEDGER_NAME, log=log)
+        log(f"{cfg.name}: hedge books kept in {C.LEDGER_NAME} (several bots per symbol)")
     gw = MT5Gateway(backend, port=cfg.listen_port, token=cfg.token,
                     allowed_clients=set(cfg.clients),
-                    tick_poll_s=cfg.tick_poll_ms / 1000.0, log=log)
+                    tick_poll_s=cfg.tick_poll_ms / 1000.0, log=log, ledger=ledger)
     gw._backend("get_account")
     try:
         write_state(cfg.dir / C.SYMBOLS_NAME,
@@ -103,7 +108,13 @@ def main(argv=None) -> int:
     except Exception as e:          # the dialog then asks for a typed symbol
         log(f"{cfg.name}: could not write {C.SYMBOLS_NAME}: {type(e).__name__}: {e}")
     gw.quote_request = cfg.dir / C.QUOTES_REQUEST_NAME
-    gw.start()
+    try:
+        gw.start()
+    except RuntimeError as e:       # books: "ledger" on a hedging account
+        log(f"{cfg.name}: cannot start — {e}")
+        gw.stop()
+        backend.disconnect()
+        return 2
     from atjte.gateways.accounts import AccountPublisher
     accounts = AccountPublisher(cfg.dir, gw.account_snapshot, name=cfg.name, venue="mt5",
                                 every_s=cfg.accounts_every_s,

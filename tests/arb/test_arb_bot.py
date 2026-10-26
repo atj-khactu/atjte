@@ -547,6 +547,71 @@ class SettleAfterAFailedCancelTest(unittest.TestCase):
         self.assertAlmostEqual(bot.counters["fills_booked_units"], 1.0)
 
 
+class NoOrderIdTest(unittest.TestCase):
+    """A venue answer that names no order (CCXT's Hyperliquid
+    ``create_order_ws`` with no status in the reply) was tracked as resting
+    under the id "None"; its cancel and its read then raised
+    ``decimal.ConversionSyntax`` on every pass, and the level never quoted
+    again (2026-10-22)."""
+
+    def setUp(self):
+        self._live = (pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY)
+        pb.LIVE_TRADING = True
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = None, 1.0
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = self._live
+
+    class NoIdVenue(StubVenue):
+        def place_limit(self, side, units, price, post_only=True, reduce_only=False):
+            super().place_limit(side, units, price, post_only, reduce_only)
+            return StubOrder(0.0, order_id="", status=OrderStatus.UNKNOWN)
+
+    class Unreadable(StubVenue):
+        def cancel(self, order_id):
+            raise AssertionError(f"cancel sent for id {order_id!r}")
+
+        def get_order(self, order_id):
+            raise AssertionError(f"read sent for id {order_id!r}")
+
+    def test_an_answer_with_no_order_is_not_tracked(self):
+        logs = []
+        bot = make_bot(logs)
+        bot.venue = self.NoIdVenue(StubExchange())
+        bot._place("grid-exit-S1", {"side": "sell", "purpose": "exit", "level_index": 1,
+                                    "level": 0.5, "price": 4450.0, "amount": 1.0})
+        self.assertEqual(len(bot.venue.placed), 1)
+        self.assertNotIn("grid-exit-S1", bot.orders)
+        self.assertTrue(any("names no order" in m for m in logs))
+
+    def test_a_record_with_no_id_is_dropped_without_a_cancel_or_a_read(self):
+        for oid in (None, "", "None"):           # "None": what the old client stored
+            bot = make_bot([])
+            bot.venue = self.Unreadable(StubExchange())
+            rec = resting(key="grid-entry-S1", purpose="entry")
+            rec.order_id = oid
+            bot.orders[rec.key] = rec
+            bot._settle(rec.key, cancel_first=True, reason="signal off", defer_read=True)
+            self.assertNotIn(rec.key, bot.orders, oid)
+
+    def test_a_settling_record_with_no_id_is_retired(self):
+        bot = make_bot([])
+        bot.venue = self.Unreadable(StubExchange())
+        rec = resting(key="grid-entry-S1", purpose="entry")
+        rec.order_id = "None"
+        bot._settling = {"None": (rec, "requote")}
+        bot._drain_settling(0.0)
+        self.assertEqual(bot._settling, {})
+
+    def test_the_client_keeps_a_missing_id_empty(self):
+        from atjte.clients.ccxt_client import CCXTClient
+        o = CCXTClient._map_order(types.SimpleNamespace(name="hl"),
+                                  {"id": None, "status": None, "info": {}})
+        self.assertEqual(o.order_id, "")
+        self.assertTrue(pb._no_order_id(o.order_id))
+        self.assertFalse(pb._no_order_id("12345"))
+
+
 class DeferredSettleReadTest(unittest.TestCase):
     """A requote's cancel no longer waits for the order's final-state REST
     read before the replacement goes out (2026-10-08, XAU perp: that read

@@ -4,6 +4,7 @@
         gateway.json        port, tick poll, allowlist
         gateway.env         the terminal and the login it must be on
         gateway_state.json  the heartbeat the panel reads (while running)
+        ledger.jsonl        the hedge books per (symbol, magic) (books: "ledger")
         stop.signal         written by the panel to stop it cleanly
         logs/
 
@@ -15,6 +16,12 @@ on two ports.
 
     {"name": "mt5_main", "venue": "mt5", "listen_port": 5620,
      "tick_poll_ms": 10, "clients": []}
+
+``books``: ``"broker"`` (the default) serves the terminal's positions as
+they are — on a NETTING account one magic per symbol, a second is refused.
+``"ledger"`` (a netting account only) keeps one book per (symbol, magic) in
+``ledger.jsonl`` and serves each bot ITS book, so several bots hedge one
+symbol (:mod:`atjte.gateways.ledger`).
 
 ``gateway.env`` (this file only)::
 
@@ -46,6 +53,8 @@ STATE_NAME = "gateway_state.json"
 #: new-strategy dialog reads it (the panel opens no terminal connection)
 SYMBOLS_NAME = "symbols.json"
 STOP_NAME = "stop.signal"
+LEDGER_NAME = "ledger.jsonl"
+BOOKS = ("broker", "ledger")
 #: symbols the control panel wants quoted in account_state.json ("quotes"):
 #: ``{"symbols": [...], "t": ...}``, written by the panel, read by the gateway
 #: at each account snapshot (the panel opens no terminal connection)
@@ -53,7 +62,7 @@ QUOTES_REQUEST_NAME = "quotes.request"
 DEFAULT_LISTEN_PORT = 5620
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
-_KNOWN = {"name", "venue", "listen_port", "tick_poll_ms", "clients", "_comment"}
+_KNOWN = {"name", "venue", "listen_port", "tick_poll_ms", "clients", "books", "_comment"}
 _KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
 
 
@@ -68,6 +77,8 @@ class GatewayConfig:
     listen_port: int = DEFAULT_LISTEN_PORT
     tick_poll_ms: float = 10.0
     clients: list = field(default_factory=list)
+    #: "broker" (the terminal's positions) or "ledger" (books per magic)
+    books: str = "broker"
     #: account_state.json (:mod:`atjte.gateways.accounts`)
     publish_accounts: bool = True
     accounts_every_s: float = _A.EVERY_S
@@ -91,7 +102,8 @@ class GatewayConfig:
 
     def status(self) -> dict:
         return {"name": self.name, "venue": "mt5", "listen_port": self.listen_port,
-                "tick_poll_ms": self.tick_poll_ms, "complete": self.complete,
+                "tick_poll_ms": self.tick_poll_ms, "books": self.books,
+                "complete": self.complete,
                 "missing": self.missing, "token_set": bool(self.token),
                 "login_check": bool(self.login), "logs_in": self.logs_in,
                 "clients_allowed": list(self.clients)}
@@ -138,6 +150,9 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
                         listen_port=int(raw.get("listen_port") or DEFAULT_LISTEN_PORT),
                         tick_poll_ms=float(raw.get("tick_poll_ms") or 10.0),
                         clients=[str(c) for c in (raw.get("clients") or [])])
+    cfg.books = str(raw.get("books") or "broker").lower()
+    if cfg.books not in BOOKS:
+        raise ConfigError(f"{CONFIG_NAME}: books must be one of {', '.join(BOOKS)}")
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:

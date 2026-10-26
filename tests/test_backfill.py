@@ -189,6 +189,24 @@ class PagingTest(unittest.TestCase):
         self.assertAlmostEqual(recs[0]["fee_usd"], 4.0)          # 0.001 XAUT at 4000
         self.assertEqual(recs[0]["order"], "o1")
 
+    def test_ibkr_realized_is_before_fees_both_commissions_added_back(self):
+        """MGC 2026-10-21, sell 1 at 4148.6: TWS's realizedPNL 66.913333 is
+        net of the closing 0.96 AND the opening 0.96 its average cost carries;
+        the report books 68.833333 and the 0.96 once, in its own column."""
+        t = {"id": "e1", "order": "967", "side": "sell", "amount": 10.0, "price": 4148.6,
+             "timestamp": T0 * 1000, "fee": {"cost": 0.96, "currency": "USD"},
+             "info": {"ib_realized_pnl_net": 66.913333}}
+        rec = B.to_fill_records([t], "ibkr", "MGC/USD:USD-261229", "MGC", "USD")[0]
+        self.assertAlmostEqual(rec["realized_usd"], 66.913333 + 2 * 0.96)
+        self.assertAlmostEqual(rec["fee_usd"], 0.96)
+        # an opening execution: 0; before the commission report: not known
+        self.assertEqual(R.venue_realized_pnl({"ib_realized_pnl_net": 0.0}, 0.96), 0.0)
+        self.assertIsNone(R.venue_realized_pnl({"ib_realized_pnl_net": None}, None))
+        self.assertIsNone(R.venue_realized_pnl({"ib_realized_pnl_net": 66.9}, None))
+        # the other venues are unchanged
+        self.assertEqual(R.venue_realized_pnl({"closedPnl": "1.5"}), 1.5)
+        self.assertEqual(R.venue_realized_pnl({"realized_pnl": 2.0}, 9.0), 2.0)
+
 
 class FakeMt5:
     def __init__(self, deals, tick_ms):

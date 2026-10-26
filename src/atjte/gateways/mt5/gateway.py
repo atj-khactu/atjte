@@ -19,6 +19,16 @@ one process holds the terminal (its path and the login check, once) and:
 No dead man's switch: nothing rests. A bot that dies leaves its hedged
 position exactly where it was, as it always has.
 
+**The ledger** (``books: "ledger"`` in gateway.json, a NETTING account only):
+the account holds one position per symbol, so the gateway keeps one book
+per (symbol, magic) itself (:mod:`atjte.gateways.ledger`) and serves THAT as
+each bot's position and deal history — several bots hedge one symbol, each
+reading only its own book. The broker's position minus the books is the
+residual, a position of magic 0. Every hedge is booked from its
+``order_send`` result before the bot hears back; a sync every
+:data:`LEDGER_SYNC_S` checks the books against the broker's deals and
+position. A bot that crashes leaves its book exactly as it was.
+
 The backend is anything with ``MT5Client``'s methods — the real client in
 the daemon, a fake in the tests.
 """
@@ -30,11 +40,14 @@ from pathlib import Path
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-from atjte.clients.base import Order, OrderSide, OrderStatus, OrderType, PositionSide
+from atjte.clients.base import (Order, OrderSide, OrderStatus, OrderType, Position,
+                                PositionSide, Trade, ms_to_dt)
 
 from . import protocol as P
+from ..ledger import HedgeLedger, _shares, position_id
 
 DEFAULT_PORT = 5620
 HELLO_TIMEOUT_S = 10.0
@@ -48,6 +61,17 @@ HEALTH_WINDOW_S = 5.0
 HEALTH_INTERVAL_S = 5.0
 HEALTH_RETRY_S = 1.0
 RECONNECT_S = 10.0
+#: the ledger reads the broker's deals and position this often
+LEDGER_SYNC_S = 2.0
+#: a hedge booked from its order_send result that the broker's deals still
+#: do not show after this long is reported
+LEDGER_CONFIRM_GRACE_S = 30.0
+#: the broker's deals read back from at the ledger's first start
+LEDGER_SEED_LOOKBACK = timedelta(days=7)
+#: one sync reads the deals from this long before the newest it holds
+LEDGER_SYNC_OVERLAP = timedelta(hours=1)
+#: the value of a price unit on a lot (order_calc_profit) is re-asked this often
+VPP_TTL_S = 60.0
 
 
 class Refusal(Exception):
@@ -90,8 +114,19 @@ class MT5Gateway:
     def __init__(self, backend: Any, *, host: str = "127.0.0.1", port: int = DEFAULT_PORT,
                  token: str = "", allowed_clients: Optional[set] = None,
                  tick_poll_s: float = TICK_POLL_S,
-                 log: Optional[Callable[[str], None]] = None, clock=time.time) -> None:
+                 log: Optional[Callable[[str], None]] = None, clock=time.time,
+                 ledger: Optional[HedgeLedger] = None) -> None:
         self.backend = backend
+        #: the books per (symbol, magic) on a netting account; None = the
+        #: broker's positions as they are (one magic per netting symbol)
+        self.ledger = ledger
+        #: a hedge's send + booking, a sync and a position read never interleave
+        self._book_lock = threading.RLock()
+        self._vpp: dict[str, tuple[float, float]] = {}      # symbol -> (t, value)
+        self._specs: dict[str, dict] = {}
+        self._ledger_check: dict = {}
+        self._ledger_said: dict = {}
+        self._booked_at: dict[str, float] = {}
         self.host, self.port = host, int(port)
         self._token = token
         self.allowed = set(allowed_clients or ())
@@ -124,9 +159,12 @@ class MT5Gateway:
         s.settimeout(1.0)
         self._srv, self.port = s, s.getsockname()[1]
         self.check_health(force=True)
-        for target, name in ((self._accept_loop, "mt5-gw-accept"),
-                             (self._reap_loop, "mt5-gw-reap"),
-                             (self._tick_loop, "mt5-gw-ticks")):
+        loops = [(self._accept_loop, "mt5-gw-accept"), (self._reap_loop, "mt5-gw-reap"),
+                 (self._tick_loop, "mt5-gw-ticks")]
+        if self.ledger is not None:
+            self.open_ledger()
+            loops.append((self._ledger_loop, "mt5-gw-ledger"))
+        for target, name in loops:
             threading.Thread(target=target, name=name, daemon=True).start()
         self._log(f"{self.label}: listening on {self.host}:{self.port}")
 
@@ -344,6 +382,8 @@ class MT5Gateway:
             c.symbols.add(sym)              # asking for a tick = wanting its stream
         if c.readonly and method in ("place_order", "close_by", "cancel_order"):
             raise Refusal(f"{c.name} attached read-only: it trades nothing", "invalid_order")
+        if self.ledger is not None and method in self._LEDGER_ROUTES:
+            return getattr(self, self._LEDGER_ROUTES[method])(*args, **kwargs)
         if method == "place_order":
             return self._place(c, args, kwargs)
         if method == "close_by":
@@ -408,6 +448,14 @@ class MT5Gateway:
                           f"rests an MT5 order, and nothing here would pull one")
         self._refuse_if_unfit()
         symbol = str(args[0] if args else kwargs.get("symbol"))
+        if self.ledger is not None:
+            kwargs["magic"] = c.magic
+            c.traded.add(symbol)
+            self.counters["hedges"] += 1
+            with self._book_lock:
+                o = self._backend("place_order", *args, **kwargs)
+                self._book_order(c, symbol, o)
+            return o
         self._netting_guard(c, symbol)
         c.traded.add(symbol)
         # the order is the CALLER's, whatever the call said
@@ -501,6 +549,287 @@ class MT5Gateway:
         self.counters["close_by"] += 1
         return self._backend("close_by", *ids)
 
+    # ── the ledger (books: "ledger", a netting account) ─────────────────────
+    #: what the ledger answers instead of the terminal
+    _LEDGER_ROUTES = {"get_positions": "_ledger_positions", "history_deals": "_ledger_deals",
+                      "get_trades": "_ledger_trades", "close_by": "_ledger_close_by",
+                      "get_account": "_ledger_account"}
+
+    def _ledger_account(self) -> Any:
+        """The account, its ``raw`` marked ``books: "ledger"`` — what tells
+        the engine's netting check that a symbol may be shared here."""
+        a = self._backend("get_account")
+        if isinstance(getattr(a, "raw", None), dict):
+            a.raw = {**a.raw, "books": "ledger"}
+        return a
+
+    def open_ledger(self) -> None:
+        """Seed the books at the ledger's first start — each open position
+        is its own magic's, which held while the gateway allowed one magic
+        per netting symbol; a position of magic 0 stays the residual — then
+        sync once. Refused on a HEDGING account: every bot's tickets are its
+        own there already."""
+        if not self._netting():
+            raise RuntimeError("books: 'ledger' is for a NETTING account — this one hedges "
+                               "(one ticket per order), so each bot's positions are its "
+                               "own already")
+        led = self.ledger
+        if not led.seeded:
+            now = datetime.now(timezone.utc)
+            deals = self._backend("history_deals", now - LEDGER_SEED_LOOKBACK,
+                                  now + timedelta(days=1)) or []
+            positions = self._backend("get_positions") or []
+            raws = [p.raw if isinstance(p.raw, dict) else {} for p in positions]
+            since = max([int(d.get("time_msc") or 0) for d in deals]
+                        + [int(r.get("time_update_msc") or 0) for r in raws]
+                        + [int((now - LEDGER_SEED_LOOKBACK).timestamp() * 1000)])
+            seeds = [{"symbol": p.symbol, "magic": int(r.get("magic") or 0),
+                      "lots": p.size if p.side is PositionSide.LONG else -p.size,
+                      "price": p.entry_price, "time_msc": int(r.get("time_msc") or 0)}
+                     for p, r in zip(positions, raws) if int(r.get("magic") or 0) > 0]
+            led.seed(seeds, since)
+            self._log(f"{self.label}: ledger started — "
+                      + (", ".join(f"{s['symbol']} magic {s['magic']}: {s['lots']:+g} lot"
+                                   for s in seeds) or "no open hedge position"))
+        self.sync_ledger()
+
+    def sync_ledger(self) -> dict:
+        """One check of the books against the broker: its deals since the
+        newest the ledger holds (confirm, recover, split, foreign — see
+        :meth:`HedgeLedger.sync`), then its position per symbol against the
+        books' sum. Never trades: what does not add up is reported."""
+        led = self.ledger
+        with self._book_lock:
+            frm = (datetime.fromtimestamp(led.last_msc() / 1000.0, tz=timezone.utc)
+                   - LEDGER_SYNC_OVERLAP)
+            deals = self._backend("history_deals", frm,
+                                  datetime.now(timezone.utc) + timedelta(days=1)) or []
+            notes = led.sync(deals, self._vpp_of)
+            real = self._real_net()
+            books = led.books()
+        for n in notes:
+            self._log(f"{self.label}: {n}")
+        return self._check_ledger(real, books)
+
+    def _ledger_loop(self) -> None:
+        while not self._stop.wait(LEDGER_SYNC_S):
+            try:
+                self.sync_ledger()
+                self._say("sync", None)
+            except Exception as e:                          # noqa: BLE001
+                self._ledger_check = {**self._ledger_check, "ok": False,
+                                      "error": f"{type(e).__name__}: {e}"}
+                self._say("sync", f"ledger sync failed: {type(e).__name__}: {e}")
+
+    def _say(self, key: str, msg: Optional[str]) -> None:
+        """Log ``msg`` once until it changes (None clears it)."""
+        if self._ledger_said.get(key) != msg:
+            self._ledger_said[key] = msg
+            if msg:
+                self._log(f"{self.label}: {msg}")
+
+    def _real_net(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for p in self._backend("get_positions") or ():
+            out[p.symbol] = out.get(p.symbol, 0.0) + (p.size if p.side is PositionSide.LONG
+                                                       else -p.size)
+        return out
+
+    def _check_ledger(self, real: dict, books: dict) -> dict:
+        now = self._clock()
+        symbols = {}
+        for sym in sorted(set(real) | {s for (s, _m) in books}):
+            booked = round(sum(b["lots"] for (s, _m), b in books.items() if s == sym), 8)
+            broker = round(real.get(sym, 0.0), 8)
+            residual = round(broker - booked, 8)
+            off = abs(residual) >= self._step(sym) / 2.0
+            symbols[sym] = {"books": booked, "broker": broker, "residual": residual,
+                            "ok": not off}
+            self._say(f"residual:{sym}",
+                      f"ledger: {sym} at the broker {broker:+g} lot, the books {booked:+g} "
+                      f"— {residual:+g} lot is no bot's (magic 0)" if off else None)
+        late = []
+        for r in self.ledger.provisional():
+            t0 = self._booked_at.get(r["key"])
+            if t0 is None or now - t0 > LEDGER_CONFIRM_GRACE_S:
+                late.append({"key": r["key"], "symbol": r["symbol"], "magic": r["magic"],
+                             "side": r["side"], "lots": r["lots"]})
+        self._say("late", (f"ledger: {len(late)} hedge(s) booked but not in the broker's "
+                           f"deals after {LEDGER_CONFIRM_GRACE_S:g}s: "
+                           + ", ".join(f"{x['symbol']} {x['side']} {x['lots']:g} magic "
+                                       f"{x['magic']}" for x in late)) if late else None)
+        self._ledger_check = {"t": now, "ok": all(v["ok"] for v in symbols.values())
+                              and not late, "symbols": symbols, "unconfirmed": late}
+        return self._ledger_check
+
+    def _spec(self, symbol: str) -> dict:
+        s = self._specs.get(symbol)
+        if s is None:
+            s = self._specs[symbol] = dict(self._backend("get_symbol_specs", symbol) or {})
+        return s
+
+    def _step(self, symbol: str) -> float:
+        try:
+            return float(self._spec(symbol).get("volume_step") or 0.01)
+        except Exception:                                   # noqa: BLE001
+            return 0.01
+
+    def _tick(self, symbol: str):
+        t = self._ticks.get(symbol)
+        return t if t is not None else self._backend("get_ticker", symbol)
+
+    def _vpp_of(self, symbol: str) -> float:
+        """The account-currency value of one price unit on one lot: the
+        terminal's own profit calculation (contract size, tick value, the
+        currency conversion), else the contract size (a profit currency
+        that is the account's)."""
+        now = self._clock()
+        hit = self._vpp.get(symbol)
+        if hit is not None and now - hit[0] < VPP_TTL_S:
+            return hit[1]
+        value = None
+        if callable(getattr(self.backend, "calc_profit", None)):
+            try:
+                t = self._tick(symbol)
+                p = (float(t.bid) + float(t.ask)) / 2.0
+                value = self._backend("calc_profit", symbol, "buy", 1.0, p, p + 1.0)
+            except Exception:                               # noqa: BLE001
+                value = None
+        if not value:
+            value = float(self._spec(symbol).get("contract_size") or 1.0)
+        self._vpp[symbol] = (now, float(value))
+        return float(value)
+
+    def _book_order(self, c: _Client, symbol: str, o: Any) -> None:
+        """Book a hedge from its order_send result, before the bot hears
+        back. A booking that fails is LOGGED, never raised: the order is
+        done, and an error would make the bot hedge it again — the next sync
+        books it from the broker's deal instead."""
+        try:
+            filled = float(getattr(o, "filled", 0.0) or 0.0)
+            if filled <= 1e-9:
+                return
+            raw = o.raw if isinstance(getattr(o, "raw", None), dict) else {}
+            tick = self._tick(symbol)
+            px = float(raw.get("price") or 0.0) or float(o.price or 0.0) \
+                or float(tick.ask if o.side is OrderSide.BUY else tick.bid)
+            t_msc = max(int((getattr(tick, "raw", None) or {}).get("time_msc") or 0),
+                        self.ledger.last_msc() + 1)
+            try:
+                order = int(raw.get("order") or o.order_id or 0)
+            except (TypeError, ValueError):
+                order = 0
+            row = self.ledger.book_fill(
+                symbol=symbol, magic=c.magic, side=o.side.value, lots=filled, price=px,
+                time_msc=t_msc, vpp=self._vpp_of(symbol), ticket=int(raw.get("deal") or 0),
+                order=order, comment=str(raw.get("comment") or ""))
+            self._booked_at[row["key"]] = self._clock()
+        except Exception as e:                              # noqa: BLE001
+            self._log(f"{self.label}: WARNING: {c.name}'s hedge on {symbol} is done but "
+                      f"not booked ({type(e).__name__}: {e}) — the next ledger sync books "
+                      f"it from the broker's deal")
+
+    def _ledger_positions(self, symbol: Optional[str] = None) -> list[Position]:
+        """Each magic's book as a position, and what the broker holds beyond
+        the books as a position of magic 0 (its own ticket and price)."""
+        with self._book_lock:
+            real = list((self._backend("get_positions", symbol) if symbol
+                         else self._backend("get_positions")) or ())
+            books = self.ledger.books()
+        out: list[Position] = []
+        syms = {s for (s, _m) in books} | {p.symbol for p in real}
+        for sym in sorted(s for s in syms if symbol in (None, s)):
+            mine = {m: b for (s, m), b in books.items() if s == sym}
+            held = [p for p in real if p.symbol == sym]
+            net = sum(b["lots"] for b in mine.values())
+            side = 1 if net > 1e-9 else (-1 if net < -1e-9 else 0)
+            carriers = {m: b["lots"] for m, b in mine.items()
+                        if side and (b["lots"] > 0) == (side > 0)}
+            swap = sum(float((p.raw or {}).get("swap") or 0.0) for p in held
+                       if isinstance(p.raw, dict))
+            shares = _shares(carriers, swap) if carriers and swap else {}
+            try:
+                tick = self._tick(sym)
+            except Exception:                               # noqa: BLE001
+                tick = None
+            vpp = self._vpp_of(sym) if mine else 0.0
+            for m, b in sorted(mine.items()):
+                out.append(self._book_position(sym, m, b, tick, vpp, shares.get(m, 0.0)))
+            rest = round(sum(p.size if p.side is PositionSide.LONG else -p.size
+                             for p in held) - net, 8)
+            if abs(rest) >= self._step(sym) / 2.0:
+                p0 = held[0] if held else None
+                raw = {"ticket": int(p0.position_id) if p0 else 0, "symbol": sym,
+                       "type": 0 if rest > 0 else 1, "magic": 0, "volume": abs(rest),
+                       "price_open": p0.entry_price if p0 else 0.0,
+                       "price_current": p0.current_price if p0 else None,
+                       "profit": None, "swap": 0.0,
+                       "comment": "held at the broker beyond the ledger's books"}
+                out.append(Position(exchange="mt5", symbol=sym,
+                                    side=PositionSide.LONG if rest > 0 else PositionSide.SHORT,
+                                    size=abs(rest), entry_price=raw["price_open"],
+                                    current_price=raw["price_current"], unrealized_pnl=None,
+                                    liquidation_price=None, leverage=None,
+                                    position_id=str(raw["ticket"]), raw=raw))
+        return out
+
+    @staticmethod
+    def _book_position(sym: str, magic: int, b: dict, tick: Any, vpp: float,
+                       swap: float) -> Position:
+        long_ = b["lots"] > 0
+        cur = float(tick.bid if long_ else tick.ask) if tick is not None else None
+        upnl = (cur - b["price"]) * b["lots"] * vpp if cur else None
+        pid = position_id(sym, magic)
+        t_msc = int(b.get("t_msc") or 0)
+        raw = {"ticket": pid, "symbol": sym, "type": 0 if long_ else 1, "magic": magic,
+               "volume": abs(b["lots"]), "price_open": b["price"], "price_current": cur,
+               "profit": upnl, "swap": swap, "time": t_msc // 1000, "time_msc": t_msc,
+               "comment": "ledger book"}
+        return Position(exchange="mt5", symbol=sym,
+                        side=PositionSide.LONG if long_ else PositionSide.SHORT,
+                        size=abs(b["lots"]), entry_price=b["price"], current_price=cur,
+                        unrealized_pnl=upnl, liquidation_price=None, leverage=None,
+                        position_id=str(pid), raw=raw)
+
+    def _ledger_deals(self, frm: datetime, to: datetime,
+                      symbol: Optional[str] = None) -> list[dict]:
+        """The books' CONFIRMED deals (each on ONE magic, its profit the
+        book's own); before the ledger started, the broker's deals as they
+        are — one magic per netting symbol held then."""
+        a, b = _ms(frm), _ms(to)
+        since = int(self.ledger.since_msc or 0)
+        out = []
+        if a <= since:
+            out = [d for d in self._backend("history_deals", frm, to, symbol) or []
+                   if int(d.get("time_msc") or 0) <= since]
+        return out + [d for d in self.ledger.deals(max(a, since + 1), b, symbol)
+                      if not d.get("provisional")]
+
+    def _ledger_trades(self, symbol: Optional[str] = None, since=None,
+                       limit: int = 100) -> list[Trade]:
+        frm = since or (datetime.now(timezone.utc) - timedelta(days=7))
+        ccy = getattr(self._backend("get_account"), "currency", None)
+        out = []
+        for d in self._ledger_deals(frm, datetime.now(timezone.utc) + timedelta(days=1),
+                                    symbol):
+            if d.get("type") not in (0, 1):
+                continue
+            out.append(Trade(exchange="mt5", trade_id=str(d["ticket"]), symbol=d["symbol"],
+                             side=OrderSide.BUY if d["type"] == 0 else OrderSide.SELL,
+                             amount=float(d["volume"]), price=float(d["price"]),
+                             order_id=str(d.get("order") or ""),
+                             fee=float(d.get("commission") or 0.0)
+                             + float(d.get("fee") or 0.0), fee_currency=ccy,
+                             realized_pnl=(float(d["profit"]) if d.get("entry") in (1, 2)
+                                           else None),
+                             timestamp=ms_to_dt(int(d["time_msc"])), raw=d))
+        return out[-limit:]
+
+    @staticmethod
+    def _ledger_close_by(*_a: Any, **_k: Any) -> bool:
+        """One book per (symbol, magic): never two opposite tickets to pair."""
+        return False
+
     # ── the tick stream ──────────────────────────────────────────────────────
     def _tick_loop(self) -> None:
         while not self._stop.wait(self.tick_poll_s):
@@ -582,9 +911,12 @@ class MT5Gateway:
             clients = [{"client": c.name, "magic": c.magic, "symbols": sorted(c.symbols),
                         "idle_s": round(now - c.last_seen, 1), "dms_s": c.dms_s}
                        for c in self._clients.values()]
-        return {"listening": self._srv is not None, "port": self.port, "clients": clients,
-                "session": self.session(), "counters": dict(self.counters),
-                "symbols": sorted(self._ticks)}
+        out = {"listening": self._srv is not None, "port": self.port, "clients": clients,
+               "session": self.session(), "counters": dict(self.counters),
+               "symbols": sorted(self._ticks)}
+        if self.ledger is not None:
+            out["ledger"] = {**self.ledger.status(), "check": dict(self._ledger_check)}
+        return out
 
     def account_snapshot(self) -> dict:
         """The terminal's account for account_state.json (:mod:`..accounts`):
@@ -594,12 +926,16 @@ class MT5Gateway:
         with self._lock:
             by_magic = {c.magic: c.name for c in self._clients.values() if not c.readonly}
         acc: dict = {"account": "terminal", "currency": None, "equity": None,
-                     "balances": None, "margin": None, "positions": None,
+                     "credit": None, "balances": None, "margin": None, "positions": None,
                      "orders": None, "errors": {}, "scope": {}}
         try:
             a = self._backend("get_account")
             acc["currency"] = a.currency
             acc["equity"] = a.equity
+            # the broker's credit: inside MT5's equity (balance + credit +
+            # floating P/L), never the account's own money nor a P/L
+            credit = (a.raw or {}).get("credit") if isinstance(a.raw, dict) else None
+            acc["credit"] = float(credit) if credit is not None else None
             acc["balances"] = [{"currency": a.currency, "total": a.balance,
                                 "free": None, "used": None}]
         except Exception as e:                              # noqa: BLE001
@@ -616,7 +952,9 @@ class MT5Gateway:
             return int(v) if v is not None else None
         try:
             rows = []
-            for p in self._backend("get_positions") or []:
+            held = (self._ledger_positions() if self.ledger is not None
+                    else self._backend("get_positions") or [])
+            for p in held:
                 mg = magic_of(p)
                 # MT5 keeps the swap with the open position and books it at
                 # the close (equity = balance + profit + swap): open PnL
@@ -688,6 +1026,12 @@ class MT5Gateway:
             out[sym] = {"bid": bid, "ask": ask, "mid": (bid + ask) / 2.0,
                         "t": ts.timestamp() if ts is not None else self._clock()}
         return out
+
+
+def _ms(dt: datetime) -> int:
+    """A datetime as epoch ms; a naive one is read as UTC (the broker clock
+    labelled UTC, as the terminal reads it)."""
+    return int((dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp() * 1000)
 
 
 def _kind_of(e: Exception) -> str:

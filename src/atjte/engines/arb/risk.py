@@ -211,6 +211,9 @@ class DayBook:
     venue_volume_usd: float = 0.0    # perp notional traded today
     mt5_volume_usd: float = 0.0       # MT5 hedge notional traded today
     loss_latched: bool = False
+    #: the loss limit the latch was set under (0 = unknown, a state written
+    #: before it was kept): raising the limit above it may release the latch
+    loss_latched_cap: float = 0.0
     venue_volume_latched: bool = False
     mt5_volume_latched: bool = False
 
@@ -226,6 +229,7 @@ class DayBook:
         self.bases = {}
         self.venue_volume_usd = self.mt5_volume_usd = 0.0
         self.loss_latched = False
+        self.loss_latched_cap = 0.0
         self.venue_volume_latched = self.mt5_volume_latched = False
         return True
 
@@ -256,7 +260,7 @@ class DayBook:
         out.date = str(d.get("date") or "")
         for k in ("realized_venue_usd", "realized_mt5_usd", "funding_usd",
                   "fees_venue_usd", "mt5_costs_usd",
-                  "venue_volume_usd", "mt5_volume_usd"):
+                  "venue_volume_usd", "mt5_volume_usd", "loss_latched_cap"):
             try:
                 setattr(out, k, float(d.get(k, 0.0) or 0.0))
             except (TypeError, ValueError):
@@ -299,13 +303,23 @@ def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
     a counter that cannot fall must not re-open the book. (``sample_project``
     keeps its equivalent latch until the process restarts; here the reset is
     the day roll, which is what "close-only for the rest of the day" means.)
+    One exception, the operator's: a loss limit RAISED above the one the
+    latch was set under, with today's PnL above the new limit, releases it
+    (MGC 2026-10-22: latched at a lower cap, raised to 2,500, still
+    close-only at −1,688). A lowered limit never releases. A latch of unknown
+    cap (state written before it was kept) follows the current limit once.
     None or a non-positive limit is off. A PnL of None cannot latch the loss
     limit but never clears one either."""
     reasons: list[str] = []
     if max_loss_usd and max_loss_usd > 0:
         cap = float(max_loss_usd)
+        if (day.loss_latched and pnl_usd is not None and pnl_usd > -cap
+                and cap > day.loss_latched_cap):
+            day.loss_latched = False
+            day.loss_latched_cap = 0.0
         if pnl_usd is not None and pnl_usd <= -cap:
             day.loss_latched = True
+            day.loss_latched_cap = max(day.loss_latched_cap, cap)
         if day.loss_latched:
             shown = "n/a" if pnl_usd is None else f"{pnl_usd:+.2f}"
             reasons.append(f"daily loss limit hit (today {shown} USD <= -{cap:g})")

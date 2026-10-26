@@ -260,17 +260,37 @@ def fee_usd(fee: Optional[float], fee_ccy: Optional[str], price: float,
     return None
 
 
-def venue_realized_pnl(info) -> Optional[float]:
+def venue_realized_pnl(info, fee: Optional[float] = None) -> Optional[float]:
     """The realized PnL a venue reports on one fill, before fees, or None:
     Kraken Futures' ``realized_pnl``, Hyperliquid's ``closedPnl`` (0 on an
     opening fill; over JP225's whole history it summed to the average-cost
-    replay of the same fills to the cent)."""
+    replay of the same fills to the cent), IBKR's :func:`ibkr_realized_gross`
+    (which needs the fill's ``fee``)."""
     info = info or {}
+    if "ib_realized_pnl_net" in info:
+        return ibkr_realized_gross(_f(info.get("ib_realized_pnl_net")), _f(fee))
     for k in ("realized_pnl", "closedPnl"):
         v = _f(info.get(k))
         if v is not None:
             return v
     return None
+
+
+def ibkr_realized_gross(net: Optional[float], fee: Optional[float]) -> Optional[float]:
+    """IBKR's realized PnL on one execution as the report books it: before
+    fees, the fees counted once in their own column. TWS's ``realizedPNL``
+    is net of BOTH commissions — the closing execution's, and the opening
+    one's that its average cost carries — so both are added back. The
+    opening commission is not reported apart; IBKR charges a contract the
+    same per-contract rate both ways, so the closing ``fee`` stands for it
+    (MGC 2026-10-21: 0.96 a contract each way). 0 on an opening execution;
+    None before TWS's commission report (no ``fee`` yet, the net unset), so
+    the reader replays the fills instead of guessing."""
+    if net is None or fee is None:
+        return None
+    if net == 0.0:
+        return 0.0
+    return net + 2.0 * abs(fee)
 
 
 def fill_record(venue: str, *, trade_id: str, ts: float, side: str,
@@ -589,13 +609,17 @@ def order_row(order_id: str, side: str, price: float, amount: float,
 def mt5_block(*, symbol: str, magic: int, ok: bool, contract: float,
               srv_offset_s: Optional[float], account: Optional[dict],
               top: Optional[dict], positions: Optional[list],
-              hedge_ratio: float = 1.0, swap: Optional[dict] = None) -> dict:
+              hedge_ratio: float = 1.0, swap: Optional[dict] = None,
+              fx_rate: float = 1.0) -> dict:
     """``contract`` is the broker's MT5 units per lot and ``top`` the MT5
     quote as quoted; ``hedge_ratio`` is k in spread = venue − k × MT5 (the
     engine's ``HEDGE_RATIO``: MT5 units hedged per venue unit); ``swap`` the
-    symbol's swap terms (:func:`swap_terms`)."""
+    symbol's swap terms (:func:`swap_terms`); ``fx_rate`` the MT5 symbol's
+    profit currency per venue quote currency (``FX_CONVERSION_SYMBOL``'s
+    rate, 1 when the two match)."""
     return {"symbol": symbol, "magic": int(magic), "ok": bool(ok),
             "contract": float(contract), "hedge_ratio": float(hedge_ratio),
+            "fx_rate": float(fx_rate or 1.0),
             "srv_offset_s": srv_offset_s,
             "ts": time.time(), "account": account, "top": top,
             "positions": positions, "swap": swap}
@@ -1073,7 +1097,8 @@ class Reporter:
         return {"ccy": ccy, "usd_rate": rate, "equity": _f(acct.equity),
                 "balance": _f(acct.balance), "margin": _f(mm.used),
                 "margin_free": _f(mm.free), "margin_level": _f(mm.level),
-                "profit": _f(raw.get("profit")), "leverage": _f(mm.leverage),
+                "profit": _f(raw.get("profit")), "credit": _f(raw.get("credit")),
+                "leverage": _f(mm.leverage),
                 "ts": time.time()}
 
     def _fx_rate(self, client, ccy: str) -> Optional[float]:
@@ -1369,6 +1394,7 @@ class Report:
         vm = v.get("margin") or {}
         v_ccy = (vm.get("ccy") or "USD").upper()
         v_fx = fx if (v_ccy == ccy and v_ccy not in STABLE_USD) else None
+        v_rate = _f(vm.get("usd_rate")) or 1.0
         out = accounting.daily_pnl(self.fills(), self.deals(), magic,
                                    funding=self.funding(), since_ts=since,
                                    until_ts=until_ts, contract=contract,
@@ -1377,8 +1403,8 @@ class Report:
                                    seed_avg=seed.get("avg_price"),
                                    venue_deals=self.venue_deals(),
                                    venue_magic=v.get("magic"),
-                                   venue_rate=_f(vm.get("usd_rate")) or 1.0,
-                                   venue_fx=v_fx)
+                                   venue_rate=v_rate, venue_fx=v_fx,
+                                   mt5_price_rate=v_rate / (_f(mt5.get("fx_rate")) or 1.0))
         sm = out["summary"]
         sm["mt5_ccy"] = ccy
         sm["mt5_fx_missing"] = (ccy not in STABLE_USD and not spot

@@ -479,6 +479,19 @@ class MT5Client(UniversalClient):
         return None if m is None else float(m)
 
     @_serialised
+    def calc_profit(self, symbol: str, side: str, lots: float, price_open: float,
+                    price_close: float) -> Optional[float]:
+        """The profit, in the ACCOUNT currency, of ``lots`` of ``symbol``
+        opened on ``side`` at ``price_open`` and closed at ``price_close`` —
+        the terminal's own ``order_calc_profit`` (its contract size, tick
+        value and currency conversion). None when the terminal cannot say."""
+        mt5.symbol_select(symbol, True)
+        buy = str(side).lower() == "buy"
+        v = mt5.order_calc_profit(mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL,
+                                  symbol, float(lots), float(price_open), float(price_close))
+        return None if v is None else float(v)
+
+    @_serialised
     def get_symbol_specs(self, symbol: str) -> dict:
         """Contract/lot specs for `symbol` — connector extra beyond
         ``UniversalClient``. Strategies need these to convert exchange base

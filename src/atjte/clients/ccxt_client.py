@@ -228,9 +228,12 @@ class CCXTClient(UniversalClient):
         filled = float(o.get("filled") or 0.0)
         remaining = o.get("remaining")
         otype = o.get("type") or "limit"
+        oid = o.get("id")
         return Order(
             exchange=self.name,
-            order_id=str(o.get("id")),
+            # an order with no id stays "" — str(None) is the id "None",
+            # which a later cancel / read sends to the venue as if real
+            order_id="" if oid is None else str(oid),
             symbol=o.get("symbol") or "",
             side=OrderSide(o.get("side")) if o.get("side") else OrderSide.BUY,
             type=OrderType(otype) if otype in OrderType._value2member_map_ else OrderType.LIMIT,
