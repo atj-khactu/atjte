@@ -29,7 +29,8 @@ import os
 from pathlib import Path
 
 #: the gateway kinds, = the folder names under ``gateways/`` and ``templates/``
-KINDS = ("fix", "hyperliquid", "lighter", "ccxt", "ibkr", "mt5", "ctrader", "databento")
+KINDS = ("fix", "hyperliquid", "lighter", "ccxt", "ibkr", "mt5", "ctrader", "databento",
+         "exante")
 
 #: overrides where the instances live (tests, a standalone gateway host)
 ENV_DIR = "ATJTE_GATEWAYS_DIR"

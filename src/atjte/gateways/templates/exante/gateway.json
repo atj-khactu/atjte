@@ -1,0 +1,16 @@
+{
+  "_comment": "An EXANTE gateway: one process per EXANTE account owns the two FIX sessions (FEED for quotes, TRADE for orders, with CancelOnDisconnect) and the HTTP API key (polled reads: account summary, positions, orders, fills, fees); the bots lease it. 'network' is demo or live; 'fix_host' the FIX bridge (demo: fixuat2.exante.eu; live: the one EXANTE assigned, e.g. fixprodeu.exante.eu). 'symbols' are EXANTE ids (XAU/USD.E.FX, AAPL.NASDAQ, GC.COMEX.Z2026). 'tif' DAY is what CancelOnDisconnect cancels. EXANTE allows 25 order requests per 10 s: msgs_per_min stays at or under 150.",
+  "name": "exante_demo",
+  "venue": "exante",
+  "network": "demo",
+  "listen_port": 5691,
+  "fix_host": "fixuat2.exante.eu",
+  "symbols": [
+    "XAU/USD.E.FX"
+  ],
+  "depth": 10,
+  "tif": "DAY",
+  "msgs_per_min": 138,
+  "max_inflight": 10,
+  "clients": []
+}

@@ -1193,9 +1193,10 @@ def _reject_kind(text: str) -> str:
 
 
 #: the gateways that are not Kraken FIX: venue -> its config module
-#: (cTrader first: the others take any folder PATH holding a gateway.json as
-#: theirs; cTrader's checks its venue)
+#: (cTrader and EXANTE first: the others take any folder PATH holding a
+#: gateway.json as theirs; these two check its venue)
 _OTHER_VENUES = {"ctrader": "atjte.gateways.ctrader.config",
+                 "exante": "atjte.gateways.exante.config",
                  "hyperliquid": "atjte.gateways.hyperliquid.config",
                  "lighter": "atjte.gateways.lighter.config",
                  "ccxt": "atjte.gateways.ccxt.config",
@@ -1270,6 +1271,9 @@ def main(argv=None) -> int:
     if other == "databento":
         from atjte.gateways.databento.daemon import main as db_main
         return db_main(args_in)
+    if other == "exante":
+        from atjte.gateways.exante.daemon import main as ex_main
+        return ex_main(args_in)
 
     ap = argparse.ArgumentParser(prog="atjte-gateway")
     ap.add_argument("gateway", nargs="?", type=Path,

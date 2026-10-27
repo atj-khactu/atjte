@@ -2,10 +2,10 @@
 system consults: the connectors refuse any other CCXT id, the control
 panel offers only these on its settings page and in its market catalogue.
 
-Six venues, keyed by the CCXT ids that reach them (an exchange with a
-separate derivatives API is two ids; ``ibkr`` is not a CCXT exchange at all —
-its gateway hands the bot CCXT-SHAPED markets, so the engine's math is the
-same)::
+The venues, keyed by the CCXT ids that reach them (an exchange with a
+separate derivatives API is two ids; ``ibkr`` and ``exante`` are not CCXT
+exchanges at all — their gateways hand the bot CCXT-SHAPED markets, so the
+engine's math is the same)::
 
     kraken         Kraken spot                 krakenfutures   Kraken Futures (perpetuals)
     coinbase       Coinbase (Advanced Trade)
@@ -13,6 +13,7 @@ same)::
     hyperliquid    Hyperliquid (perpetuals + spot)
     lighter        Lighter (perpetuals)
     ibkr           Interactive Brokers (listed futures, through TWS / IB Gateway)
+    exante         EXANTE (FX, CFDs, stocks, futures; FIX orders, REST reads)
     mt5            an MT5 broker's CFD as the QUOTE leg (market orders only)
 
 ``family`` is the exchange name a user thinks in (``kraken``, ``binance``);
@@ -27,13 +28,14 @@ from dataclasses import dataclass
 from typing import Optional
 
 #: The exchanges, in the order the panel lists them.
-FAMILIES = ("kraken", "coinbase", "binance", "hyperliquid", "lighter", "ibkr", "mt5")
+FAMILIES = ("kraken", "coinbase", "binance", "hyperliquid", "lighter", "ibkr", "exante",
+            "mt5")
 
 #: The ids that are NOT CCXT exchanges: their gateway speaks the platform's
 #: own API and hands the bot CCXT-SHAPED markets, tickers and fills, so the
 #: engine is unchanged — but nothing may look them up in ``ccxt`` /
 #: ``ccxt.pro`` (the registry's honesty tests, the panel's catalogue).
-NON_CCXT = ("ibkr", "mt5")
+NON_CCXT = ("ibkr", "exante", "mt5")
 
 
 #: the order-execution transports, most direct last. These are the values of
@@ -103,6 +105,11 @@ SUPPORTED: dict[str, Venue] = {
     # API and hands the bot CCXT-shaped markets, tickers and fills. The keys
     # live in TWS itself (the gateway knows only the account id).
     "ibkr": Venue("ibkr", "ibkr", "Interactive Brokers (futures)", "future"),
+    # not a CCXT exchange: the EXANTE gateway (atjte.gateways.exante) quotes
+    # and orders over EXANTE's FIX, polls its HTTP API, and hands the bot
+    # CCXT-shaped markets (XAU/USD:USD for XAU/USD.E.FX), tickers and fills.
+    # The keys live in the gateway's own gateway.env.
+    "exante": Venue("exante", "exante", "EXANTE (FX, CFDs, stocks, futures)", "perp"),
     # not a CCXT exchange: an MT5 terminal's symbol through that terminal's
     # MT5 gateway (atjte.clients.gateway.MT5VenueClient) — a CFD against
     # another broker's CFD, traded with MARKET orders on both legs
@@ -188,7 +195,7 @@ def transports(exchange_id: Optional[str]) -> tuple[str, ...]:
 #: Which gateway kind serves a venue — its own where it has one, the CCXT
 #: gateway otherwise; a Kraken venue can also take the Kraken FIX gateway.
 GATEWAY_KIND_OF = {"hyperliquid": "hyperliquid", "lighter": "lighter", "ibkr": "ibkr",
-                   "mt5": "mt5"}
+                   "exante": "exante", "mt5": "mt5"}
 FIX_GATEWAY_VENUES = ("kraken", "krakenfutures")
 #: the bot-side connector for each gateway kind (``VENUE_CLIENT``)
 GATEWAY_CONNECTORS = {
@@ -196,6 +203,7 @@ GATEWAY_CONNECTORS = {
     "hyperliquid": "atjte.clients.gateway.HyperliquidGatewayClient",
     "lighter": "atjte.clients.gateway.LighterGatewayClient",
     "ibkr": "atjte.clients.gateway.IbkrGatewayClient",
+    "exante": "atjte.clients.gateway.ExanteGatewayClient",
     "mt5": "atjte.clients.gateway.MT5VenueClient",
     "fix:kraken": "atjte.clients.gateway.KrakenFixClient",
     "fix:krakenfutures": "atjte.clients.gateway.KrakenFuturesFixClient",

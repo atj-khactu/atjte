@@ -29,7 +29,7 @@
     "BASIS_RELEASE": "0.25",
     "OPTIMIZE_LIMIT_OFFSET": "None",
     "OPTIMIZE_LIMIT_TAKER": "False",
-    "REQUOTE_MIN_MOVE": "0",
+    "REQUOTE_MIN_MOVE": "0.25",
     "ORDER_OPS_PER_S": "None",
     "ORDER_OPS_BURST": "10.0",
     "ALLOW_TAKER_ENTRY": "True",

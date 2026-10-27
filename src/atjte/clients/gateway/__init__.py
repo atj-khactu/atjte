@@ -9,6 +9,8 @@ key; it leases a gateway (:mod:`atjte.gateways`) over loopback:
   machine's Hyperliquid / Lighter gateway;
 - ``IbkrGatewayClient`` — Interactive Brokers futures through the IBKR
   gateway (TWS / IB Gateway);
+- ``ExanteGatewayClient`` — EXANTE (FX, CFDs, stocks, futures) through the
+  EXANTE gateway (FIX quotes and orders, REST reads);
 - ``KrakenFixClient`` / ``KrakenFuturesFixClient`` — Kraken spot /
   derivatives with order entry over the Kraken FIX gateway (which serves the
   reads, prices and fills too);
@@ -31,6 +33,7 @@ _LAZY = {"CcxtGatewayClient": ".ccxt_gateway",
          "HyperliquidGatewayClient": ".hyperliquid_gateway",
          "LighterGatewayClient": ".lighter_gateway",
          "IbkrGatewayClient": ".ibkr_gateway",
+         "ExanteGatewayClient": ".exante_gateway",
          "MT5GatewayClient": ".mt5_gateway",
          "CTraderGatewayClient": ".ctrader_gateway",
          "IbkrHedgeGatewayClient": ".ibkr_hedge_gateway",
