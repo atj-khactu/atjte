@@ -188,6 +188,44 @@ class AccountTest(unittest.TestCase):
         self.assertAlmostEqual(v.upnl, 150.0 * 1.16)            # every ticket, in USD
 
 
+class AdoptedBookTest(unittest.TestCase):
+    """2026-10-27: a quote book under another magic read as flat, and the
+    startup hedge closed the real hedge. Adopted magics count; every other
+    magic is reported as foreign."""
+
+    def _lease(self):
+        lease = FakeLease()
+        lease.positions = [_pos(1, PositionSide.LONG, 0.01, 77020),
+                           _pos(2, PositionSide.LONG, 0.03, 77016),
+                           _pos(3, PositionSide.SHORT, 0.02, 0)]
+        return lease
+
+    def test_foreign_tickets_are_named_by_magic(self):
+        c = _client(self._lease())
+        self.assertEqual([p.position_id for p in c.get_positions()], ["1"])
+        self.assertEqual(c.foreign_positions(), {77016: 0.03, 0: -0.02})
+
+    def test_an_adopted_magic_counts_and_is_not_foreign(self):
+        c = _client(self._lease())
+        c.adopt_magics = frozenset({77016})
+        self.assertEqual(sorted(p.position_id for p in c.get_positions()), ["1", "2"])
+        self.assertEqual(c.foreign_positions(), {0: -0.02})
+
+    def test_an_adopted_ticket_is_never_closed_by(self):
+        lease = FakeLease()
+        lease.positions = [_pos(1, PositionSide.SHORT, 0.01, 77020),
+                           _pos(2, PositionSide.LONG, 0.01, 77016)]
+        c = _client(lease)
+        c.adopt_magics = frozenset({77016})
+        c._compact()
+        self.assertEqual(lease.closed, [])
+
+    def test_adopting_its_own_magic_is_refused(self):
+        with self.assertRaises(ValueError):
+            MT5VenueClient(symbol="XAUUSD247.i", magic=77020, gateway_port=5623,
+                           gateway_token="t", adopt_magics=[77020])
+
+
 class DealHistoryTest(unittest.TestCase):
     """The broker's booked results: the report reads them on this
     terminal's clock (:meth:`atjte.reporting.Reporter.read_venue_deals`)."""

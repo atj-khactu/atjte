@@ -471,6 +471,8 @@ MT5_DEVIATION_POINTS = _cfg("MT5_DEVIATION_POINTS")
 MT5_COMMENT = None if _cfg("MT5_COMMENT") is None else str(_cfg("MT5_COMMENT")).strip()
 MT5_QUOTE_COMMENT = (None if _cfg("MT5_QUOTE_COMMENT") is None
                      else str(_cfg("MT5_QUOTE_COMMENT")).strip())
+#: other magics whose SYMBOL_VENUE tickets count as an MT5 QUOTE leg's position
+MT5_QUOTE_ADOPT_MAGICS = tuple(int(m) for m in (_cfg("MT5_QUOTE_ADOPT_MAGICS") or ()))
 #: MT5 truncates an order comment at 31 characters
 MT5_COMMENT_MAX = 31
 HEDGE_THRESHOLD_UNITS = _cfg("HEDGE_THRESHOLD_UNITS")
@@ -1275,7 +1277,9 @@ class ArbBot:
     def __init__(self) -> None:
         # an MT5 quote leg's order comment (MT5VenueClient's ``comment``);
         # no other connector takes one
-        quote_opts = ({"comment": self.quote_comment} if EXCHANGE_ID == "mt5" else {})
+        quote_opts = ({"comment": self.quote_comment,
+                       "adopt_magics": list(MT5_QUOTE_ADOPT_MAGICS)}
+                      if EXCHANGE_ID == "mt5" else {})
         self.venue = Venue(EXCHANGE_ID, SYMBOL_VENUE, client_path=VENUE_CLIENT,
                            client_options={**VENUE_CLIENT_OPTIONS, **quote_opts,
                                            "client_name": f"{PROJECT_DIR.name}_{STRATEGY_DIR.name}",
@@ -1726,6 +1730,13 @@ class ArbBot:
             _log(f"WARNING: EXECUTION_MODE 'market' with BASIS_MODE {BASIS_MODE!r} — the "
                  f"trigger judges a spread the pair does not execute at (market-market "
                  f"is: buy at the venue ask vs the hedge bid, sell the reverse)")
+        if (MARKET_PAIR and not LIVE_TRADING
+                and getattr(self.venue.client, "margin_verified", True) is False):
+            _log(f"WARNING: {SYMBOL_VENUE}: the broker's margin could not be read ("
+                 f"{getattr(self.venue.client, 'margin_note', '') or 'no reason given'}) — "
+                 f"this DRY RUN sizes its margin checks on the ACCOUNT leverage, which "
+                 f"may be far below what the broker charges this symbol (a fixed-rate CFD: "
+                 f"10 % where 1:500 says 0.2 %); a LIVE start is refused until it reads")
         if (MARKET_PAIR and LIVE_TRADING
                 and getattr(self.venue.client, "margin_verified", True) is False):
             note = getattr(self.venue.client, "margin_note", "") or (
@@ -1743,6 +1754,8 @@ class ArbBot:
                  + ("" if LIVE_TRADING else
                     f" — DRY RUN: PAPER pairs at the touch, paper position "
                     f"{self.paper_pos_units:+g} units, report/paper_trades.jsonl"))
+            if not LIVE_TRADING:
+                self._check_paper_book()
         self.mt5.connect()
         self._check_netting_hedge()
         self._apply_leverage()      # LEVERAGE / MARGIN_MODE, once, never fatal
@@ -1880,6 +1893,9 @@ class ArbBot:
         # a hedge book under another magic is invisible to the parity read:
         # the startup hedge would double it (2026-10-15) — refuse first
         self._check_foreign_hedge_book(drift)
+        # ...and a QUOTE book under another magic (an MT5 quote leg) reads as
+        # flat: the startup hedge then CLOSES the real hedge (2026-10-27)
+        self._check_foreign_quote_book()
         self._hedge(source="startup")  # correct any startup drift immediately
         # resync pos_units to the venue position so the strategy never begins
         # from a diverged tracked position
@@ -3273,6 +3289,16 @@ class ArbBot:
         if MARKET_PAIR and not LIVE_TRADING:
             return self.paper_pos_units
         return self.venue_pos_units if self.venue_pos_units is not None else self.pos_units
+
+    def _reported_position_units(self) -> float:
+        """The REAL venue position, for every figure the bot reports (the
+        snapshot, the heartbeat, the report seed): a dry-run market pair's
+        paper position is its own bookkeeping, never shown — it only
+        confused the dashboard (+0.63 contracts the account did not hold,
+        2026-10-27); report/paper_trades.jsonl keeps it."""
+        if MARKET_PAIR and not LIVE_TRADING:
+            return self.venue_pos_units if self.venue_pos_units is not None else 0.0
+        return self._position_units()
 
     def _venue_exposure_units(self) -> float:
         """The crypto-leg exposure MT5 must offset."""
@@ -4742,6 +4768,74 @@ class ArbBot:
                 out[magic] = f.parent.name
         return out
 
+    def _other_project_quote_magics(self) -> dict[int, str]:
+        """``{magic: project}``: the OTHER projects of this catalogue whose
+        MT5 quote leg trades SYMBOL_VENUE — their quote tickets are theirs.
+        Read as literals, never executed."""
+        from atjte import settings_io as _sio
+        out: dict[int, str] = {}
+        try:
+            files = sorted(PROJECT_DIR.parent.glob("*/project_settings.py"))
+        except OSError:
+            return out
+        for f in files:
+            if f.parent.resolve() == PROJECT_DIR.resolve():
+                continue
+            v = _sio.read_values(f)
+            opts = v.get("VENUE_CLIENT_OPTIONS")
+            try:
+                magic = int(opts.get("magic")) if isinstance(opts, dict) else None
+            except (TypeError, ValueError):
+                magic = None
+            if magic is not None and str(v.get("SYMBOL_VENUE") or "") in ("", str(SYMBOL_VENUE)):
+                out[magic] = f.parent.name
+        return out
+
+    def _check_foreign_quote_book(self) -> None:
+        """An MT5 QUOTE leg reads its position by its own magic (and
+        MT5_QUOTE_ADOPT_MAGICS): tickets under any other magic on its symbol
+        are invisible, so the parity read takes the leg as flatter than it is
+        and the startup hedge would "correct" a drift that is not there — on
+        2026-10-27 the strategy ID had been edited to an old deployment's
+        magic, the quote leg read flat, and the startup CLOSED the 0.03-lot
+        hedge of the 0.03 lot it could not see. So a LIVE start is refused
+        while the quote terminal holds such tickets; another project's quote
+        magic on the same symbol is only named. A dry run warns."""
+        client = self._mt5_quote_client()
+        fn = getattr(client, "foreign_positions", None)
+        if fn is None:
+            return
+        try:
+            foreign = fn(SYMBOL_VENUE)
+        except Exception as e:                              # noqa: BLE001
+            _log(f"foreign quote book check skipped: {type(e).__name__}: {e}")
+            return
+        if not foreign:
+            return
+        known = self._other_project_quote_magics()
+        theirs = {m: q for m, q in foreign.items() if m in known}
+        unknown = {m: q for m, q in foreign.items() if m not in known}
+        if theirs:
+            _log("note: " + ", ".join(f"quote magic {m} ({known[m]}) holds {q:+g} lot "
+                                      f"{SYMBOL_VENUE}" for m, q in sorted(theirs.items()))
+                 + " — another project's quote book, not counted here")
+        if not unknown:
+            return
+        what = ", ".join(f"magic {m}{' (hand trades)' if m == 0 else ''}: {q:+g} lot"
+                         for m, q in sorted(unknown.items()))
+        msg = (f"{SYMBOL_VENUE} on the quote terminal holds tickets this bot cannot see "
+               f"({what}); this leg reads magic {getattr(client, 'magic', '?')}"
+               + (f" and adopts {', '.join(map(str, MT5_QUOTE_ADOPT_MAGICS))}"
+                  if MT5_QUOTE_ADOPT_MAGICS else "")
+               + f". Its position would read flatter than it is, and the startup hedge "
+                 f"would trade the difference against a hedge that is right. Close those "
+                 f"tickets, or adopt them: MT5_QUOTE_ADOPT_MAGICS = "
+                 f"{sorted(unknown)} (and MT5_ADOPT_MAGICS for their hedge, if it is under "
+                 f"another magic too)")
+        if LIVE_TRADING:
+            raise RuntimeError(msg + " — refusing to start LIVE")
+        _log(f"WARNING: {msg} (dry run: no order is sent)")
+
     def _check_foreign_hedge_book(self, drift: float) -> None:
         """Refuse a LIVE start when the startup hedge would land on top of
         a hedge book this bot cannot see.
@@ -5046,6 +5140,24 @@ class ArbBot:
         self.paper_pairs = int(d.get("pairs") or 0)
         self._paper_vl = Ledger.from_dict(d.get("venue_ledger"))
         self._paper_hl = Ledger.from_dict(d.get("mt5_ledger"))
+
+    def _check_paper_book(self) -> None:
+        """Warn when the persisted paper position no longer fits the order
+        size: paper_state.json outlives a size change (63 units left by a
+        GRID_LEVEL_UNITS change, 2026-10-27), and the grid then walks from a
+        position its levels cannot have made. Never changes the book."""
+        pos = self.paper_pos_units
+        try:
+            clip = float(self._clip_units() or 0.0)
+        except Exception:                                   # noqa: BLE001
+            return
+        if abs(pos) < POS_EPS or clip <= POS_EPS:
+            return
+        steps = abs(pos) / clip
+        if abs(steps - round(steps)) > 1e-6:
+            _log(f"WARNING: the paper position {pos:+g} units ({PAPER_FILE.name}) is not a "
+                 f"whole number of orders of {clip:g} — left by an earlier size setting? "
+                 f"Delete {PAPER_FILE} with the bot stopped to start the paper book flat")
 
     def _paper_fire(self, key: str, t: dict) -> None:
         """A market pair on paper: the venue at its touch, MT5 at its touch
@@ -6229,7 +6341,7 @@ class ArbBot:
         try:
             if self.venue_pos_units is None:
                 self._read_venue_position()
-            pos = self._position_units()
+            pos = self._reported_position_units()
             avg = (self.venue_entry_px if self.venue_pos_units is not None
                    else (self.venue_ledger.avg_cost if abs(pos) > POS_EPS else None))
             net, mt5_avg = self._read_mt5_book()
@@ -6465,7 +6577,10 @@ class ArbBot:
             funding = {"rate": self.funding_rate, "prediction": self.funding_rate_pred,
                        "next_ms": self.next_funding_ms, "mark": self.mark_px,
                        "index": self.index_px}
-        pos = self._position_units()
+        # the REAL venue position: a dry-run market pair's paper position is
+        # the bot's own bookkeeping, never shown as a venue holding (the
+        # panel listed +0.63 contracts the account did not hold, 2026-10-27)
+        pos = self._reported_position_units()
         entry = self.venue_entry_px if self.venue_pos_units is not None else (
             self.venue_ledger.avg_cost if abs(self.pos_units) > POS_EPS else None)
         if entry is None and abs(pos) > POS_EPS and self.venue_ledger.avg_cost:
@@ -6498,7 +6613,7 @@ class ArbBot:
     # ── monitoring snapshot ──────────────────────────────────────────────────
     def dump_state(self) -> None:
         k = self.venue_ticker
-        pos = self._position_units()
+        pos = self._reported_position_units()
         state = {
             "ts_utc": _utcnow(),
             "strategy": self.STRATEGY_KEY,          # which strategies/<dir> wrote
@@ -6576,8 +6691,7 @@ class ArbBot:
             "position_reconcile_last": self.position_reconcile_last,
             "mt5_net_units": self.mt5_net_units,
             "mt5_net_units_mt5": round(self.mt5_net_units * HEDGE_RATIO, 6),
-            "exposure_drift_units": round(self._venue_exposure_units()
-                                       + self.mt5_net_units, 4),
+            "exposure_drift_units": round(pos + self.mt5_net_units, 4),
             "hedge_ok": self.hedge_ok,
             # the hedge MT5 refused for the request itself, held (see _hedge)
             "hedge_refusal": ({k: v for k, v in self.hedge_refusal.items()

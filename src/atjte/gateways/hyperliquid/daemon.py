@@ -60,6 +60,10 @@ def write_state(path: Path, body: dict) -> bool:
     MT5 and CCXT daemons."""
     tmp = None
     try:
+        # the library this PROCESS runs: the panel flags a gateway started
+        # before an upgrade (it keeps running the old code until restarted)
+        from atjte import __version__ as _v
+        body = {"atjte_version": _v, **body}
         fd, tmp = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(body, f, indent=1, default=str)

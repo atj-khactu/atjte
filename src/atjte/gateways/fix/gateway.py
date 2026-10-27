@@ -1117,7 +1117,8 @@ def write_state(path, gw: "FixGateway", cfg, pid: int) -> None:
     from pathlib import Path
 
     path = Path(path)
-    body = {"name": cfg.name, "pid": int(pid), "t": time.time(),
+    from atjte import __version__ as _v
+    body = {"name": cfg.name, "pid": int(pid), "t": time.time(), "atjte_version": _v,
             "dialect": cfg.dialect.name, "host": cfg.host, "trd_port": cfg.trd_port,
             "listen_port": gw.port, "clients_allowed": list(cfg.clients),
             "keys_from": cfg.creds_source, "sender_from": cfg.sender_source,

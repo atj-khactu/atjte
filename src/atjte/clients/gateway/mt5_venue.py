@@ -64,6 +64,15 @@ class MT5Exchange(ccxt.Exchange):
         })
 
 
+def _magic_of(p) -> Optional[int]:
+    """A position's magic, or None when the terminal names none."""
+    m = (p.raw or {}).get("magic") if isinstance(getattr(p, "raw", None), dict) else None
+    try:
+        return None if m is None else int(m)
+    except (TypeError, ValueError):
+        return None
+
+
 def market_from_specs(symbol: str, specs: dict, leverage: Optional[float] = None) -> dict:
     """A CCXT-shaped contract market for an MT5 symbol from
     ``get_symbol_specs``: one contract = one lot."""
@@ -111,18 +120,26 @@ class MT5VenueClient(GatewayConnector):
     DEFAULT_GATEWAY_PORT = 5620
 
     def __init__(self, *args: Any, magic: int = 0, deviation: int = 20,
-                 comment: Optional[str] = None, fx_symbol: str = "", **kwargs: Any) -> None:
+                 comment: Optional[str] = None, fx_symbol: str = "",
+                 adopt_magics=(), **kwargs: Any) -> None:
         """``magic``: this bot's magic on THIS terminal (the gateway stamps
         it on every order and lets the bot close only its own tickets).
         ``fx_symbol``: the terminal's symbol that converts the account
         currency into the market's quote currency (``EURUSD.i`` for an EUR
         account quoting USD); unneeded when they are the same.
         ``comment``: the orders' MT5 comment, sent as given ("" = none);
-        not given = "atjte quote"."""
+        not given = "atjte quote".
+        ``adopt_magics``: other magics whose tickets on the symbol COUNT as
+        this leg's position (an inherited book: MT5_QUOTE_ADOPT_MAGICS). They
+        are read, never closed by close-by (the gateway closes only this
+        magic's tickets): a reducing order opens an opposite ticket."""
         if int(magic or 0) <= 0:
             raise ValueError("MT5VenueClient needs VENUE_CLIENT_OPTIONS['magic'] — the "
                              "bot's magic on the quote terminal")
         self.magic = int(magic)
+        self.adopt_magics = frozenset(int(m) for m in (adopt_magics or ()))
+        if self.magic in self.adopt_magics:
+            raise ValueError(f"adopt_magics lists the quote leg's own magic ({self.magic})")
         self.deviation = int(deviation)
         self.comment = "atjte quote" if comment is None else str(comment)[:31]
         self.fx_symbol = str(fx_symbol or "")
@@ -457,8 +474,8 @@ class MT5VenueClient(GatewayConnector):
         False keeps it as the broker states it)."""
         out = []
         for p in self.gateway.get_positions(symbol or self.symbol) or []:
-            magic = (p.raw or {}).get("magic") if isinstance(p.raw, dict) else None
-            if magic is not None and int(magic) != self.magic:
+            magic = _magic_of(p)
+            if magic is not None and magic != self.magic and magic not in self.adopt_magics:
                 continue
             out.append(p)
         if convert and out and any(p.unrealized_pnl is not None for p in out):
@@ -503,12 +520,29 @@ class MT5VenueClient(GatewayConnector):
                              daemon=True).start()
         return out
 
+    def _own(self, positions) -> list:
+        """THIS magic's tickets only (an adopted magic's are never closed)."""
+        return [p for p in positions if _magic_of(p) in (None, self.magic)]
+
+    def foreign_positions(self, symbol: Optional[str] = None) -> dict[int, float]:
+        """``{magic: signed lots}`` on the symbol under every magic that is
+        neither this leg's nor adopted — tickets this bot cannot see. Magic 0
+        is a hand trade (or another program)."""
+        out: dict[int, float] = {}
+        for p in self.gateway.get_positions(symbol or self.symbol) or []:
+            m = _magic_of(p)
+            if m is None or m == self.magic or m in self.adopt_magics:
+                continue
+            lots = float(p.size or 0.0) * (1.0 if p.side is PositionSide.LONG else -1.0)
+            out[m] = round(out.get(m, 0.0) + lots, 8)
+        return {m: q for m, q in out.items() if abs(q) > 1e-9}
+
     def _compact(self) -> None:
         """Pair this magic's long and short tickets off with close-by (a
         hedging-mode account books a reducing order as a new opposite
         ticket): net exposure unchanged, margin and swap of both freed."""
         try:
-            pos = self.get_positions(self.symbol)
+            pos = self._own(self.get_positions(self.symbol))
             longs = [p for p in pos if p.side is PositionSide.LONG]
             shorts = [p for p in pos if p.side is PositionSide.SHORT]
             while longs and shorts:
@@ -518,7 +552,7 @@ class MT5VenueClient(GatewayConnector):
                     self._log(f"mt5 quote: close-by #{a.position_id} by #{b.position_id} "
                               f"refused — tickets stay as they are (exposure unchanged)")
                     return
-                pos = self.get_positions(self.symbol)
+                pos = self._own(self.get_positions(self.symbol))
                 longs = [p for p in pos if p.side is PositionSide.LONG]
                 shorts = [p for p in pos if p.side is PositionSide.SHORT]
         except Exception as e:                              # noqa: BLE001

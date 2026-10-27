@@ -329,6 +329,14 @@ MT5_COMMENT = ""
 # own magic, not this, is how the bot knows the quote leg's tickets. Wins
 # over VENUE_CLIENT_OPTIONS['comment']. Ignored on any other Quote exchange.
 MT5_QUOTE_COMMENT = ""
+# An MT5 QUOTE leg's inherited book: other magics whose tickets on
+# SYMBOL_VENUE (its terminal) COUNT as this bot's quote position — what
+# MT5_ADOPT_MAGICS is for the hedge. Without them, tickets under another
+# magic are invisible to the bot, and a LIVE start is REFUSED while any are
+# open (2026-10-27: the strategy ID edited to an old deployment's magic, the
+# quote leg read flat, and the startup "corrected" by closing a real hedge).
+# Read, never closed by close-by. e.g. [77016]. Ignored off an MT5 quote leg.
+MT5_QUOTE_ADOPT_MAGICS = []
 
 # --- Reconcile (venue position vs MT5 exposure) ---
 # Every RECONCILE_INTERVAL_S: compare the venue's position with the MT5

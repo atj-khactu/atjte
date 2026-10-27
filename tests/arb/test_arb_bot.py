@@ -4874,6 +4874,76 @@ class HedgeSplitAndRefusalTest(unittest.TestCase):
                 self.assertEqual(bot._other_project_magics(), {2: "other"})
 
 
+class QuoteBookAndPaperTest(unittest.TestCase):
+    """2026-10-27: an MT5 quote leg read its own magic while its tickets were
+    under another (the strategy ID edited by hand), read flat, and the
+    startup closed the real hedge; and a dry run's paper position showed on
+    the dashboard as a venue holding."""
+
+    def setUp(self):
+        self._saved = (pb.LIVE_TRADING, pb.MARKET_PAIR, pb.MT5_QUOTE_ADOPT_MAGICS)
+        self.logs = []
+        p = mock.patch.object(pb, "_log", self.logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb.MARKET_PAIR, pb.MT5_QUOTE_ADOPT_MAGICS = self._saved
+
+    def _bot(self, foreign):
+        bot = make_bot()
+        client = types.SimpleNamespace(magic=77012, foreign_positions=lambda sym: dict(foreign))
+        bot._mt5_quote_client = lambda: client
+        bot._other_project_quote_magics = lambda: {}
+        return bot
+
+    def test_an_unseen_quote_book_refuses_a_live_start(self):
+        pb.LIVE_TRADING = True
+        with self.assertRaises(RuntimeError) as cm:
+            self._bot({77016: 0.03})._check_foreign_quote_book()
+        self.assertIn("77016", str(cm.exception))
+        self.assertIn("MT5_QUOTE_ADOPT_MAGICS", str(cm.exception))
+
+    def test_a_dry_run_only_warns(self):
+        pb.LIVE_TRADING = False
+        self._bot({77016: 0.03})._check_foreign_quote_book()
+        self.assertTrue(any("WARNING" in m and "77016" in m for m in self.logs), self.logs)
+
+    def test_nothing_foreign_or_another_projects_book_passes(self):
+        pb.LIVE_TRADING = True
+        self._bot({})._check_foreign_quote_book()
+        bot = self._bot({77030: 0.5})
+        bot._other_project_quote_magics = lambda: {77030: "other_project"}
+        bot._check_foreign_quote_book()
+        self.assertTrue(any("other_project" in m for m in self.logs), self.logs)
+
+    def test_not_an_mt5_quote_leg_is_not_checked(self):
+        pb.LIVE_TRADING = True
+        bot = make_bot()
+        bot._mt5_quote_client = lambda: None
+        bot._check_foreign_quote_book()
+
+    def test_the_paper_position_is_never_reported(self):
+        pb.MARKET_PAIR, pb.LIVE_TRADING = True, False
+        bot = make_bot()
+        bot.paper_pos_units = 63.0
+        self.assertEqual(bot._position_units(), 63.0)        # the grid still walks on it
+        self.assertEqual(bot._reported_position_units(), 0.0)
+        bot.venue_pos_units = 1.0
+        self.assertEqual(bot._reported_position_units(), 1.0)  # the account's own figure
+
+    def test_a_paper_book_off_the_order_size_warns(self):
+        bot = make_bot()
+        bot._clip_units = lambda: 10.0
+        bot.paper_pos_units = 63.0
+        bot._check_paper_book()
+        self.assertTrue(any("WARNING" in m and "63" in m for m in self.logs), self.logs)
+        self.logs.clear()
+        bot.paper_pos_units = 60.0
+        bot._check_paper_book()
+        self.assertEqual(self.logs, [])
+
+
 class DailyLimitEnforcementTest(unittest.TestCase):
     """2026-10-19: a LIVE bot never starts without a max daily loss and a
     daily volume cap on each exchange, and the day's loss counts the venue
