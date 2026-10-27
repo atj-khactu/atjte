@@ -228,6 +228,69 @@ class MarginRateTest(unittest.TestCase):
         self.assertIn("account leverage", how)
 
 
+class AccountCurrencyTest(unittest.TestCase):
+    """A EUR account on a USD-quoted symbol, with NO fx_symbol in the options
+    (what every strategy the panel makes has): until 2026-10-28 the margin
+    read failed and a LIVE start was refused."""
+
+    def _bare(self, lease):
+        c = _client(lease)
+        c.fx_symbol = ""
+        c._contract = SPECS["contract_size"]
+        return c
+
+    def test_the_terminal_s_own_rate_converts_the_margin(self):
+        lease = FakeLease()
+        lease.margin_1lot = 40000.0 / 1.16                  # 10 % of 400,000 USD, in EUR
+        # a 1 % move on one lot (100 oz x 40 USD = 4,000 USD) is 3,448.28 EUR
+        lease.calc_profit = lambda sym, side, lots, p0, p1: 100.0 * (p1 - p0) / 1.16
+        c = self._bare(lease)
+        lev, how = c._effective_leverage(SPECS)
+        self.assertAlmostEqual(lev, 10.0, places=6)
+        self.assertIn("broker", how)
+        self.assertEqual(c.fx_source, "the terminal's own rate")
+        self.assertEqual(c.margin_note, "")
+
+    def test_without_calc_profit_the_pair_is_found_by_the_symbol_s_suffix(self):
+        lease = FakeLease()
+        lease.margin_1lot = 40000.0 / 1.16
+        lease.wire.symbols = set()
+
+        def no_calc_profit(*a):
+            raise ConnectionError("calc_profit is not a read this gateway serves")
+        lease.calc_profit = no_calc_profit
+        asked = []
+        real = lease.get_ticker
+
+        def ticker(sym):
+            asked.append(sym)
+            if sym not in ("XAUUSD247.i", "EURUSD.i"):
+                lease.wire.symbols.add(sym)
+                raise ConnectionError(f"no symbol {sym}")
+            return real(sym)
+        lease.get_ticker = ticker
+        c = self._bare(lease)
+        lev, how = c._effective_leverage(SPECS)
+        self.assertAlmostEqual(lev, 400000.0 / 40000.0 * 1.16 / 1.16, places=2)
+        self.assertEqual(c.fx_symbol, "EURUSD.i")           # XAUUSD247.i's own suffix
+        pairs = [s for s in asked if s != "XAUUSD247.i"]
+        self.assertEqual(pairs[0], "EURUSD.i")              # the own suffix, tried first
+        self.assertEqual(lease.wire.symbols, set())         # no dead subscription left
+
+    def test_no_conversion_names_the_cause_and_the_fix(self):
+        lease = FakeLease()
+        lease.margin_1lot = 40000.0 / 1.16
+        lease.get_ticker = lambda sym: (_ for _ in ()).throw(ConnectionError("no")) \
+            if sym != "XAUUSD247.i" else types.SimpleNamespace(bid=4000.0, ask=4000.0)
+        lease.wire.symbols = set()
+        c = self._bare(lease)
+        lev, how = c._effective_leverage(SPECS)
+        self.assertEqual(lev, 100.0)                        # the account's, as a fallback
+        self.assertIn("EUR to USD", c.margin_note)
+        self.assertIn("fx_symbol", c.margin_note)
+        self.assertIn(c.margin_note, how)
+
+
 class FeedTest(unittest.TestCase):
     def test_no_fill_stream_and_health_from_the_lease(self):
         c = _client()

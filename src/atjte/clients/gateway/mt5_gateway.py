@@ -219,6 +219,12 @@ class MT5GatewayClient:
         """:meth:`atjte.clients.mt5.MT5Client.calc_margin`, through the gateway."""
         return self._call("calc_margin", symbol, side, lots, price)
 
+    def calc_profit(self, symbol: str, side: str, lots: float, price_open: float,
+                    price_close: float) -> Optional[float]:
+        """:meth:`atjte.clients.mt5.MT5Client.calc_profit`, through the gateway
+        (a gateway older than 0.2.16 refuses it: the caller falls back)."""
+        return self._call("calc_profit", symbol, side, lots, price_open, price_close)
+
     def bar_open(self, symbol: str, timeframe: str = "H1"):
         return self._call("bar_open", symbol, timeframe)
 

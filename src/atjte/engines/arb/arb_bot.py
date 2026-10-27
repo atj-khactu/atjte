@@ -1728,9 +1728,10 @@ class ArbBot:
                  f"is: buy at the venue ask vs the hedge bid, sell the reverse)")
         if (MARKET_PAIR and LIVE_TRADING
                 and getattr(self.venue.client, "margin_verified", True) is False):
+            note = getattr(self.venue.client, "margin_note", "") or (
+                "the quote gateway predates its calc_margin read — restart that gateway")
             raise RuntimeError(
-                f"{SYMBOL_VENUE}: the broker's margin could not be read (the quote "
-                f"gateway predates its calc_margin read — restart that gateway); the "
+                f"{SYMBOL_VENUE}: the broker's margin could not be read ({note}); the "
                 f"account leverage would be a guess, and an entry the broker then "
                 f"refuses still sends its hedge — refusing to start LIVE")
         if MARKET_PAIR:

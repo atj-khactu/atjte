@@ -128,6 +128,11 @@ class MT5VenueClient(GatewayConnector):
         self.fx_symbol = str(fx_symbol or "")
         self._orders: dict[str, Order] = {}
         self._fx: Optional[float] = None
+        #: how the account -> quote conversion was found (the start log)
+        self.fx_source = ""
+        self._contract = 1.0
+        #: why the broker's margin could not be read, when it could not
+        self.margin_note = ""
         self._srv_off: Optional[float] = None
         super().__init__(*args, **kwargs)
 
@@ -179,6 +184,7 @@ class MT5VenueClient(GatewayConnector):
                     self._log(f"mt5 quote gateway: {e} — waiting for it")
                 time.sleep(ATTACH_POLL_S)
         specs = self.gateway.get_symbol_specs(self.symbol)
+        self._contract = float(specs.get("contract_size") or 1.0)
         self._x = MT5Exchange({"enableRateLimit": False})
         refuse_network(self._x, f"{self.venue_label} via gateway")
         self._x.set_markets({self.symbol: market_from_specs(self.symbol, specs, None)})
@@ -192,7 +198,9 @@ class MT5VenueClient(GatewayConnector):
         self._x.markets[self.symbol]["limits"]["leverage"]["max"] = lev
         if lev:
             self._log(f"mt5 quote: {self.symbol} margin {100.0 / lev:.2f}% of notional "
-                      f"(1:{lev:.0f}, {how})")
+                      f"(1:{lev:.0f}, {how})"
+                      + (f"; account currency converted by {self.fx_source}"
+                         if self.fx_source else ""))
         # subscribe; a terminal that is not ready (Algo Trading off, no broker
         # link) answers no tick yet — the feed then reports it and the bot
         # sleeps until it is, as with any venue whose stream is down
@@ -212,22 +220,36 @@ class MT5VenueClient(GatewayConnector):
         the account currency. A fixed-rate CFD ignores the account leverage
         (Blueberry XAUUSD247.i: 10 % at 1:100); the account leverage is only
         the fallback, for a gateway that cannot answer."""
+        why = ""
         try:
             fn = getattr(self.gateway, "calc_margin", None)
             margin = fn(self.symbol, "buy", 1.0) if fn is not None else None
             t = self.gateway.get_ticker(self.symbol)
             acct = self.gateway.get_account()
-            rate = self._fx_rate(getattr(acct, "currency", "") or "")
+            ccy = getattr(acct, "currency", "") or ""
+            rate = self._fx_rate(ccy)
             notional = float(specs["contract_size"]) * float(t.ask)
             if margin and rate and notional > 0:
+                self.margin_note = ""
                 return notional / (float(margin) * rate), "the broker's own margin"
-        except Exception:                                   # noqa: BLE001
-            pass
+            if not margin:
+                why = (f"the terminal gave no margin for {self.symbol} (order_calc_margin; "
+                       f"an MT5 gateway older than calc_margin — restart it)")
+            elif not rate:
+                why = (f"no conversion from the account's {ccy} to {self.quote_currency}: "
+                       f"neither the terminal's own (calc_profit — restart the MT5 gateway "
+                       f"on this release) nor an FX symbol it quotes; set "
+                       f"VENUE_CLIENT_OPTIONS['fx_symbol'] (e.g. {ccy}{self.quote_currency})")
+            else:
+                why = f"no price for {self.symbol} yet"
+        except Exception as e:                              # noqa: BLE001
+            why = f"{type(e).__name__}: {e}"
+        self.margin_note = why
         try:
             lev = float(self.gateway.get_margin().leverage or 0) or None
         except Exception:                                   # noqa: BLE001
             lev = None
-        return lev, "the account leverage — the broker's margin could not be read"
+        return lev, f"the account leverage — the broker's margin could not be read ({why})"
 
     def disconnect(self) -> None:
         try:
@@ -323,12 +345,27 @@ class MT5VenueClient(GatewayConnector):
 
     # ── account ──────────────────────────────────────────────────────────────
     def _fx_rate(self, ccy: str) -> Optional[float]:
-        """Account currency -> the market's quote currency."""
+        """Account currency -> the market's quote currency (quote units per
+        account unit). ``fx_symbol`` when the options name one; else the
+        TERMINAL's own rate (:meth:`_terminal_fx`: the broker's cross rate,
+        no symbol name to guess); else the pair the terminal quotes under a
+        usual name (:meth:`_find_fx_symbol`). Until 2026-10-28 an account in
+        another currency than the symbol's quote (a EUR account on a USD
+        CFD) had no rate at all unless fx_symbol was set by hand — which no
+        panel form offered: its margin read failed, and LIVE was refused."""
         quote = self.quote_currency or "USD"
         if not ccy or ccy == quote:
             return 1.0
         if not self.fx_symbol:
-            return None
+            rate = self._terminal_fx()
+            if rate:
+                self._fx, self.fx_source = rate, "the terminal's own rate"
+                return rate
+            found = self._find_fx_symbol(ccy, quote)
+            if not found:
+                return self._fx
+            self.fx_symbol = found
+            self.fx_source = f"{found} (found on the terminal)"
         try:
             t = self.gateway.get_ticker(self.fx_symbol)
             mid = (float(t.bid) + float(t.ask)) / 2.0
@@ -340,6 +377,52 @@ class MT5VenueClient(GatewayConnector):
         elif name.startswith(quote.upper()) and ccy.upper() in name[3:6]:
             self._fx = 1.0 / mid if mid else None
         return self._fx
+
+    def _terminal_fx(self) -> Optional[float]:
+        """Quote units per account unit from the terminal itself: the value,
+        in the account currency, of a 1 % move on one lot of the symbol
+        (``order_calc_profit``, the broker's own conversion) against that
+        move in the quote currency (contract × move). None when the gateway
+        cannot answer (one older than calc_profit)."""
+        fn = getattr(self.gateway, "calc_profit", None)
+        if fn is None:
+            return None
+        try:
+            t = self.gateway.get_ticker(self.symbol)
+            px = float(t.bid or 0.0) or float(t.ask or 0.0)
+            if px <= 0:
+                return None
+            move = px * 0.01
+            profit = fn(self.symbol, "buy", 1.0, px, px + move)
+            if not profit or float(profit) <= 0:
+                return None
+            return (self._contract * move) / float(profit)
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def _find_fx_symbol(self, ccy: str, quote: str) -> Optional[str]:
+        """The pair converting ``ccy`` and ``quote`` that the terminal quotes:
+        ``EURUSD`` / ``USDEUR``, bare or with the quote symbol's own suffix
+        (``XAUUSD247.i`` -> ``.i``) or a usual one."""
+        own = self.symbol[self.symbol.find("."):] if "." in self.symbol else ""
+        suffixes = list(dict.fromkeys([own, "", ".i", ".a", ".r", ".raw", ".pro", ".m", "m",
+                                       ".ecn"]))
+        for base in (f"{ccy}{quote}", f"{quote}{ccy}"):
+            for sfx in suffixes:
+                name = base + sfx
+                try:
+                    t = self.gateway.get_ticker(name)
+                except Exception:                           # noqa: BLE001
+                    # a name the terminal does not list: off the lease's
+                    # subscriptions (they are re-sent on every reconnect)
+                    try:
+                        self.gateway.wire.symbols.discard(name)
+                    except Exception:                       # noqa: BLE001
+                        pass
+                    continue
+                if t is not None and float(t.bid or 0) > 0 and float(t.ask or 0) > 0:
+                    return name
+        return None
 
     def flex_account(self) -> dict:
         """The account's margin figures under the names ``Venue.read_margin``

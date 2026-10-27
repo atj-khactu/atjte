@@ -43,6 +43,9 @@ CLIENT_OPS = frozenset({HELLO, CALL, SUBSCRIBE, PING, BYE})
 READ_METHODS = frozenset({"get_account", "get_margin", "get_positions",
                           "get_open_orders", "get_trades", "history_deals",
                           "get_ticker", "get_symbol_specs", "bar_open", "calc_margin",
+                          # the terminal's own conversion of a price move into
+                          # the account currency (the MT5 quote leg's FX)
+                          "calc_profit",
                           # history: the bots backfill their report bars and
                           # warm their indicators from it at startup
                           "rates"})
