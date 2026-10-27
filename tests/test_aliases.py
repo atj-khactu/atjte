@@ -46,6 +46,7 @@ class CanonicaliseTest(unittest.TestCase):
             self.assertEqual(A.canonical(legacy), canon)
         self.assertEqual(A.canonical("GRID_LEVELS"), "GRID_LEVELS")       # canonical: itself
         self.assertEqual(A.canonical("GRID_STEP_USD"), "GRID_STEP")         # the unit left the name
+        self.assertEqual(A.canonical("DAILY_BLACKOUTS"), "DAILY_BREAKS")    # renamed 2026-10-27
 
 
 class IdentityDefaultsTest(unittest.TestCase):

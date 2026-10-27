@@ -624,7 +624,7 @@ MAX_DAILY_MT5_VOLUME_USD = None      # MT5 hedge notional traded today >= this -
 #    including the Sunday one — and the wild first prints of the reopen.
 #    0 = off.
 SESSION_REOPEN_BLACKOUT_MIN = 2.0
-# 2) DAILY_BLACKOUTS — times of day that recur, in BLACKOUT_TZ wall clock
+# 2) DAILY_BREAKS — times of day that recur, in BLACKOUT_TZ wall clock
 #    (so a DST zone follows the clock): the MT5 daily rollover, a session
 #    open, a fixing. Each entry is
 #        "HH:MM"                              (uses the default window)
@@ -643,7 +643,7 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 BLACKOUT_TZ = None
 BLACKOUT_BEFORE_MIN = 2.0        # default minutes BEFORE the moment
 BLACKOUT_AFTER_MIN = 2.0         # default minutes AFTER it
-DAILY_BLACKOUTS = []             # market opens / rollover (recurring)
+DAILY_BREAKS = []             # market opens / rollover (recurring)
 MACRO_EVENTS = []                # scheduled macroeconomic releases (one-off)
 # 4) Trading sessions — the hours of each weekday the bot may quote, in
 #    BLACKOUT_TZ wall clock; outside them it is a blackout like the others.

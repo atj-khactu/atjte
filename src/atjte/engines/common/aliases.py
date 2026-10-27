@@ -65,6 +65,9 @@ LEGACY_TO_CANONICAL: dict[str, str] = {
     "LONG_EXIT_SPREAD_USD": "LONG_EXIT_SPREAD",
     "SHORT_ENTRY_SPREAD_USD": "SHORT_ENTRY_SPREAD",
     "SHORT_EXIT_SPREAD_USD": "SHORT_EXIT_SPREAD",
+    # the schedule: the daily windows are breaks, as the panel names them
+    # (2026-10-27)
+    "DAILY_BLACKOUTS": "DAILY_BREAKS",
 }
 CANONICAL_TO_LEGACY: dict[str, str] = {v: k for k, v in LEGACY_TO_CANONICAL.items()}
 

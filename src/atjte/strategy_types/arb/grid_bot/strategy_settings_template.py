@@ -190,7 +190,7 @@ DERISK_MT5_FREE_MARGIN = None           # account ccy, MT5 free margin
 # ticking again, quotes are held for this long — the first prints of a
 # reopen are the widest of the day. 0 = off.
 SESSION_REOPEN_BLACKOUT_MIN = 2.0
-# DAILY_BLACKOUTS covers what a schedule must catch instead — the minutes
+# DAILY_BREAKS covers what a schedule must catch instead — the minutes
 # BEFORE a rollover or an open, which no live signal can see coming. Times
 # are wall clock in BLACKOUT_TZ (a DST zone follows the clock), each entry
 #     "HH:MM"                                   (default window below)
@@ -198,7 +198,7 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 #     ("HH:MM", before_min, after_min)
 #     ("HH:MM", "label", before_min, after_min)
 # Set them to YOUR broker's session times, e.g. with BLACKOUT_TZ = "UTC":
-#     DAILY_BLACKOUTS = [("20:59", "MT5 rollover", 2, 5),
+#     DAILY_BREAKS = [("20:59", "MT5 rollover", 2, 5),
 #                        ("22:05", "MT5 session open", 0, 3),
 #                        ("13:30", "US cash open")]
 # A mis-typed entry or an unknown timezone raises AT STARTUP — a schedule
@@ -206,7 +206,7 @@ SESSION_REOPEN_BLACKOUT_MIN = 2.0
 BLACKOUT_TZ = None          # IANA name every entry below is read in; None = the ACP timezone
 BLACKOUT_BEFORE_MIN = 2.0    # default minutes BEFORE the moment
 BLACKOUT_AFTER_MIN = 2.0     # default minutes AFTER it
-DAILY_BLACKOUTS = []
+DAILY_BREAKS = []
 
 # --- Trading blackout 2: scheduled macroeconomic events ---
 # One absolute moment each ("YYYY-MM-DD HH:MM" in BLACKOUT_TZ), same shapes

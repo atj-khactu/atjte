@@ -126,7 +126,7 @@ inherits them):
   around the moments where the perp and the CFD stop moving together:
   ``SESSION_REOPEN_BLACKOUT_MIN`` (2 min after the MT5 quote starts ticking
   again — every open, halt and the Sunday reopen, no schedule needed),
-  ``DAILY_BLACKOUTS`` (recurring wall-clock times in ``BLACKOUT_TZ``: the
+  ``DAILY_BREAKS`` (recurring wall-clock times in ``BLACKOUT_TZ``: the
   rollover, a session open) and ``MACRO_EVENTS`` (absolute moments: CPI,
   NFP, FOMC), each with its own ``before``/``after`` window
   (``BLACKOUT_BEFORE_MIN`` / ``BLACKOUT_AFTER_MIN``, 2/2). Inside a window
@@ -812,7 +812,7 @@ SESSION_REOPEN_BLACKOUT_MIN = _cfg("SESSION_REOPEN_BLACKOUT_MIN")
 BLACKOUT_TZ = _cfg("BLACKOUT_TZ")
 BLACKOUT_BEFORE_MIN = _cfg("BLACKOUT_BEFORE_MIN")
 BLACKOUT_AFTER_MIN = _cfg("BLACKOUT_AFTER_MIN")
-DAILY_BLACKOUTS = _cfg("DAILY_BLACKOUTS")
+DAILY_BREAKS = _cfg("DAILY_BREAKS")
 MACRO_EVENTS = _cfg("MACRO_EVENTS")
 HOLIDAYS = _cfg("HOLIDAYS")
 # Parsed HERE, at import: a mis-typed schedule or an unknown timezone must
@@ -828,7 +828,7 @@ if not (isinstance(BLACKOUT_TZ, str) and BLACKOUT_TZ.strip()):
 BLACKOUT_ZONE = _blackout.parse_tz(BLACKOUT_TZ) if BLACKOUT_TZ else None
 if not BLACKOUT_TZ:
     BLACKOUT_TZ = "machine local"
-DAILY_SPECS = _blackout.parse_daily(DAILY_BLACKOUTS, BLACKOUT_BEFORE_MIN,
+DAILY_SPECS = _blackout.parse_daily(DAILY_BREAKS, BLACKOUT_BEFORE_MIN,
                                     BLACKOUT_AFTER_MIN)
 EVENT_SPECS = _blackout.parse_events(MACRO_EVENTS, BLACKOUT_BEFORE_MIN,
                                      BLACKOUT_AFTER_MIN, BLACKOUT_ZONE)
@@ -4059,7 +4059,7 @@ class ArbBot:
         elif not REOPEN_BLACKOUT_S and not HOLIDAY_SPECS \
                 and not _blackout.sessions_limited(SESSIONS):
             _log("trading blackouts: off (SESSION_REOPEN_BLACKOUT_MIN 0, "
-                 "DAILY_BLACKOUTS / MACRO_EVENTS / HOLIDAYS empty, no sessions)")
+                 "DAILY_BREAKS / MACRO_EVENTS / HOLIDAYS empty, no sessions)")
         if _blackout.sessions_limited(SESSIONS):
             _log(f"trading sessions ({BLACKOUT_TZ}): "
                  + _blackout.describe_sessions(SESSIONS)

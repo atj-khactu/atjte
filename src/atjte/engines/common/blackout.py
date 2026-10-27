@@ -4,7 +4,7 @@ and no I/O (``bot_core/test_blackout.py``).
 Two schedules, both off by default, both expressed in ONE timezone
 (``BLACKOUT_TZ``) so a wall-clock entry means what the operator reads:
 
-- **daily** (``DAILY_BLACKOUTS``) — a time of day that recurs every day: the
+- **daily** (``DAILY_BREAKS``) — a time of day that recurs every day: the
   MT5 daily rollover, a session open, a fixing. Handled here as the local
   wall clock in the configured zone, so a zone with DST (``America/New_York``
   for an 08:30 ET release) follows the clock rather than drifting an hour
@@ -136,14 +136,14 @@ def _split_entry(entry, what: str):
 
 def parse_daily(entries: Optional[Sequence], before_min: float,
                 after_min: float) -> list[DailySpec]:
-    """``DAILY_BLACKOUTS`` -> specs. Accepted per entry: ``"HH:MM"``,
+    """``DAILY_BREAKS`` -> specs. Accepted per entry: ``"HH:MM"``,
     ``("HH:MM", "label")``, ``("HH:MM", before, after)`` or
     ``("HH:MM", "label", before, after)`` (minutes). Raises on anything it
     cannot read — a mis-typed schedule must fail at startup, not at the
     release it was meant to sit out."""
     out: list[DailySpec] = []
     for entry in (entries or ()):
-        what = f"DAILY_BLACKOUTS entry {entry!r}"
+        what = f"DAILY_BREAKS entry {entry!r}"
         head, label, before, after = _split_entry(entry, what)
         try:
             hh, mm = head.strip().split(":")
