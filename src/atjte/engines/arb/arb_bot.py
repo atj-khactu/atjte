@@ -595,6 +595,13 @@ MT5_VOLUME_READ_S = 5.0
 BASIS_TRIGGER = _cfg("BASIS_TRIGGER")
 BASIS_WINDOW_S = _cfg("BASIS_WINDOW_S")
 BASIS_RELEASE = _cfg("BASIS_RELEASE")
+BASIS_RELEASE_STEP_RATIO = _cfg("BASIS_RELEASE_STEP_RATIO")
+if BASIS_RELEASE_STEP_RATIO is not None and (
+        isinstance(BASIS_RELEASE_STEP_RATIO, bool)
+        or not isinstance(BASIS_RELEASE_STEP_RATIO, (int, float))
+        or BASIS_RELEASE_STEP_RATIO < 0):
+    raise RuntimeError(f"BASIS_RELEASE_STEP_RATIO must be None or a number >= 0 (a "
+                       f"fraction of GRID_STEP) - got {BASIS_RELEASE_STEP_RATIO!r}")
 BASIS_TRIGGER_MODE = str(_cfg("BASIS_TRIGGER_MODE") or "avg").strip().lower()
 if BASIS_TRIGGER_MODE not in ("avg", "min/max"):
     raise RuntimeError(f"BASIS_TRIGGER_MODE must be 'avg' or 'min/max' - got "
@@ -1275,6 +1282,10 @@ class ArbBot:
         return {}
 
     def __init__(self) -> None:
+        if BASIS_RELEASE_STEP_RATIO is not None and self.grid_step() is None:
+            raise RuntimeError(f"BASIS_RELEASE_STEP_RATIO is a fraction of GRID_STEP: "
+                               f"a {self.STRATEGY_LABEL} has no grid step - set it to "
+                               f"None and use BASIS_RELEASE")
         # an MT5 quote leg's order comment (MT5VenueClient's ``comment``);
         # no other connector takes one
         quote_opts = ({"comment": self.quote_comment,
@@ -6004,12 +6015,25 @@ class ArbBot:
                                              f"included")
         return [d for d in desired if d.key == RISK_FLAT_KEY]
 
+    def grid_step(self) -> Optional[float]:
+        """The grid interval in spread points, for a strategy that has one
+        (the grid types override it); None here."""
+        return None
+
+    def basis_release(self) -> float:
+        """How far back inside its level the basis average must retreat
+        before an armed quote is pulled: ``BASIS_RELEASE_STEP_RATIO`` x the
+        grid step when that is set, else ``BASIS_RELEASE``."""
+        if BASIS_RELEASE_STEP_RATIO is None:
+            return BASIS_RELEASE
+        return float(BASIS_RELEASE_STEP_RATIO) * float(self.grid_step())
+
     def _basis_gate(self, desired: list[DesiredOrder]) -> list[DesiredOrder]:
         """BASIS_TRIGGER submission filter: keep an order only while the
         rolling basis average is at/through its spread level — buys while
         avg(perp_bid − k·xau_bid) <= level, sells while avg(perp_ask − k·xau_ask)
         >= level. An order that armed stays live until the average retreats
-        BASIS_RELEASE back inside (hysteresis). No average (warm-up,
+        :meth:`basis_release` back inside (hysteresis). No average (warm-up,
         stale feed) drops everything — fail safe.
 
         BASIS_TRIGGER_MODE 'min/max' arms on the whole window instead of its
@@ -6019,6 +6043,7 @@ class ArbBot:
         if not BASIS_TRIGGER:
             return desired
         minmax = BASIS_TRIGGER_MODE == "min/max"
+        release = self.basis_release()
         out: list[DesiredOrder] = []
         for d in desired:
             buy = d.side == "buy"
@@ -6033,9 +6058,9 @@ class ArbBot:
             if avg is None or arm_on is None:
                 live = False
             elif buy:
-                live = arm_on <= d.level + (BASIS_RELEASE if armed else 0.0)
+                live = arm_on <= d.level + (release if armed else 0.0)
             else:
-                live = arm_on >= d.level - (BASIS_RELEASE if armed else 0.0)
+                live = arm_on >= d.level - (release if armed else 0.0)
             if live != armed:
                 _log(f"basis trigger {'ARMED' if live else 'released'} "
                      f"{d.key}: {what}_{'bid' if buy else 'ask'} "
@@ -6863,7 +6888,8 @@ class ArbBot:
             },
             "basis_trigger": {
                 "enabled": BASIS_TRIGGER, "window_s": BASIS_WINDOW_S,
-                "release_usd": BASIS_RELEASE, "mode": BASIS_TRIGGER_MODE,
+                "release_usd": self.basis_release(),
+                "release_step_ratio": BASIS_RELEASE_STEP_RATIO, "mode": BASIS_TRIGGER_MODE,
                 "basis_mode": BASIS_MODE,
                 "max_bid": None if self.basis_max_bid is None
                 else round(self.basis_max_bid, 4),

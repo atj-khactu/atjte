@@ -113,6 +113,9 @@ MAX_SHORT_UNITS = None          # short cap; None = MAX_POSITION_UNITS
 BASIS_TRIGGER = True         # default ON (orders go in only when the basis average is through their level)
 BASIS_WINDOW_S = 5.0         # rolling basis-average window (s)
 BASIS_RELEASE = 0.25     # hysteresis before a live quote is pulled (spread points)
+# the same hysteresis as a fraction of GRID_STEP (0.25 = a quarter step),
+# following the step; None = BASIS_RELEASE above
+BASIS_RELEASE_STEP_RATIO = None
 BASIS_TRIGGER_MODE = 'avg'   # 'avg' | 'min/max' = the whole window through the level arms it
 BASIS_MODE = 'limit-market'  # basis prices: 'limit-market' | 'market-market' (market orders on both legs) | 'mid-mid'
 

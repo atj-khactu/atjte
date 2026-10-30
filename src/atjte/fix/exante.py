@@ -196,8 +196,13 @@ def cancel_request(*, cl_ord_id: str, orig_cl_ord_id: str, exante_id: str, side:
 def replace_request(*, cl_ord_id: str, orig_cl_ord_id: str, exante_id: str, side: str,
                     qty, price, now: Optional[float] = None) -> list[tuple[int, object]]:
     """Order Cancel/Replace: a new price (and quantity). The spec lists no
-    Account tag here. # SPEC: whether OrderID (37) survives a replace —
-    the gateway assumes it does (the order's id stays the engine's id)."""
+    Account tag here. Proven on demo 2026-10-30: OrderID (37) survives a
+    replace, and the replace is acknowledged with ExecType 0 / OrdStatus 0
+    (not 5) carrying the new ClOrdID in 11 and the old one in 41. Once the
+    order is gone (cancelled), EXANTE may also send a late 35=9 for that
+    replace's ClOrdID (434=2, "Operation rejected") — an answer nobody waits
+    for. A 34-character ClOrdID (our cloid) is accepted; REST lists the
+    FIRST one as ``clientTag`` for the order's whole life."""
     return [(11, cl_ord_id), (41, orig_cl_ord_id), *instrument(exante_id),
             (54, SIDE[side]), (60, utc_stamp(now)), (38, _num(qty)), (40, ORD_LIMIT),
             (44, _num(price))]

@@ -19,10 +19,22 @@
      "msgs_per_min": 138, "max_inflight": 10,
      "clients": []}                         # allowlist; empty = any with the token
 
+Optional: ``quote_source`` — CME Group futures priced from a Databento
+gateway instead of the FIX FEED (:mod:`.quotes`)::
+
+    "quote_source": {"gateway": "databento_cme",            # its name
+                     "port": 5670,                           # optional
+                     "symbols": {"GC.COMEX.Z2026": "GCZ6"}}  # optional overrides
+
+with that gateway's loopback token as ``db_gateway_token`` in THIS
+``gateway.env``; the FIX FEED password is then needed only for instruments
+that are not CME Group futures.
+
 Optional: ``feed_port`` / ``trade_port`` (default 8100 / 8101 demo, 27000 /
 27001 live), ``feed_sender`` / ``trade_sender`` (default
 ``<ACCOUNT>_FEED[_UAT]`` / ``<ACCOUNT>_TRADE[_UAT]`` from the account id,
-which is what EXANTE issues), ``heartbeat_s`` (30).
+what EXANTE documents; the demo TRADE login came suffixed,
+``ABC1234_TRADE_UAT_1a2b3c4d``, so copy the issued ones), ``heartbeat_s`` (30).
 
 ``gateway.env`` (read from this file only — never the process environment
 or the workspace's ``env/.env``)::
@@ -35,6 +47,7 @@ or the workspace's ``env/.env``)::
     exante_fix_trade_password = ...       # from EXANTE's account manager
     exante_fix_feed_password = ...
     ex_gateway_token = ...                # the loopback handshake secret
+    db_gateway_token = ...                # with quote_source: the Databento gateway's
 
 Nothing here ever returns a value in a message — :meth:`GatewayConfig.status`
 names variables only.
@@ -73,6 +86,8 @@ CLIENT_ID_NAME = "exante_client_id"
 SHARED_KEY_NAME = "exante_shared_key"
 TRADE_PASSWORD_NAME = "exante_fix_trade_password"
 FEED_PASSWORD_NAME = "exante_fix_feed_password"
+#: the Databento gateway's loopback token (with ``quote_source``)
+DB_TOKEN_NAME = "db_gateway_token"
 TIFS = {"DAY": X.TIF_DAY, "GTC": X.TIF_GTC}
 #: EXANTE's limit: 25 order requests per 10 s
 MAX_MSGS_PER_MIN = 150.0
@@ -81,7 +96,9 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _ACCOUNT_RE = re.compile(r"^[A-Z0-9]{3,20}\.\d{3}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "fix_host", "feed_port", "trade_port",
           "feed_sender", "trade_sender", "symbols", "depth", "tif", "heartbeat_s",
-          "msgs_per_min", "max_inflight", "clients", "_comment"} | _A.KEYS
+          "msgs_per_min", "max_inflight", "clients", "quote_source",
+          "_comment"} | _A.KEYS
+_QUOTE_KEYS = {"gateway", "port", "symbols"}
 
 
 class ConfigError(ValueError):
@@ -106,6 +123,12 @@ class GatewayConfig:
     msgs_per_min: float = 138.0
     max_inflight: int = 10
     clients: list = field(default_factory=list)
+    #: ``quote_source``: the Databento gateway CME futures are priced from
+    #: ("" = everything on the FIX FEED), its port (0 = from its
+    #: gateway.json) and the per-id Databento symbol overrides
+    quote_gateway: str = ""
+    quote_port: int = 0
+    quote_symbols: dict = field(default_factory=dict)
     publish_accounts: bool = True
     accounts_every_s: float = _A.EVERY_S
     # gateway.env (raw text; never returned in a message)
@@ -117,6 +140,7 @@ class GatewayConfig:
     trade_password: str = ""
     feed_password: str = ""
     token: str = ""
+    quote_token: str = ""
 
     @property
     def rest_complete(self) -> bool:
@@ -132,7 +156,9 @@ class GatewayConfig:
             out.append(f"{ACCESS_KEY_NAME} (or {CLIENT_ID_NAME} + {SHARED_KEY_NAME})")
         if not self.trade_password:
             out.append(TRADE_PASSWORD_NAME)
-        if not self.feed_password:
+        if not self.feed_password and not self.quote_gateway:
+            # with a Databento source the FEED prices only what is not a CME
+            # future: a gateway of CME futures alone needs no FEED login
             out.append(FEED_PASSWORD_NAME)
         if self.account_id and not _ACCOUNT_RE.match(self.account_id):
             out.append(f"{ACCOUNT_NAME} (an EXANTE account id, like ABC1234.001)")
@@ -171,6 +197,10 @@ class GatewayConfig:
                 "account_set": bool(self.account_id),
                 "complete": self.complete, "missing": self.missing,
                 "token_set": bool(self.token), "clients_allowed": list(self.clients),
+                "quote_source": ({"gateway": self.quote_gateway, "port": self.quote_port or None,
+                                  "token_set": bool(self.quote_token),
+                                  "symbols": dict(self.quote_symbols)}
+                                 if self.quote_gateway else None),
                 "msgs_per_min": self.msgs_per_min}
 
 
@@ -268,6 +298,8 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
     if not 0 < cfg.msgs_per_min <= MAX_MSGS_PER_MIN:
         raise ConfigError(f"{CONFIG_NAME}: msgs_per_min is at most {MAX_MSGS_PER_MIN:g} "
                           f"(EXANTE allows 25 order requests per 10 s)")
+    cfg.quote_gateway, cfg.quote_port, cfg.quote_symbols = parse_quote_source(
+        raw.get("quote_source"))
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
@@ -282,7 +314,55 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
     cfg.trade_password = env.get(TRADE_PASSWORD_NAME, "")
     cfg.feed_password = env.get(FEED_PASSWORD_NAME, "")
     cfg.token = env.get(TOKEN_NAME, "")
+    cfg.quote_token = env.get(DB_TOKEN_NAME, "")
     return cfg
+
+
+def parse_quote_source(raw) -> tuple[str, int, dict]:
+    """``quote_source`` -> (Databento gateway name, port or 0, overrides);
+    absent / null -> ("", 0, {})."""
+    if raw in (None, "", {}):
+        return "", 0, {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source is an object: "
+                          f'{{"gateway": "<a Databento gateway>"}}')
+    unknown = sorted(set(raw) - _QUOTE_KEYS)
+    if unknown:
+        raise ConfigError(f"{CONFIG_NAME}: quote_source: unknown key(s) {', '.join(unknown)}")
+    name = str(raw.get("gateway") or "").strip()
+    if not _NAME_RE.match(name):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source.gateway names a Databento gateway "
+                          f"(lower-case letters, digits and _)")
+    try:
+        port = int(raw.get("port") or 0)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source.port is a number") from None
+    syms = raw.get("symbols") or {}
+    if not isinstance(syms, dict):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source.symbols maps EXANTE ids to Databento "
+                          f'symbols: {{"GC.COMEX.Z2026": "GCZ6"}}')
+    return name, port, {str(k): str(v).strip() for k, v in syms.items() if str(v).strip()}
+
+
+def quote_port(cfg: GatewayConfig) -> int:
+    """The Databento gateway's port: ``quote_source.port``, else its own
+    ``gateway.json`` (never its gateway.env)."""
+    if cfg.quote_port:
+        return cfg.quote_port
+    from atjte.gateways.databento import config as DC
+    try:
+        return DC.listen_port_of(cfg.quote_gateway)
+    except DC.ConfigError as e:
+        raise ConfigError(f"quote_source: {e}") from None
+
+
+def make_quotes(cfg: GatewayConfig, *, log=None):
+    """The Databento lease of a gateway with a ``quote_source`` (else None)."""
+    if not cfg.quote_gateway:
+        return None
+    from .quotes import DatabentoQuotes
+    return DatabentoQuotes(port=quote_port(cfg), token=cfg.quote_token,
+                           client=f"exante:{cfg.name}", gateway=cfg.quote_gateway, log=log)
 
 
 def scaffold(name: str, network: str = "demo") -> Path:

@@ -19,10 +19,18 @@
   same request, in USD, BEFORE anything is fetched. Databento bills
   historical data per request: the Spread History page shows this figure
   and fetches only once the operator confirms it.
-- **live bars** — with ``live`` on, one ``Live`` session subscribed to
+- **live bars** — with ``live`` on, the ``Live`` session subscribes
   ``ohlcv-1m`` and ``bbo-1m`` for every configured symbol; the last
   :data:`LIVE_KEEP_S` of 1 m bars (trade and mid) are kept and served for
   the part of a window past the historical end, at no historical cost.
+- **live quotes** — :meth:`DatabentoUpstream.subscribe_quotes`: the top of
+  the book (``mbp-1``) of any symbol of the dataset a client asks for, added
+  to the SAME session while it runs (one Databento connection per key,
+  however many gateways price off it). Each change of the best bid / ask or
+  their sizes is handed to :meth:`set_quote_handler`'s function as a
+  CCXT-shaped ticker. The session asks Databento for a heartbeat every
+  :data:`HEARTBEAT_S`: :meth:`live_alive` is "something arrived lately", the
+  liveness the quoting gateways gate on — a quiet book is not a dead one.
 
 The API key never leaves this object; nothing on the wire carries it.
 """
@@ -47,6 +55,14 @@ MID_SCHEMA = "bbo-1m"
 PRICES = ("trades", "mid")
 #: 1 m live bars kept per symbol and basis
 LIVE_KEEP_S = 3 * 86400
+#: the top-of-book schema the live quotes are streamed in
+QUOTE_SCHEMA = "mbp-1"
+#: Databento's record type (``rtype``) of an ``mbp-1`` record
+RTYPE_MBP_1 = 1
+#: the heartbeat interval asked of the live session, and how long a silent
+#: session (no record, no heartbeat) is taken for alive
+HEARTBEAT_S = 10
+LIVE_SILENT_S = 3 * HEARTBEAT_S
 #: how long the dataset's published range is trusted before it is re-asked
 RANGE_TTL_S = 60.0
 DEFAULT_LIMIT = 500
@@ -119,6 +135,27 @@ def bars_from_records(records, basis: str, bar_s: int) -> dict[int, list]:
     return out
 
 
+def quote_of(rec, symbol: str, now: float) -> Optional[dict]:
+    """An ``mbp-1`` record as a CCXT ticker; None unless the book is
+    two-sided. ``timestamp`` is when the gateway RECEIVED it (the clock its
+    clients judge freshness by); the exchange's own time is in ``info``."""
+    bid, ask = _px(rec, "bid_px_00"), _px(rec, "ask_px_00")
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return None
+    return {"symbol": symbol, "bid": bid, "ask": ask,
+            "bidVolume": float(getattr(rec, "bid_sz_00", 0) or 0),
+            "askVolume": float(getattr(rec, "ask_sz_00", 0) or 0), "last": None,
+            "timestamp": int(now * 1000),
+            "info": {"ts_event": getattr(rec, "ts_event", None), "source": "databento"}}
+
+
+def _rtype(rec) -> Optional[int]:
+    try:
+        return int(getattr(rec, "rtype"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def rows_of(bars: dict[int, list]) -> list[list]:
     """CCXT OHLCV rows ``[ms, o, h, l, c, v]``, oldest first."""
     return [[b * 1000, *bars[b]] for b in sorted(bars)]
@@ -142,7 +179,8 @@ class DatabentoUpstream:
                  log: Optional[Callable[[str], None]] = None,
                  historical_factory: Optional[Callable[[str], Any]] = None,
                  live_factory: Optional[Callable[[str], Any]] = None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 heartbeat_s: int = HEARTBEAT_S) -> None:
         self._key = api_key
         self.dataset = dataset
         self.symbols = list(symbols)
@@ -154,15 +192,25 @@ class DatabentoUpstream:
         self._hist = None
         self._live = None
         self._lock = threading.Lock()
+        #: one session per key: creating it, and adding a subscription to it
+        self._live_lock = threading.Lock()
+        self.heartbeat_s = int(heartbeat_s)
+        self._last_rx = 0.0                     # anything from the live session
+        self._quote_syms: set[str] = set()      # symbols streamed as quotes
+        self._quotes: dict[str, dict] = {}      # symbol -> its latest ticker
+        self._on_quote: Optional[Callable[[str, dict], None]] = None
         #: symbol -> basis -> {bar open (s): [o, h, l, c, v]} (1 m, live)
         self._live_bars: dict[str, dict[str, dict[int, list]]] = {
             s: {"trades": {}, "mid": {}} for s in self.symbols}
-        self._ids: dict[int, str] = {}          # instrument_id -> configured symbol
+        #: instrument_id -> the symbols it was subscribed as (one contract
+        #: can be both GCZ6 and GC.c.0)
+        self._ids: dict[int, set[str]] = {}
         self._range: tuple[float, Optional[float]] = (0.0, None)   # (asked at, end)
         self.connected = False
         self.live_ok = False
         self.last_error = ""
-        self.counters = {"reads": 0, "cost_quotes": 0, "live_records": 0, "errors": 0}
+        self.counters = {"reads": 0, "cost_quotes": 0, "live_records": 0, "quotes": 0,
+                         "heartbeats": 0, "reconnects": 0, "errors": 0}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -177,27 +225,94 @@ class DatabentoUpstream:
             self._start_live()
 
     def _start_live(self) -> None:
+        if not self.symbols:
+            return                              # no bars to stream; quotes open it
         try:
-            if self._live_factory is None:
-                import databento as db
-                self._live_factory = lambda key: db.Live(
-                    key=key, reconnect_policy=db.ReconnectPolicy.RECONNECT)
-            live = self._live_factory(self._key)
             by_stype: dict[str, list[str]] = {}
             for s in self.symbols:
                 by_stype.setdefault(C.stype_of(s), []).append(s)
-            for stype, syms in by_stype.items():
-                for schema in ("ohlcv-1m", MID_SCHEMA):
-                    live.subscribe(dataset=self.dataset, schema=schema, symbols=syms,
-                                   stype_in=stype)
-            live.add_callback(self._on_record, self._on_live_error)
-            live.start()
-            self._live = live
-            self.live_ok = True
+            self._live_subscribe([(schema, syms, stype) for stype, syms in by_stype.items()
+                                  for schema in ("ohlcv-1m", MID_SCHEMA)])
             self._log(f"databento: live 1 m bars (trades + mid) for {', '.join(self.symbols)}")
         except Exception as e:                              # noqa: BLE001
             self.live_ok = False
             self._err("live", e)
+
+    def _live_subscribe(self, subs: list) -> None:
+        """Add ``(schema, symbols, stype_in)`` subscriptions to THE live
+        session, opening it on the first (Databento takes a subscription on
+        a running session; only a replay start must come before ``start``)."""
+        with self._live_lock:
+            live = self._live
+            fresh = live is None
+            if fresh:
+                if self._live_factory is None:
+                    import databento as db
+                    self._live_factory = lambda key: db.Live(
+                        key=key, reconnect_policy=db.ReconnectPolicy.RECONNECT,
+                        heartbeat_interval_s=self.heartbeat_s)
+                live = self._live_factory(self._key)
+            try:
+                for schema, syms, stype in subs:
+                    live.subscribe(dataset=self.dataset, schema=schema, symbols=syms,
+                                   stype_in=stype)
+            except Exception:
+                if fresh:                       # never a half-opened connection left behind
+                    try:
+                        live.stop()
+                    except Exception:                       # noqa: BLE001
+                        pass
+                raise
+            if fresh:
+                live.add_callback(self._on_record, self._on_live_error)
+                add_rc = getattr(live, "add_reconnect_callback", None)
+                if add_rc is not None:
+                    add_rc(self._on_reconnect)
+                self._last_rx = self._clock()   # the heartbeat window starts now
+                live.start()
+                self._live = live
+            self.live_ok = True
+
+    def subscribe_quotes(self, symbol: str) -> None:
+        """Stream ``symbol``'s top of book (``mbp-1``) on the live session —
+        once, however many clients want it. Raises when Databento refuses."""
+        symbol = str(symbol or "").strip()
+        if not symbol:
+            raise ccxt.BadSymbol("databento: a quote subscription names a symbol")
+        with self._lock:
+            if symbol in self._quote_syms:
+                return
+            # before the subscription: its first record may beat this thread
+            self._quote_syms.add(symbol)
+        try:
+            self._live_subscribe([(QUOTE_SCHEMA, [symbol], C.stype_of(symbol))])
+        except Exception as e:                              # noqa: BLE001
+            with self._lock:
+                self._quote_syms.discard(symbol)
+            self._err(f"quotes for {symbol}", e)
+            raise ccxt.ExchangeNotAvailable(f"databento: live quotes for {symbol}: "
+                                            f"{type(e).__name__}: {e}") from None
+        self._log(f"databento: live quotes ({QUOTE_SCHEMA}) for {symbol}")
+
+    def set_quote_handler(self, fn: Optional[Callable[[str, dict], None]]) -> None:
+        self._on_quote = fn
+
+    def last_quote(self, symbol: str) -> Optional[dict]:
+        with self._lock:
+            q = self._quotes.get(symbol)
+            return dict(q) if q else None
+
+    def live_alive(self) -> bool:
+        """The live session is open and spoke within :data:`LIVE_SILENT_S`
+        (a record or a heartbeat) — liveness, not a price's age."""
+        if self._live is None or not self.live_ok:
+            return False
+        return self._clock() - self._last_rx <= max(LIVE_SILENT_S, 3 * self.heartbeat_s)
+
+    def _on_reconnect(self, *_a) -> None:
+        self.counters["reconnects"] += 1
+        self._last_rx = self._clock()
+        self._log("databento: the live session reconnected (subscriptions resumed)")
 
     def stop(self) -> None:
         live, self._live = self._live, None
@@ -218,15 +333,53 @@ class DatabentoUpstream:
         self._err("live callback", e)
 
     def _on_record(self, rec) -> None:
-        """A live record: a symbol mapping, a 1 m trade bar or a 1 m BBO."""
+        """A live record: a heartbeat, a symbol mapping, a top-of-book
+        update (``mbp-1``), a 1 m trade bar or a 1 m BBO."""
+        self._last_rx = self._clock()
+        if getattr(rec, "is_heartbeat", None) is not None:     # SystemMsg
+            if rec.is_heartbeat:
+                self.counters["heartbeats"] += 1
+            else:
+                self._log(f"databento: {getattr(rec, 'msg', '')}")
+            return
+        err = getattr(rec, "err", None)                        # ErrorMsg
+        if err is not None:
+            self._err("live", RuntimeError(str(err)))
+            return
         stype_in_symbol = getattr(rec, "stype_in_symbol", None)
         if stype_in_symbol is not None:             # SymbolMappingMsg
             with self._lock:
-                self._ids[int(rec.instrument_id)] = str(stype_in_symbol)
+                self._ids.setdefault(int(rec.instrument_id), set()).add(str(stype_in_symbol))
             return
-        sym = self._ids.get(int(getattr(rec, "instrument_id", -1) or -1))
-        if sym is None or sym not in self._live_bars:
+        syms = self._ids.get(int(getattr(rec, "instrument_id", -1) or -1)) or ()
+        if _rtype(rec) == RTYPE_MBP_1:
+            for sym in syms:
+                if sym in self._quote_syms:
+                    self._quote(sym, rec)
             return
+        for sym in syms:
+            if sym in self._live_bars:
+                self._bar(sym, rec)
+
+    def _quote(self, sym: str, rec) -> None:
+        q = quote_of(rec, sym, self._clock())
+        if q is None:
+            return
+        with self._lock:
+            prev = self._quotes.get(sym)
+            self._quotes[sym] = q
+        if prev is not None and all(prev[k] == q[k] for k in
+                                    ("bid", "ask", "bidVolume", "askVolume")):
+            return                                  # a trade that left the top as it was
+        self.counters["quotes"] += 1
+        fn = self._on_quote
+        if fn is not None:
+            try:
+                fn(sym, q)
+            except Exception as e:                          # noqa: BLE001
+                self._err("quote handler", e)
+
+    def _bar(self, sym: str, rec) -> None:
         basis = "mid" if getattr(rec, "bid_px_00", None) is not None else "trades"
         if basis == "trades" and _px(rec, "open") is None:
             return                                  # neither a bar nor a BBO
@@ -357,7 +510,9 @@ class DatabentoUpstream:
     def status(self) -> dict:
         with self._lock:
             live = {s: len(v["trades"]) for s, v in self._live_bars.items()}
+            quotes = sorted(self._quote_syms)
         return {"connected": self.connected, "live": self.live_on, "live_ok": self.live_ok,
+                "live_alive": self.live_alive(), "quote_symbols": quotes,
                 "live_bars": live, "dataset": self.dataset, "symbols": list(self.symbols),
                 "dataset_end": self._range[1], "last_error": self.last_error,
                 "counters": dict(self.counters)}

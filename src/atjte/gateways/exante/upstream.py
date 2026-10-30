@@ -3,6 +3,11 @@
 - **FEED** (FIX): one full-snapshot subscription per symbol (``35=V`` ->
   ``35=W``), pushed as tickers and books. The bots price off these only —
   never a REST quote ("websocket or sleep").
+- **or Databento** (``quotes``, :mod:`.quotes`): with a ``quote_source``,
+  every CME Group future is priced from a Databento gateway's CME Globex
+  top of book instead, on the same ticker / book path (the post-only check
+  included). The FEED session is opened only for what is left — none at all
+  when every instrument is priced from Databento.
 - **TRADE** (FIX): limit orders (``35=D``), amends (``35=G``, in place: the
   order keeps EXANTE's OrderID), cancels (``35=F``), their execution reports
   (``35=8``) — fills are pushed the moment they arrive. CancelOnDisconnect is
@@ -142,6 +147,7 @@ class ExanteUpstream:
                  fix_host: str = "", feed: Optional[dict] = None, trade: Optional[dict] = None,
                  session_factory: Optional[Callable] = None, depth: int = BOOK_LEVELS,
                  tif: str = X.TIF_DAY, heartbeat_s: int = 30,
+                 quotes: Any = None, quote_symbols: Optional[dict] = None,
                  clock: Callable[[], float] = time.time,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.network = network
@@ -152,6 +158,12 @@ class ExanteUpstream:
         self._feed_cfg = dict(feed or {})        # {"sender", "target", "password", "port"}
         self._trade_cfg = dict(trade or {})
         self._factory = session_factory
+        #: a :class:`~atjte.gateways.exante.quotes.DatabentoQuotes` (or None:
+        #: everything on the FEED), and its per-id symbol overrides
+        self.quotes = quotes
+        self._quote_overrides = dict(quote_symbols or {})
+        self._db_of: dict[str, str] = {}             # ccxt symbol -> Databento symbol
+        self._syms_of_db: dict[str, list] = {}       # Databento symbol -> ccxt symbols
         self.depth = int(depth)
         self.tif = tif
         self.heartbeat_s = int(heartbeat_s)
@@ -225,33 +237,71 @@ class ExanteUpstream:
                 self._log(f"exante: {sid} is a {m['info']['symbolType']} — listed, but the "
                           f"engine quotes {', '.join(TRADABLE_TYPES)}")
             listed[m["symbol"]] = m
+        db_of: dict[str, str] = {}
+        if self.quotes is not None:
+            from . import quotes as Q
+            for s, m in listed.items():
+                info = m["info"]
+                if Q.is_cme_future(m["id"], str(info.get("exchange") or ""),
+                                   str(info.get("symbolType") or "")):
+                    try:
+                        db_of[s] = Q.databento_symbol(m["id"], self._quote_overrides)
+                    except ValueError as e:
+                        self._log(f"exante: {e} — priced from the FIX FEED")
         with self._lock:
             self._markets = listed
             self._sym_of = {m["id"]: s for s, m in listed.items()}
+            self._db_of = db_of
+            self._syms_of_db = {}
+            for s, d in db_of.items():
+                self._syms_of_db.setdefault(d, []).append(s)
+        if db_of:
+            self._log("exante: priced from Databento — " + ", ".join(
+                f"{self._markets[s]['id']} as {d}" for s, d in sorted(db_of.items())))
+
+    @property
+    def feed_needed(self) -> bool:
+        """Some instrument is priced from the FIX FEED (no Databento source,
+        or not a CME Group future)."""
+        return any(s not in self._db_of for s in self._markets)
 
     def start(self) -> None:
         self.load_markets()
         mk = self._factory or _default_factory
         common = {"host": self.fix_host, "network": self.network,
                   "heartbeat_s": self.heartbeat_s, "log": self._log, "clock": self._clock}
-        self.feed = mk("feed", sender=self._feed_cfg["sender"], target=self._feed_cfg["target"],
-                       password=self._feed_cfg["password"],
-                       port=int(self._feed_cfg.get("port") or X.PORTS[self.network]["feed"]),
-                       on_message=self._on_feed, on_event=self._on_feed_event, **common)
+        if self.feed_needed and self._feed_cfg.get("password"):
+            self.feed = mk("feed", sender=self._feed_cfg["sender"],
+                           target=self._feed_cfg["target"],
+                           password=self._feed_cfg["password"],
+                           port=int(self._feed_cfg.get("port") or X.PORTS[self.network]["feed"]),
+                           on_message=self._on_feed, on_event=self._on_feed_event, **common)
+        elif self.feed_needed:
+            self._log("exante: no FIX FEED password — the instruments not priced from "
+                      "Databento have no quotes")
+        if self.quotes is not None and self._db_of:
+            self.quotes.set_handler(self._on_db_ticker)
+            self.quotes.start()
+            # every contract streams from the start (not only once a bot
+            # asks): the source's health, and a first price, are there when
+            # the first bot attaches
+            for db in sorted(set(self._db_of.values())):
+                self.quotes.subscribe(db)
         self.trade = mk("trade", sender=self._trade_cfg["sender"],
                         target=self._trade_cfg["target"],
                         password=self._trade_cfg["password"],
                         port=int(self._trade_cfg.get("port") or X.PORTS[self.network]["trade"]),
                         cancel_on_disconnect=True,
                         on_message=self._on_trade, on_event=self._on_trade_event, **common)
-        self.feed.start()
+        if self.feed is not None:
+            self.feed.start()
         self.trade.start()
         self._poller = threading.Thread(target=self._poll_loop, name="exante-poll", daemon=True)
         self._poller.start()
 
     def stop(self) -> None:
         self._stop.set()
-        for s in (self.trade, self.feed):
+        for s in (self.trade, self.feed, self.quotes):
             if s is not None:
                 try:
                     s.stop()
@@ -265,14 +315,20 @@ class ExanteUpstream:
 
     @property
     def public_ok(self) -> bool:
-        return bool(self.feed is not None and self.feed.ready
-                    and all(self._fresh(s) for s in self._wanted))
+        return all(self.public_ok_for(s) for s in self._wanted)
 
     def public_ok_for(self, symbol: str) -> bool:
-        """THIS symbol's quotes: the FEED session up, the symbol not refused,
-        a snapshot within TICKER_STALE_S."""
+        """THIS symbol's quotes: its source up (the FEED session, or the
+        Databento lease and its live session), the symbol not refused, a
+        quote within TICKER_STALE_S."""
+        db = self._db_of.get(symbol)
+        if db is not None:
+            return bool(self.quotes is not None and self.quotes.ok(db) and self._fresh(symbol))
         return bool(self.feed is not None and self.feed.ready
                     and symbol not in self._md_error and self._fresh(symbol))
+
+    def quote_source_of(self, symbol: str) -> str:
+        return "databento" if symbol in self._db_of else "fix-feed"
 
     def private_ok(self, account: str) -> bool:
         """The TRADE session up and its book rebuilt since the last logon."""
@@ -280,11 +336,14 @@ class ExanteUpstream:
                     and self._mass_done.is_set())
 
     def status(self) -> dict:
+        feed_up = (self.feed is not None and self.feed.logged_on) if self.feed_needed \
+            else True
         return {"network": self.network, "public_ok": self.public_ok,
                 "accounts": {"main": self.private_ok("main")},
-                "connected": bool(self.trade is not None and self.trade.logged_on
-                                  and self.feed is not None and self.feed.logged_on),
+                "connected": bool(self.trade is not None and self.trade.logged_on and feed_up),
                 "feed": self.feed.status() if self.feed is not None else None,
+                "quotes": self.quotes.status() if self.quotes is not None else None,
+                "quote_source": {s: self.quote_source_of(s) for s in sorted(self._markets)},
                 "trade": self.trade.status() if self.trade is not None else None,
                 "symbols": sorted(self._wanted), "markets": len(self._markets),
                 "market_data_refused": dict(self._md_error),
@@ -322,7 +381,35 @@ class ExanteUpstream:
         with self._lock:
             self._exante_id(symbol)
             self._wanted.add(symbol)
+            db = self._db_of.get(symbol)
+        if db is not None:
+            self.quotes.subscribe(db)
+            return
         self._subscribe(symbol)
+
+    def _on_db_ticker(self, db_symbol: str, t: dict) -> None:
+        """A Databento top of book, as the FEED's ticker for every instrument
+        priced off that contract (the gateway's receive time is the clock the
+        freshness checks read)."""
+        bid, ask = t.get("bid"), t.get("ask")
+        if bid is None or ask is None:
+            return
+        now_ms = int(self._clock() * 1000)
+        for sym in self._syms_of_db.get(db_symbol, ()):
+            d = {"symbol": sym, "bid": float(bid), "ask": float(ask),
+                 "bidVolume": t.get("bidVolume"), "askVolume": t.get("askVolume"),
+                 "last": None, "timestamp": now_ms,
+                 "info": {"exanteId": self._markets[sym]["id"], "source": "databento",
+                          "databentoSymbol": db_symbol,
+                          "ts_event": (t.get("info") or {}).get("ts_event")}}
+            self._last[sym] = d
+            self.counters["tickers"] += 1
+            self._emit("ticker", sym, d)
+            if self._h.get("book") is not None:
+                b = book_payload(sym, {"bids": [[d["bid"], d["bidVolume"] or 0.0]],
+                                       "asks": [[d["ask"], d["askVolume"] or 0.0]]})
+                if b is not None:
+                    self._emit("book", sym, b)
 
     def _subscribe(self, symbol: str) -> None:
         if self.feed is None or not self.feed.logged_on:
@@ -422,7 +509,7 @@ class ExanteUpstream:
     def amend(self, account, symbol, order_id, side, price, amount, *, cloid,
               post_only, reduce_only) -> dict:
         """Cancel/Replace: a new ClOrdID in the order's own slot (a restarted
-        gateway still knows whose it is); the OrderID stays (# SPEC)."""
+        gateway still knows whose it is); the OrderID stays (proven on demo)."""
         self._require_trade()
         o = self._orders.get(str(order_id))
         if o is None or o.status != "open":
@@ -651,8 +738,11 @@ class ExanteUpstream:
     def _poll_fees(self) -> None:
         """The commission of each fill pushed without one: EXANTE books it
         as a COMMISSION transaction of the order (``orderPos`` = the fill),
-        and the fill is pushed again WITH it. # SPEC: the commission's
-        orderPos matching the fill's position."""
+        and the fill is pushed again WITH it. Proven on demo 2026-10-30: the
+        COMMISSION's orderPos is the REST fill's ``position`` (0-based; FIX
+        carries no 20100), and the order's other rows — its TRADE in the
+        instrument and, on a closing fill, a TRADE in USD (the realized PnL)
+        — are never a fee, so only COMMISSION rows are summed."""
         now = self._clock()
         due = dict(self._fee_due)
         orders = {self._pushed[f]["order"] for f in due if f in self._pushed}
@@ -666,6 +756,8 @@ class ExanteUpstream:
                 continue
             by_pos: dict = {}
             for tx in txs:
+                if str(tx.get("operationType") or "COMMISSION").upper() != "COMMISSION":
+                    continue
                 pos = tx.get("orderPos")
                 amt = _f(tx.get("sum"))
                 if amt is not None:

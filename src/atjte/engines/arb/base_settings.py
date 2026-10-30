@@ -364,6 +364,11 @@ RECONCILE_TOLERANCE_UNITS = None  # >= one broker min lot in base units; None = 
 BASIS_TRIGGER = True
 BASIS_WINDOW_S = 5.0        # rolling basis-average window (s)
 BASIS_RELEASE = 0.25    # pull the quote once avg is this far back inside
+# The release as a fraction of the grid interval instead (grid / grid futures
+# only): an armed quote is pulled once the average is this ratio x GRID_STEP
+# back inside — 0.25 = a quarter step. It follows the step, also a bps step
+# re-anchored daily. None = BASIS_RELEASE in spread points.
+BASIS_RELEASE_STEP_RATIO = None
 # What ARMS an order: 'avg' = the window's average is through the level (as
 # above); 'min/max' = the WHOLE window is - a buy only when the HIGHEST bid
 # basis of the last BASIS_WINDOW_S is at/below its level, a sell only when

@@ -378,7 +378,12 @@ class UpstreamTest(unittest.TestCase):
             {"operationType": "COMMISSION", "orderId": "ord-1", "orderPos": 1, "sum": "-0.4",
              "asset": "EUR"},
             {"operationType": "COMMISSION", "orderId": "ord-1", "orderPos": 2, "sum": "-0.8",
-             "asset": "EUR"}]
+             "asset": "EUR"},
+            # the order's own trade and its realized PnL (demo, 2026-10-30): never a fee
+            {"operationType": "TRADE", "orderId": "ord-1", "orderPos": 2, "sum": "-2",
+             "asset": XAU_ID},
+            {"operationType": "TRADE", "orderId": "ord-1", "orderPos": 2, "sum": "-0.37",
+             "asset": "USD"}]
         self.up._poll_fees()
         fees = {t[1]["id"]: t[1]["fee"] for t in self.events["fill"] if t[1]["fee"]}
         self.assertEqual(fees, {"ord-1@1": {"cost": 0.4, "currency": "EUR"},
@@ -543,6 +548,184 @@ class RestTest(unittest.TestCase):
             r.accounts()
         self.assertNotIn("SECRETKEY", str(cm.exception))
         self.assertIn("Accounts", str(cm.exception))
+
+
+# ── CME futures priced from a Databento gateway ──────────────────────────────
+GC_ID = "GC.COMEX.Z2026"
+GC = "GC/USD:USD-261229"
+#: what EXANTE's demo answered for GC.COMEX.Z2026 (2026-10-30), trimmed
+GC_SYMBOL = {"ticker": "GC", "exchange": "COMEX", "currency": "USD", "symbolId": GC_ID,
+             "expiration": "2026-12-29T00:00:00Z", "minPriceIncrement": "0.1",
+             "symbolType": "FUTURE", "name": "Gold"}
+GC_SPEC = {"contractMultiplier": "100.0", "lotSize": "1.0", "priceUnit": "1.0",
+           "units": "Contracts"}
+
+
+class CmeRest(FakeRest):
+    def symbol(self, sid):
+        return dict(GC_SYMBOL) if sid == GC_ID else super().symbol(sid)
+
+    def specification(self, sid):
+        return dict(GC_SPEC) if sid == GC_ID else super().specification(sid)
+
+
+class FakeQuotes:
+    """The Databento lease: what the upstream subscribes, and its health."""
+
+    def __init__(self):
+        self.subscribed, self.healthy, self.started = [], True, False
+        self.handler = None
+
+    def set_handler(self, fn):
+        self.handler = fn
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def subscribe(self, db):
+        if db not in self.subscribed:
+            self.subscribed.append(db)
+
+    def ok(self, db):
+        return self.healthy
+
+    def status(self):
+        return {"source": "databento", "connected": self.healthy,
+                "session": {"quotes_ok": self.healthy}}
+
+    def push(self, db, bid, ask):
+        self.handler(db, {"symbol": db, "bid": bid, "ask": ask, "bidVolume": 3.0,
+                          "askVolume": 4.0, "info": {"ts_event": 1}})
+
+
+def cme_upstream(venue, symbols, quotes, feed_password="f"):
+    return U.ExanteUpstream(network="demo", account_id=ACCOUNT, symbols=symbols, rest=CmeRest(),
+                            feed={"sender": "ABC1234_FEED_UAT", "target": "EXANTE_FEED_UAT",
+                                  "password": feed_password},
+                            trade={"sender": "ABC1234_TRADE_UAT",
+                                   "target": "EXANTE_TRADE_UAT", "password": "t"},
+                            session_factory=venue.factory, quotes=quotes)
+
+
+class DatabentoSymbolTest(unittest.TestCase):
+    def test_cme_group_futures_map_to_cme_s_own_symbol(self):
+        from atjte.gateways.exante import quotes as Q
+        self.assertEqual(Q.databento_symbol("GC.COMEX.Z2026"), "GCZ6")
+        self.assertEqual(Q.databento_symbol("MGC.COMEX.G2027"), "MGCG7")
+        self.assertEqual(Q.databento_symbol("ES.CME.H2027"), "ESH7")
+        self.assertEqual(Q.databento_symbol("6E.CME.Z2026", {"6E.CME.Z2026": "6EZ6"}), "6EZ6")
+        self.assertTrue(Q.is_cme_future("CL.NYMEX.F2027"))
+        self.assertTrue(Q.is_cme_future("ZN.CBOT.H2027", "CBOT", "FUTURE"))
+        self.assertFalse(Q.is_cme_future(XAU_ID, "E", "FX_SPOT"))
+        self.assertFalse(Q.is_cme_future("FDAX.EUREX.Z2026"))
+        self.assertFalse(Q.is_cme_future("GC.COMEX.Z2026", "COMEX", "OPTION"))
+        with self.assertRaises(ValueError):
+            Q.databento_symbol("GC.COMEX")
+
+
+class DatabentoPricedTest(unittest.TestCase):
+    def setUp(self):
+        self.venue, self.quotes = FakeVenue(), FakeQuotes()
+        self.events = {"ticker": [], "fill": [], "order": [], "event": [], "book": []}
+
+    def start(self, symbols, **kw):
+        up = cme_upstream(self.venue, symbols, self.quotes, **kw)
+        up.set_handlers(**{f"on_{k}": (lambda *a, k=k: self.events[k].append(a))
+                           for k in self.events})
+        up.start()
+        self.addCleanup(up.stop)
+        return up
+
+    def test_cme_futures_stream_from_databento_and_fx_from_the_feed(self):
+        up = self.start([XAU_ID, GC_ID])
+        self.assertTrue(self.quotes.started)
+        self.assertEqual(self.quotes.subscribed, ["GCZ6"])      # from the start
+        self.assertEqual((up.quote_source_of(GC), up.quote_source_of(XAU)),
+                         ("databento", "fix-feed"))
+        up.subscribe_ticker(GC)
+        up.subscribe_ticker(XAU)
+        md = [dict(b)[48] for t, b in self.venue.sessions["feed"].sent if t == X.MD_REQUEST]
+        self.assertEqual(md, [XAU_ID])                          # GC never asked of the FEED
+        self.assertFalse(up.public_ok_for(GC))                  # no price yet
+        self.quotes.push("GCZ6", 3973.5, 3973.7)
+        sym, t = self.events["ticker"][-1]
+        self.assertEqual((sym, t["bid"], t["ask"], t["info"]["source"]),
+                         (GC, 3973.5, 3973.7, "databento"))
+        self.assertTrue(self.events["book"])
+        self.assertTrue(up.public_ok_for(GC))
+        self.quotes.healthy = False                             # Databento silent / down
+        self.assertFalse(up.public_ok_for(GC))
+
+    def test_cme_futures_alone_need_no_feed_login(self):
+        up = self.start([GC_ID], feed_password="")
+        self.assertIsNone(up.feed)
+        self.assertNotIn("feed", self.venue.sessions)
+        self.assertTrue(wait_for(lambda: up.private_ok("main")))
+        self.assertTrue(up.status()["connected"])
+
+    def test_post_only_is_checked_against_the_databento_book(self):
+        up = self.start([GC_ID], feed_password="")
+        gw = ExanteGateway(up, port=0, token=TOKEN,
+                           slots=CL.SlotRegistry(Path(tempfile.mkdtemp()) / "slots.json"))
+        gw.start()
+        self.addCleanup(gw.stop)
+        c = Lease("gc_grid", GC, "main", port=gw.port, token=TOKEN, dms_s=60.0,
+                  request_timeout_s=8.0, network="demo")
+        self.addCleanup(c.stop)
+        self.assertTrue(c.start(wait_s=3.0), c.reason)
+        self.assertTrue(wait_for(lambda: up.private_ok("main")))
+        with self.assertRaises(Exception) as cm:                # no Databento price yet
+            c.place("buy", 1, 3970.0, post_only=True)
+        self.assertIn("market-data stream down", str(cm.exception))
+        self.quotes.push("GCZ6", 3973.5, 3973.7)
+        self.assertTrue(wait_for(lambda: GC in gw._tickers))
+        with self.assertRaises(ccxt.InvalidOrder) as cm:        # would cross: never sent
+            c.place("buy", 1, 3973.7, post_only=True)
+        self.assertIn("postWouldExecute", str(cm.exception))
+        self.assertFalse([t for t, _ in self.venue.sessions["trade"].sent if t == X.NEW_ORDER])
+
+
+class QuoteSourceConfigTest(ConfigTest):
+    def test_a_databento_source_drops_the_feed_login_and_names_no_value(self):
+        d = CFG.scaffold("exante_demo", "demo")
+        raw = json.loads((d / CFG.CONFIG_NAME).read_text(encoding="utf-8"))
+        raw["quote_source"] = {"gateway": "databento_cme",
+                               "symbols": {"6E.CME.Z2026": "6EZ6"}}
+        (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
+        (d / CFG.ENV_NAME).write_text(
+            "exante_application_id = A\nexante_access_key = K\n"
+            "exante_fix_trade_password = T\ndb_gateway_token = DB-TOKEN-SECRET\n",
+            encoding="utf-8")
+        cfg = CFG.load("exante_demo")
+        self.assertTrue(cfg.complete, cfg.missing)              # no FEED password needed
+        self.assertEqual((cfg.quote_gateway, cfg.quote_symbols),
+                         ("databento_cme", {"6E.CME.Z2026": "6EZ6"}))
+        st = cfg.status()["quote_source"]
+        self.assertTrue(st["token_set"])
+        self.assertNotIn("DB-TOKEN-SECRET", json.dumps(cfg.status()))
+        db_root = self.root / "db"
+        (db_root / "databento_cme").mkdir(parents=True)
+        (db_root / "databento_cme" / "gateway.json").write_text(
+            json.dumps({"venue": "databento", "listen_port": 5677}), encoding="utf-8")
+        from atjte.gateways.databento import config as DC
+        with mock.patch.object(DC, "gateways_dir", return_value=db_root):
+            self.assertEqual(CFG.quote_port(cfg), 5677)
+            q = CFG.make_quotes(cfg)
+        self.assertEqual((q.port, q.gateway), (5677, "databento_cme"))
+        q.stop()
+
+    def test_a_bad_quote_source_is_refused(self):
+        d = CFG.scaffold("exante_demo", "demo")
+        for bad in ("databento_cme", {"gateway": "Bad Name"}, {"gateway": "db", "x": 1},
+                    {"gateway": "db", "symbols": ["GCZ6"]}):
+            raw = json.loads((d / CFG.CONFIG_NAME).read_text(encoding="utf-8"))
+            raw["quote_source"] = bad
+            (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaises(CFG.ConfigError, msg=repr(bad)):
+                CFG.load("exante_demo")
 
 
 class ConnectorTest(unittest.TestCase):

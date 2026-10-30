@@ -162,6 +162,14 @@ def main(argv=None) -> int:
         print(f"{cfg.name}: cannot resolve the account over REST: {type(e).__name__}: {e}")
         return 2
     ids = cfg.senders(account)
+    try:
+        quotes = C.make_quotes(cfg, log=log)
+    except C.ConfigError as e:
+        print(f"{cfg.name}: {e}")
+        return 2
+    if quotes is not None and not cfg.quote_token:
+        log(f"WARNING: no {C.DB_TOKEN_NAME} in {C.ENV_NAME} — the Databento gateway "
+            f"{cfg.quote_gateway} refuses the quote lease if it has a token")
     up = ExanteUpstream(
         network=cfg.network, account_id=account, symbols=cfg.symbols, rest=rest,
         fix_host=cfg.fix_host,
@@ -169,10 +177,13 @@ def main(argv=None) -> int:
               "password": cfg.feed_password, "port": cfg.feed_port},
         trade={"sender": ids["trade"][0], "target": ids["trade"][1],
                "password": cfg.trade_password, "port": cfg.trade_port},
-        depth=cfg.depth, tif=C.TIFS[cfg.tif], heartbeat_s=cfg.heartbeat_s, log=log)
+        depth=cfg.depth, tif=C.TIFS[cfg.tif], heartbeat_s=cfg.heartbeat_s,
+        quotes=quotes, quote_symbols=cfg.quote_symbols, log=log)
     log(f"{cfg.name}: {cfg.network.upper()} — account {account}, FIX {cfg.fix_host} "
         f"(TRADE {ids['trade'][0]}, FEED {ids['feed'][0]}), "
-        f"{len(cfg.symbols)} instrument(s)")
+        f"{len(cfg.symbols)} instrument(s)"
+        + (f"; CME futures priced from the Databento gateway {cfg.quote_gateway} "
+           f"(port {quotes.port})" if quotes is not None else ""))
     try:
         up.start()
     except Exception as e:                                  # noqa: BLE001
@@ -203,7 +214,12 @@ def main(argv=None) -> int:
         while not stop.wait(1.0):
             s = gw.status()
             u = s["upstream"]
-            ready = bool(u.get("connected")) and all((u.get("accounts") or {}).values())
+            q = u.get("quotes")
+            # a Databento source counts once something is priced from it
+            quotes_up = (q is None or not up._db_of or
+                         bool(q.get("connected") and (q.get("session") or {}).get("quotes_ok")))
+            ready = (bool(u.get("connected")) and all((u.get("accounts") or {}).values())
+                     and quotes_up)
             write_state(state, {"name": cfg.name, "pid": os.getpid(), "t": time.time(),
                                 "dialect": "exante", "venue": "exante",
                                 "network": cfg.network, "listen_port": gw.port,
@@ -214,8 +230,8 @@ def main(argv=None) -> int:
                                 "session": {"ready": ready,
                                             "state": "ready" if ready else "degraded",
                                             "reason": "" if ready else
-                                            "a FIX session is down or the book is not "
-                                            "rebuilt yet",
+                                            "a FIX session is down, the book is not "
+                                            "rebuilt yet, or a quote source is down",
                                             "last_error": u.get("last_error", "")},
                                 **s})
             if SD.daemon_tick(cfg.dir, gw.cancel_bot_orders, lease, log):

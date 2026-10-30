@@ -38,6 +38,7 @@ _fixtures.bind(_STRATEGY)
 
 from atjte.strategy_types.arb.grid_bot import grid_bot  # noqa: E402  — the library type, bound to the fixture project
 import atjte.engines.arb.arb_bot as pb  # noqa: E402
+from atjte.engines.common.grid_model import DesiredOrder  # noqa: E402
 
 
 def make_bot(pos):
@@ -320,6 +321,42 @@ class GridWiringTest(unittest.TestCase):
         self.assertEqual(g["long_exits"], [0.0, -1.0, -2.0])
         self.assertEqual(g["short_entries"], [1.0, 2.0, 3.0])
         self.assertEqual(g["short_exits"], [0.0, 1.0, 2.0])
+
+
+class ReleaseStepRatioTest(unittest.TestCase):
+    """BASIS_RELEASE_STEP_RATIO: the basis release as a fraction of the grid
+    step, following the step (a bps step re-anchored); None = BASIS_RELEASE."""
+
+    def setUp(self):
+        self._orig = (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE,
+                      pb.BASIS_RELEASE_STEP_RATIO, grid_bot.GRID_STEP)
+        pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE = True, "avg", 0.25
+        grid_bot.GRID_STEP = 2.0
+
+    def tearDown(self):
+        (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE,
+         pb.BASIS_RELEASE_STEP_RATIO, grid_bot.GRID_STEP) = self._orig
+
+    def test_the_release_is_a_fraction_of_the_step(self):
+        bot = make_bot(0.0)
+        self.assertEqual(bot.basis_release(), 0.25)            # None: BASIS_RELEASE
+        pb.BASIS_RELEASE_STEP_RATIO = 0.5
+        self.assertEqual(bot.basis_release(), 1.0)             # half of a 2.0 step
+        grid_bot.GRID_STEP = 3.0                               # re-anchored (bps)
+        self.assertEqual(bot.basis_release(), 1.5)
+        self.assertEqual(bot.grid_step(), 3.0)
+
+    def test_an_armed_buy_holds_within_the_ratio(self):
+        pb.BASIS_RELEASE_STEP_RATIO = 0.5                      # 1.0 of a 2.0 step
+        bot = make_bot(0.0)
+        buy = DesiredOrder(key="b", side="buy", purpose="entry", level_index=1,
+                           level=-2.0, size=1.0)
+        bot.basis_avg_bid = -2.1
+        self.assertEqual(len(bot._basis_gate([buy])), 1)       # armed
+        bot.basis_avg_bid = -1.2                               # 0.8 back inside: held
+        self.assertEqual(len(bot._basis_gate([buy])), 1)
+        bot.basis_avg_bid = -0.9                               # 1.1 back inside: pulled
+        self.assertEqual(bot._basis_gate([buy]), [])
 
 
 if __name__ == "__main__":

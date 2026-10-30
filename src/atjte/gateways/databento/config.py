@@ -12,14 +12,17 @@
 
     {"name": "db_cme", "venue": "databento", "listen_port": 5670,
      "dataset": "GLBX.MDP3",              # CME Globex
-     "symbols": ["GCZ6", "GC.c.0"],       # raw symbols, or continuous (ROOT.c.N)
+     "symbols": ["GCZ6", "GC.c.0"],       # bars: raw symbols, or continuous (ROOT.c.N)
      "live": true,                        # stream 1 m bars for the live chart
      "clients": []}                       # allowlist; empty = any client with the token
 
 A DATA-ONLY gateway: it serves historical bars (``fetch_ohlcv``), the cost of
 a fetch before it is made (``ohlcv_cost`` — Databento bills historical data
-per request), and live 1 m bars from its subscription. It places nothing: a
-trading hello is refused.
+per request), live 1 m bars from its subscription, and live QUOTES (top of
+book) of any symbol a client subscribes to — what an EXANTE gateway prices
+CME futures off. ``symbols`` lists the bars' symbols only: a gateway that
+just streams quotes may list none. It places nothing: a trading hello is
+refused.
 
 ``gateway.env`` (read from this file only)::
 
@@ -85,8 +88,6 @@ class GatewayConfig:
         out = []
         if not self.api_key:
             out.append(KEY_NAME)
-        if not self.symbols:
-            out.append("symbols in gateway.json")
         return out
 
     @property
@@ -127,6 +128,23 @@ def _resolve(name_or_path: str) -> Path:
     if (q / CONFIG_NAME).is_file():
         return q
     raise ConfigError(f"no Databento gateway {name_or_path!r} (looked in {gateways_dir()})")
+
+
+def listen_port_of(name_or_path: str) -> int:
+    """The port a Databento gateway listens on, from its ``gateway.json``
+    alone — another gateway that streams its quotes never reads its
+    ``gateway.env`` (its key)."""
+    d = _resolve(str(name_or_path))
+    try:
+        raw = json.loads((d / CONFIG_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"{d / CONFIG_NAME}: {e}") from None
+    if (raw.get("venue") or "") != "databento":
+        raise ConfigError(f"{d.name} is not a Databento gateway")
+    try:
+        return int(raw.get("listen_port") or DEFAULT_LISTEN_PORT)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{d / CONFIG_NAME}: listen_port is a number") from None
 
 
 def parse_symbols(raw) -> list[str]:

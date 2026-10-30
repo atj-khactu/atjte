@@ -202,6 +202,10 @@ class GridBot(ArbBot):
     SIZE_SETTINGS = ("GRID_LEVEL_UNITS", "ORDER_VOLUME", "MAX_POSITION_UNITS",
                      "MAX_SHORT_UNITS")
 
+    def grid_step(self) -> float:
+        # the module's, as apply_bps re-anchors it (also for grid futures)
+        return float(sys.modules[__name__].GRID_STEP)
+
     def _size_module(self):
         # this module's, also for a subclass defined elsewhere (grid futures)
         return sys.modules[__name__]

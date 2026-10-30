@@ -228,7 +228,149 @@ class GatewayTest(GatewayCase):
             c.read("fetch_ohlcv", symbol="ESZ6", timeframe="1h", since=None, limit=1)
 
 
+def _mbp1(bid, ask, bsz=5, asz=7, iid=7):
+    """An ``mbp-1`` record (``nan`` = an empty side, as ``pretty_*`` gives it)."""
+    return NS(rtype=U.RTYPE_MBP_1, pretty_bid_px_00=bid, pretty_ask_px_00=ask,
+              bid_px_00=0, ask_px_00=0, bid_sz_00=bsz, ask_sz_00=asz, instrument_id=iid,
+              ts_event=NOW * NS_)
+
+
+class RefusingLive(FakeLive):
+    def subscribe(self, dataset, schema, symbols, stype_in):
+        if "BAD" in symbols:
+            raise ValueError("symbol not found")
+        super().subscribe(dataset, schema, symbols, stype_in)
+
+
+class QuoteUpstreamTest(unittest.TestCase):
+    def test_quotes_share_one_session_and_stream_only_changes(self):
+        made = []
+        lv = FakeLive()
+        up = U.DatabentoUpstream("db-test-key", "GLBX.MDP3", [], live=True,
+                                 historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: made.append(1) or lv,
+                                 clock=lambda: NOW)
+        up.start()
+        self.assertFalse(lv.started)                # no bars to stream: no session yet
+        got = []
+        up.set_quote_handler(lambda s, q: got.append((s, q)))
+        up.subscribe_quotes("GCZ6")
+        up.subscribe_quotes("GCZ6")                 # a second client: nothing new
+        up.subscribe_quotes("ESZ6")
+        self.assertTrue(lv.started)
+        self.assertEqual(len(made), 1)              # one Databento connection
+        self.assertEqual(lv.subs, [("GLBX.MDP3", "mbp-1", ("GCZ6",), "raw_symbol"),
+                                   ("GLBX.MDP3", "mbp-1", ("ESZ6",), "raw_symbol")])
+        lv.cb(NS(stype_in_symbol="GCZ6", instrument_id=7))
+        lv.cb(_mbp1(4000.1, 4000.3))
+        s, q = got[-1]
+        self.assertEqual((s, q["bid"], q["ask"], q["bidVolume"], q["askVolume"]),
+                         ("GCZ6", 4000.1, 4000.3, 5.0, 7.0))
+        self.assertEqual(q["timestamp"], NOW * 1000)
+        lv.cb(_mbp1(4000.1, 4000.3))                # a trade that left the top as it was
+        lv.cb(_mbp1(4000.1, float("nan")))          # one-sided: not a price
+        self.assertEqual(len(got), 1)
+        lv.cb(_mbp1(4000.2, 4000.3))
+        self.assertEqual(len(got), 2)
+        self.assertEqual(up.last_quote("GCZ6")["bid"], 4000.2)
+
+    def test_a_top_of_book_record_is_never_taken_for_a_bar(self):
+        up, _hist, lv = _upstream(symbols=("GCZ6",))
+        up.subscribe_quotes("GCZ6")
+        lv.cb(NS(stype_in_symbol="GCZ6", instrument_id=7))
+        lv.cb(_mbp1(4000.1, 4000.3))
+        self.assertEqual(up._live_bars["GCZ6"]["mid"], {})
+        lv.cb(_bbo(PUBLISHED + 60, 3999.0, 4001.0))     # a 1 m BBO still is one
+        self.assertEqual(len(up._live_bars["GCZ6"]["mid"]), 1)
+
+    def test_liveness_is_anything_lately_heartbeats_included(self):
+        now = [float(NOW)]
+        lv = FakeLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: now[0])
+        up.start()
+        self.assertFalse(up.live_alive())
+        up.subscribe_quotes("GCZ6")
+        self.assertTrue(up.live_alive())
+        now[0] += U.LIVE_SILENT_S + 1
+        self.assertFalse(up.live_alive())               # silent: no record, no heartbeat
+        lv.cb(NS(is_heartbeat=True, msg="Heartbeat", instrument_id=0))
+        self.assertTrue(up.live_alive())
+        self.assertEqual(up.counters["heartbeats"], 1)
+
+    def test_a_refused_symbol_raises_and_is_not_kept(self):
+        lv = RefusingLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: NOW)
+        up.start()
+        up.subscribe_quotes("GCZ6")
+        with self.assertRaises(ccxt.ExchangeNotAvailable):
+            up.subscribe_quotes("BAD")
+        self.assertEqual(up.status()["quote_symbols"], ["GCZ6"])
+
+
+class QuoteGatewayTest(unittest.TestCase):
+    def setUp(self):
+        self.lv = RefusingLive()
+        self.up = U.DatabentoUpstream("db-test-key", "GLBX.MDP3", [], live=False,
+                                      historical_factory=lambda k: FakeHistorical(),
+                                      live_factory=lambda k: self.lv, clock=time.time)
+        self.up.start()
+        self.gw = DatabentoGateway(self.up, port=0, token=TOKEN)
+        self.gw.start()
+        self.addCleanup(self.gw.stop)
+
+    def lease(self, name):
+        got = []
+        c = HlGatewayClient(name, "", "", port=self.gw.port, token=TOKEN, readonly=True,
+                            dms_s=3.0, on_ticker=got.append)
+        self.addCleanup(c.stop)
+        self.assertTrue(c.start(wait_s=5))
+        return c, got
+
+    def test_two_clients_on_one_contract_share_one_subscription(self):
+        a, got_a = self.lease("exante:one")
+        b, got_b = self.lease("exante:two")
+        a.subscribe("GCZ6")
+        b.subscribe("GCZ6")
+        self.assertTrue(wait_for(lambda: len(self.gw.status()["clients"]) == 2 and all(
+            c["streams"] == ["GCZ6"] for c in self.gw.status()["clients"])))
+        self.assertEqual([s[2] for s in self.lv.subs], [("GCZ6",)])
+        self.lv.cb(NS(stype_in_symbol="GCZ6", instrument_id=7))
+        self.lv.cb(_mbp1(4000.1, 4000.3))
+        self.assertTrue(wait_for(lambda: got_a and got_b))
+        self.assertEqual((got_a[-1]["symbol"], got_a[-1]["bid"]), ("GCZ6", 4000.1))
+        self.assertTrue(wait_for(lambda: a.session.get("quotes_ok")))
+        self.assertEqual(a.session.get("dataset"), "GLBX.MDP3")
+        # a late client gets the latest price at once, not at the next change
+        c, got_c = self.lease("exante:three")
+        c.subscribe("GCZ6")
+        self.assertTrue(wait_for(lambda: got_c and got_c[-1]["ask"] == 4000.3))
+
+    def test_a_refused_symbol_is_in_the_session_and_others_still_stream(self):
+        a, got = self.lease("exante:one")
+        a.subscribe("BAD")
+        self.assertTrue(wait_for(lambda: "BAD" in (a.session.get("quote_errors") or {})))
+        a.subscribe("GCZ6")
+        self.assertTrue(wait_for(lambda: self.lv.started))
+        self.lv.cb(NS(stype_in_symbol="GCZ6", instrument_id=7))
+        self.lv.cb(_mbp1(4000.1, 4000.3))
+        self.assertTrue(wait_for(lambda: bool(got)))
+
+
 class ConfigTest(unittest.TestCase):
+    def test_a_quote_gateway_needs_no_bar_symbols_and_its_port_is_public(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict("os.environ", {"ATJTE_GATEWAYS_DIR": d}):
+            folder = C.scaffold("db_quotes")
+            raw = json.loads((folder / C.CONFIG_NAME).read_text(encoding="utf-8"))
+            raw.update(symbols=[], listen_port=5677)
+            (folder / C.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
+            (folder / C.ENV_NAME).write_text("databento_api_key = db-secret\n",
+                                             encoding="utf-8")
+            self.assertTrue(C.load("db_quotes").complete)
+            self.assertEqual(C.listen_port_of("db_quotes"), 5677)
+
     def test_load_scaffold_and_names_only(self):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch.dict("os.environ", {"ATJTE_GATEWAYS_DIR": d}):

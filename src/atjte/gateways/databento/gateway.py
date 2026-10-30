@@ -12,7 +12,17 @@ hyperliquid.protocol`): ``hello`` / ``welcome``, ``read`` / ``reply``,
   each one is answered on its own thread — the connection keeps answering
   pings meanwhile;
 - the reads are :meth:`DatabentoUpstream.read`'s: ``markets``,
-  ``fetch_ohlcv``, ``ohlcv_cost``, ``status``.
+  ``fetch_ohlcv``, ``ohlcv_cost``, ``status``;
+- live QUOTES for the gateways that price off Databento (an EXANTE gateway
+  quoting CME futures): a client sends ``subscribe`` / ``unsubscribe`` with
+  a symbol of the dataset (``GCZ6``), and the gateway pushes ``ticker`` for
+  it — one Databento subscription however many clients want the symbol.
+  Each client has its own sender thread holding the LATEST ticker per
+  symbol, so a slow client skips stale quotes instead of holding up
+  Databento's callback or the other clients. The session it reports
+  (``welcome`` / ``pong`` / ``state``, pushed when it changes) carries
+  ``quotes_ok`` (the live session spoke lately — heartbeats included),
+  ``dataset`` and ``quote_errors`` (a symbol Databento refused).
 
 The key stays in the upstream; the only credential on this wire is the
 loopback token.
@@ -27,6 +37,7 @@ from typing import Any, Callable, Optional
 
 import ccxt
 
+from atjte.gateways.fix.protocol import SUBSCRIBE, UNSUBSCRIBE
 from atjte.gateways.hyperliquid import protocol as P
 
 from .config import DEFAULT_LISTEN_PORT
@@ -34,6 +45,9 @@ from .config import DEFAULT_LISTEN_PORT
 DEFAULT_PORT = DEFAULT_LISTEN_PORT
 HELLO_TIMEOUT_S = 10.0
 LABEL = "databento gateway"
+#: how often a quote client's sender re-checks the session (a ``state`` push
+#: when it changed) while no quote arrives
+STATE_EVERY_S = 1.0
 
 
 @dataclass
@@ -43,6 +57,13 @@ class _Client:
     symbol: str = ""
     send_lock: threading.Lock = field(default_factory=threading.Lock)
     reads: int = 0
+    #: the symbols it streams quotes of, and the latest unsent ticker of each
+    subs: set = field(default_factory=set)
+    pending: dict = field(default_factory=dict)
+    cond: threading.Condition = field(default_factory=threading.Condition)
+    sender: Optional[threading.Thread] = None
+    closed: bool = False
+    quotes: int = 0
 
 
 def _error_type(e: BaseException) -> str:
@@ -71,7 +92,13 @@ class DatabentoGateway:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._clients: dict[str, _Client] = {}
-        self.counters = {"clients": 0, "refused": 0, "reads": 0, "read_errors": 0}
+        #: symbol -> why Databento refused its quotes (cleared when they flow)
+        self._quote_errors: dict[str, str] = {}
+        self.counters = {"clients": 0, "refused": 0, "reads": 0, "read_errors": 0,
+                         "quotes_out": 0, "quotes_skipped": 0}
+        set_handler = getattr(upstream, "set_quote_handler", None)
+        if set_handler is not None:
+            set_handler(self._on_quote)
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -95,6 +122,7 @@ class DatabentoGateway:
         with self._lock:
             clients, self._clients = list(self._clients.values()), {}
         for c in clients:
+            self._close_sender(c)
             try:
                 c.sock.close()
             except OSError:
@@ -106,13 +134,21 @@ class DatabentoGateway:
         reason = "" if ready else (s.get("last_error") or "the Databento key is not checked yet")
         if ready and s.get("live") and not s.get("live_ok"):
             reason = "historical OK; the live session is down"
+        quotes_ok = bool(s.get("live_alive"))
+        if ready and s.get("quote_symbols") and not quotes_ok:
+            reason = "the live session is silent (no record or heartbeat lately)"
+        with self._lock:
+            errors = dict(self._quote_errors)
         return {"ready": ready, "state": "ready" if ready else "degraded", "reason": reason,
-                "public_ok": ready, "live_ok": bool(s.get("live_ok"))}
+                "public_ok": ready, "live_ok": bool(s.get("live_ok")),
+                "quotes_ok": quotes_ok, "dataset": s.get("dataset"),
+                "quote_errors": errors}
 
     def status(self) -> dict:
         with self._lock:
             # the panel's gateway card reads client / orders / idle_s
-            clients = [{"client": c.name, "symbol": c.symbol, "reads": c.reads,
+            clients = [{"client": c.name, "symbol": c.symbol or ",".join(sorted(c.subs)),
+                        "reads": c.reads, "quotes": c.quotes, "streams": sorted(c.subs),
                         "orders": 0, "idle_s": 0}
                        for c in self._clients.values()]
         return {"clients": clients, "counters": dict(self.counters),
@@ -172,6 +208,7 @@ class DatabentoGateway:
                 with self._lock:
                     if self._clients.get(client.name) is client:
                         del self._clients[client.name]
+                self._close_sender(client)
                 self._log(f"{LABEL}: {client.name} detached ({client.reads} read(s))")
             try:
                 sock.close()
@@ -220,6 +257,17 @@ class DatabentoGateway:
             return True
         if op == P.BYE:
             return False
+        if op == SUBSCRIBE:
+            sym = str(msg.get("symbol") or "").strip()
+            if sym:
+                threading.Thread(target=self._subscribe, args=(c, sym),
+                                 name="db-gw-sub", daemon=True).start()
+            return True
+        if op == UNSUBSCRIBE:
+            with c.cond:
+                c.subs.discard(str(msg.get("symbol") or ""))
+                c.pending.pop(str(msg.get("symbol") or ""), None)
+            return True
         req = msg.get("id")
         if op == P.READ and req is not None:
             threading.Thread(target=self._read, args=(c, int(req), str(msg.get("what") or ""),
@@ -246,3 +294,85 @@ class DatabentoGateway:
             self._send(c, msg)
         except OSError:
             pass
+
+    # ── live quotes ──────────────────────────────────────────────────────────
+    def _subscribe(self, c: _Client, symbol: str) -> None:
+        """One client's quote subscription: the Databento side once per
+        symbol (may take a connect), then the latest quote at once."""
+        with c.cond:
+            c.subs.add(symbol)
+        self._ensure_sender(c)
+        try:
+            self.up.subscribe_quotes(symbol)
+        except Exception as e:                              # noqa: BLE001
+            with self._lock:
+                self._quote_errors[symbol] = f"{type(e).__name__}: {e}"[:300]
+            self._log(f"{LABEL}: quotes for {symbol} refused: {e}")
+            self._wake(c)                   # the session (and its error) goes out
+            return
+        with self._lock:
+            self._quote_errors.pop(symbol, None)
+        self._log(f"{LABEL}: {c.name} streams {symbol}")
+        last = getattr(self.up, "last_quote", lambda _s: None)(symbol)
+        if last:
+            self._queue(c, symbol, last)
+        else:
+            self._wake(c)
+
+    def _on_quote(self, symbol: str, ticker: dict) -> None:
+        """The upstream's quote (Databento's callback thread): queued for
+        every client streaming it, never sent from here."""
+        with self._lock:
+            clients = [c for c in self._clients.values() if symbol in c.subs]
+        for c in clients:
+            self._queue(c, symbol, ticker)
+
+    def _queue(self, c: _Client, symbol: str, ticker: dict) -> None:
+        with c.cond:
+            if symbol not in c.subs or c.closed:
+                return
+            if symbol in c.pending:
+                self.counters["quotes_skipped"] += 1    # superseded before it went out
+            c.pending[symbol] = ticker
+            c.cond.notify()
+
+    def _wake(self, c: _Client) -> None:
+        with c.cond:
+            c.cond.notify()
+
+    def _ensure_sender(self, c: _Client) -> None:
+        with c.cond:
+            if c.sender is not None or c.closed:
+                return
+            c.sender = threading.Thread(target=self._send_loop, args=(c,),
+                                        name="db-gw-quotes", daemon=True)
+            c.sender.start()
+
+    def _close_sender(self, c: _Client) -> None:
+        with c.cond:
+            c.closed = True
+            c.pending.clear()
+            c.cond.notify_all()
+
+    def _send_loop(self, c: _Client) -> None:
+        """Push the client's queued tickers (latest per symbol) and, when the
+        session changed (quotes up / down, a refusal), a ``state``."""
+        last_session = None
+        while not self._stop.is_set():
+            with c.cond:
+                if not c.pending and not c.closed:
+                    c.cond.wait(STATE_EVERY_S)
+                if c.closed:
+                    return
+                batch, c.pending = c.pending, {}
+            try:
+                session = self.session()
+                if session != last_session:
+                    self._send(c, P.state(session))
+                    last_session = session
+                for t in batch.values():
+                    self._send(c, P.ticker(t))
+                    c.quotes += 1
+                    self.counters["quotes_out"] += 1
+            except OSError:
+                return                      # the connection's reader ends the client
