@@ -160,6 +160,12 @@ class ExanteRest:
     def symbol(self, exante_id: str) -> dict:
         return dict(self.get(f"/md/{VERSION}/symbols/{symbol_path(exante_id)}") or {})
 
+    def group(self, group: str) -> list[dict]:
+        """Every instrument of a product group (``MGC.COMEX``: each contract
+        month, with its expiration) — how a bot's symbol resolves to an
+        EXANTE id without a configured list. 404 (no such group): BadRequest."""
+        return list(self.get(f"/md/{VERSION}/groups/{quote(group, safe='.')}") or [])
+
     def specification(self, exante_id: str) -> dict:
         return dict(self.get(f"/md/{VERSION}/symbols/{symbol_path(exante_id)}"
                              f"/specification") or {})

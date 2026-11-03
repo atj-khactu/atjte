@@ -34,7 +34,12 @@ Optional: ``feed_port`` / ``trade_port`` (default 8100 / 8101 demo, 27000 /
 27001 live), ``feed_sender`` / ``trade_sender`` (default
 ``<ACCOUNT>_FEED[_UAT]`` / ``<ACCOUNT>_TRADE[_UAT]`` from the account id,
 what EXANTE documents; the demo TRADE login came suffixed,
-``ABC1234_TRADE_UAT_1a2b3c4d``, so copy the issued ones), ``heartbeat_s`` (30).
+``ABC1234_TRADE_UAT_1a2b3c4d``, so copy the issued ones), ``feed_target`` /
+``trade_target`` (default ``EXANTE_FEED[_UAT]`` / ``EXANTE_TRADE[_UAT]``),
+``heartbeat_s`` (30), ``fix_ca_file`` (live: EXANTE's own CA certificate,
+PEM, in this folder — EXANTE signs its live bridges with a private CA no
+public store holds; trusted for this gateway's FIX connections only, with
+hostname checking unchanged).
 
 ``gateway.env`` (read from this file only — never the process environment
 or the workspace's ``env/.env``)::
@@ -89,13 +94,18 @@ FEED_PASSWORD_NAME = "exante_fix_feed_password"
 #: the Databento gateway's loopback token (with ``quote_source``)
 DB_TOKEN_NAME = "db_gateway_token"
 TIFS = {"DAY": X.TIF_DAY, "GTC": X.TIF_GTC}
-#: EXANTE's limit: 25 order requests per 10 s
-MAX_MSGS_PER_MIN = 150.0
+#: EXANTE's published limit: 25 order requests per 10 s
+EXANTE_MSGS_PER_MIN = 150.0
+#: the most a gateway may be set to: above EXANTE's published limit is a
+#: test of what the account really gets (the gateway pauses new orders when
+#: EXANTE refuses one for its rate limit), never more than 100 a second
+MAX_MSGS_PER_MIN = 6000.0
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _ACCOUNT_RE = re.compile(r"^[A-Z0-9]{3,20}\.\d{3}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "fix_host", "feed_port", "trade_port",
-          "feed_sender", "trade_sender", "symbols", "depth", "tif", "heartbeat_s",
+          "feed_sender", "trade_sender", "feed_target", "trade_target", "fix_ca_file",
+          "symbols", "depth", "tif", "heartbeat_s",
           "msgs_per_min", "max_inflight", "clients", "quote_source",
           "_comment"} | _A.KEYS
 _QUOTE_KEYS = {"gateway", "port", "symbols"}
@@ -116,6 +126,11 @@ class GatewayConfig:
     trade_port: int = 0
     feed_sender: str = ""
     trade_sender: str = ""
+    feed_target: str = ""
+    trade_target: str = ""
+    #: EXANTE's own CA certificate (PEM) the live bridges chain to — a path in
+    #: this gateway's folder (or absolute); "" = the OS store + certifi only
+    fix_ca_file: str = ""
     symbols: list = field(default_factory=list)
     depth: int = 10
     tif: str = "DAY"
@@ -162,8 +177,10 @@ class GatewayConfig:
             out.append(FEED_PASSWORD_NAME)
         if self.account_id and not _ACCOUNT_RE.match(self.account_id):
             out.append(f"{ACCOUNT_NAME} (an EXANTE account id, like ABC1234.001)")
-        if not self.symbols:
-            out.append("symbols in gateway.json")
+        # no instrument is fine: each bot's is loaded when it attaches
+        if self.fix_ca_file and not Path(self.fix_ca_file).is_file():
+            out.append(f"fix_ca_file {Path(self.fix_ca_file).name} (not found in the "
+                       f"gateway's folder)")
         if not self.fix_host:
             out.append("fix_host in gateway.json (the live FIX bridge EXANTE assigned)")
         return out
@@ -177,12 +194,12 @@ class GatewayConfig:
         return (account_id or self.account_id or "").split(".")[0]
 
     def senders(self, account_id: Optional[str] = None) -> dict:
-        """``{"trade": (sender, target), "feed": (sender, target)}``."""
+        """``{"trade": (sender, target), "feed": (sender, target)}``: EXANTE's
+        documented CompIDs, each replaced by the one set in gateway.json."""
         ids = X.comp_ids(self.account_code(account_id), self.network)
-        if self.trade_sender:
-            ids["trade"] = (self.trade_sender, ids["trade"][1])
-        if self.feed_sender:
-            ids["feed"] = (self.feed_sender, ids["feed"][1])
+        for role, sender, target in (("trade", self.trade_sender, self.trade_target),
+                                     ("feed", self.feed_sender, self.feed_target)):
+            ids[role] = (sender or ids[role][0], target or ids[role][1])
         return ids
 
     def status(self) -> dict:
@@ -197,11 +214,13 @@ class GatewayConfig:
                 "account_set": bool(self.account_id),
                 "complete": self.complete, "missing": self.missing,
                 "token_set": bool(self.token), "clients_allowed": list(self.clients),
+                "fix_ca_file": Path(self.fix_ca_file).name if self.fix_ca_file else None,
                 "quote_source": ({"gateway": self.quote_gateway, "port": self.quote_port or None,
                                   "token_set": bool(self.quote_token),
                                   "symbols": dict(self.quote_symbols)}
                                  if self.quote_gateway else None),
-                "msgs_per_min": self.msgs_per_min}
+                "msgs_per_min": self.msgs_per_min,
+                "over_exante_limit": self.msgs_per_min > EXANTE_MSGS_PER_MIN}
 
 
 def gateways_dir() -> Path:
@@ -286,8 +305,12 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
                                                        else DEFAULT_LISTEN_PORT)),
             fix_host=host, feed_port=int(raw.get("feed_port") or 0),
             trade_port=int(raw.get("trade_port") or 0),
-            feed_sender=str(raw.get("feed_sender") or ""),
-            trade_sender=str(raw.get("trade_sender") or ""),
+            feed_sender=str(raw.get("feed_sender") or "").strip(),
+            trade_sender=str(raw.get("trade_sender") or "").strip(),
+            feed_target=str(raw.get("feed_target") or "").strip(),
+            trade_target=str(raw.get("trade_target") or "").strip(),
+            fix_ca_file=(str(d / str(raw["fix_ca_file"]).strip())
+                         if str(raw.get("fix_ca_file") or "").strip() else ""),
             symbols=symbols, depth=int(raw.get("depth") or 10), tif=tif,
             heartbeat_s=int(raw.get("heartbeat_s") or 30),
             msgs_per_min=msgs, max_inflight=int(raw.get("max_inflight") or 10),
@@ -296,8 +319,9 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         raise ConfigError(f"{CONFIG_NAME}: ports, depth, heartbeat_s, msgs_per_min and "
                           f"max_inflight are numbers") from None
     if not 0 < cfg.msgs_per_min <= MAX_MSGS_PER_MIN:
-        raise ConfigError(f"{CONFIG_NAME}: msgs_per_min is at most {MAX_MSGS_PER_MIN:g} "
-                          f"(EXANTE allows 25 order requests per 10 s)")
+        raise ConfigError(f"{CONFIG_NAME}: msgs_per_min is above 0 and at most "
+                          f"{MAX_MSGS_PER_MIN:g} (EXANTE publishes 25 order requests per "
+                          f"10 s = {EXANTE_MSGS_PER_MIN:g} / min)")
     cfg.quote_gateway, cfg.quote_port, cfg.quote_symbols = parse_quote_source(
         raw.get("quote_source"))
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)

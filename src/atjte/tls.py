@@ -19,12 +19,19 @@ from __future__ import annotations
 import ssl
 
 
-def client_context() -> ssl.SSLContext:
-    """A verifying client context trusting the OS store and certifi's bundle."""
+def client_context(cafile: str = "") -> ssl.SSLContext:
+    """A verifying client context trusting the OS store and certifi's bundle
+    — plus ``cafile``: a venue's PRIVATE certificate authority (EXANTE signs
+    its live FIX bridges with its own, which no public store holds), trusted
+    by this context only. Verification and hostname checking are unchanged.
+    A ``cafile`` that cannot be read raises: a connection that was told to
+    trust a CA must not quietly go out without it."""
     ctx = ssl.create_default_context()
     try:
         import certifi
         ctx.load_verify_locations(cafile=certifi.where())
     except Exception:                                       # noqa: BLE001 — the OS store still applies
         pass
+    if cafile:
+        ctx.load_verify_locations(cafile=cafile)
     return ctx

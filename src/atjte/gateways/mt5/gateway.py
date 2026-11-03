@@ -200,6 +200,16 @@ class MT5Gateway:
         """Answering AND able to take a hedge (the health check)."""
         return self.answering and bool(self._health.get("ok", True))
 
+    @property
+    def prices_ok(self) -> bool:
+        """Answering with LIVE prices: the terminal is reachable and on the
+        broker's server. Whether it may trade (Algo Trading, the account's
+        flags) does not matter to a price — a dry run reads them with the
+        button off, while every hedge stays refused until :attr:`ready`."""
+        h = self._health
+        return (self.answering and bool(h.get("reachable", True))
+                and bool(h.get("connected", h.get("ok", True))))
+
     def check_health(self, force: bool = False) -> dict:
         """The backend's ``health()`` every :data:`HEALTH_INTERVAL_S` (every
         :data:`HEALTH_RETRY_S` while it fails); a channel that does not
@@ -242,6 +252,7 @@ class MT5Gateway:
         if not self.answering:
             reasons = [self.last_error or f"no terminal call succeeded in {HEALTH_WINDOW_S:g}s"]
         return {"ready": ok, "state": "ready" if ok else "terminal cannot hedge",
+                "prices_ok": self.prices_ok,
                 "reason": "; ".join(reasons), "reasons": reasons,
                 "health": dict(self._health), "last_error": self.last_error}
 
@@ -441,6 +452,17 @@ class MT5Gateway:
                               "invalid_order")
 
     def _place(self, c: _Client, args: list, kwargs: dict) -> Any:
+        """One hedge, timed: the order comes back with ``raw["gw_ms"]`` =
+        when this gateway took the request and when the terminal answered
+        (epoch ms, this machine's clock) — the hedge timing's MT5 hops."""
+        t_in = self._clock()
+        o = self._place_order(c, args, kwargs)
+        raw = getattr(o, "raw", None)
+        if isinstance(raw, dict):
+            raw["gw_ms"] = {"in": int(t_in * 1000), "out": int(self._clock() * 1000)}
+        return o
+
+    def _place_order(self, c: _Client, args: list, kwargs: dict) -> Any:
         order_type = kwargs.get("order_type", args[3] if len(args) > 3 else OrderType.MARKET)
         if order_type is not OrderType.MARKET:
             raise Refusal(f"the {self.label} sends MARKET hedges only (got "
@@ -499,12 +521,21 @@ class MT5Gateway:
         done, cost, last = 0.0, 0.0, None
         closed = []
         base = {k: v for k, v in kwargs.items() if k not in ("order_type", "price")}
+        failed = False
         for p in tickets:
             if left <= 1e-9:
                 break
             vol = round(min(left, float(p.size)), 8)
-            o = self._backend("place_order", symbol, side, vol, OrderType.MARKET,
-                              **{**base, "position": p.position_id})
+            try:
+                o = self._backend("place_order", symbol, side, vol, OrderType.MARKET,
+                                  **{**base, "position": p.position_id})
+            except Exception:
+                if done <= 0:
+                    raise
+                # a ticket before it closed: report the partial (the caller
+                # books what filled; the reconciler sends the rest)
+                failed = True
+                break
             filled = float(o.filled or 0.0)
             px = (o.raw or {}).get("price") if isinstance(o.raw, dict) else None
             done += filled
@@ -514,8 +545,14 @@ class MT5Gateway:
             last = o
             if filled <= 0:
                 break
-        if left > 1e-9:
-            o = self._backend("place_order", symbol, side, left, OrderType.MARKET, **base)
+        if left > 1e-9 and not failed:
+            try:
+                o = self._backend("place_order", symbol, side, left, OrderType.MARKET, **base)
+            except Exception:
+                if done <= 0:
+                    raise
+                o = None
+        if left > 1e-9 and not failed and o is not None:
             filled = float(o.filled or 0.0)
             px = (o.raw or {}).get("price") if isinstance(o.raw, dict) else None
             done += filled

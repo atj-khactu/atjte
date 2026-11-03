@@ -349,6 +349,16 @@ RECONCILE_RECHECK_DELAY_S = 15.0
 # market: 1 unit is one XAUUSD min lot but ~157 JP225 lots. None (the
 # default) = one MT5 min lot, read from the terminal at start.
 RECONCILE_TOLERANCE_UNITS = None  # >= one broker min lot in base units; None = one MT5 min lot
+# The reconciler is the SAFETY NET: on a healthy bot every fill is hedged at
+# once and its 15 s re-check finds parity. This many FIXES IN A ROW (a drift
+# that persisted its re-check, with no clean parity read in between) means
+# the bot's own hedging is wrong -- a hedge booked that never filled, a size
+# mismatch, something else moving the MT5 book -- and more automatic
+# hedging is the danger (2026-11-01: the reconciler and the event hedger
+# traded 0.03 lot back and forth across a 20-pip spread). The last fix is
+# sent, then the bot HALTS: quotes stay down and the reconciler stops
+# hedging until the bot is restarted. 0 = off.
+MAX_RECONCILE_FIXES = 3
 
 # --- Basis trigger (ON by default; sample_project-style signal entries) ---
 # True (the default) = an order is SUBMITTED only while
@@ -613,6 +623,12 @@ MAX_DAILY_LOSS_USD = None            # today's PnL <= -this -> close-only for th
 MAX_DAILY_VOLUME_USD = None
 MAX_DAILY_VENUE_VOLUME_USD = None    # crypto notional traded today >= this -> close-only
 MAX_DAILY_MT5_VOLUME_USD = None      # MT5 hedge notional traded today >= this -> close-only
+# The caps never block a hedge (close-only must still hedge its exits),
+# with ONE exception: a RECONCILER fix that would take today's hedge
+# notional past the hedge cap is not sent, and the bot HALTS until restarted
+# -- the safety net trading past the day's budget is the suspect trade
+# (2026-11-01: the reconciler and the event hedger traded 0.03 lot back
+# and forth every cycle).
 
 # --- Trading blackouts: market opens / rollover and scheduled events ---
 # Inside a blackout the bot rests NO quotes at all (not "close-only": an exit

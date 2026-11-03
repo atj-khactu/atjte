@@ -25,6 +25,7 @@ from test_hl_gateway import TOKEN, wait_for  # noqa: E402
 from atjte.fix import exante as X  # noqa: E402
 from atjte.fix.codec import Msg  # noqa: E402
 from atjte.gateways.exante import config as CFG  # noqa: E402
+from atjte.gateways.exante import gateway as GW  # noqa: E402
 from atjte.gateways.exante import session as S  # noqa: E402
 from atjte.gateways.exante import upstream as U  # noqa: E402
 from atjte.gateways.exante.client import ExanteGatewayClient as Lease  # noqa: E402
@@ -42,9 +43,11 @@ SYMBOL = {"ticker": "XAU/USD", "name": "Gold / US dollar", "exchange": "E", "cur
 SPEC = {"contractMultiplier": "1.0", "lotSize": "1.0", "priceUnit": "1.0", "units": "Contracts"}
 SUMMARY = {"currencies": [{"code": "EUR", "convertedValue": "1114610.0", "value": "1000000.0"}],
            "freeMoney": "1100000.0", "netAssetValue": "1114610.0", "marginUtilization": "0.01",
-           "positions": [{"id": XAU_ID, "symbolType": "FX_SPOT", "quantity": "-3",
+           # the shape EXANTE serves (demo, 2026-11-02): "symbolId", no "id"
+           "positions": [{"symbolId": XAU_ID, "symbolType": "FX_SPOT", "quantity": "-3",
                           "currency": "USD", "price": "4010.0", "averagePrice": "4000.0",
-                          "pnl": "-30.0", "convertedPnl": "-30.0"}],
+                          "pnl": "-30.0", "convertedPnl": "-30.0", "value": "-12030.0",
+                          "convertedValue": "-12030.0", "accruedInterest": "0"}],
            "currency": "USD", "accountId": ACCOUNT, "moneyUsedForMargin": "14610.0"}
 
 
@@ -214,7 +217,15 @@ class FakeVenue:
         self.orders: dict = {}                  # order id -> state
         self.resting = resting or []            # orders already on the book at logon
         self.reject_next = ""
+        self.business_reject_next = ""          # refused by a 35=j instead
+        self.reject_after_pending = ""          # PendingNew, then Rejected (with pending_s)
         self.sessions: dict = {}
+        # EXANTE as traced on demo (2026-11-02): a new order is PendingNew
+        # first and New ``pending_s`` later; a cancel landing in between is
+        # dropped. ``ignore_cancels`` drops that many cancels outright
+        self.pending_s = 0.0
+        self.ignore_cancels = 0
+        self.cancels_dropped = 0
 
     def factory(self, role, **kw):
         s = FakeSession(role, self, **kw)
@@ -239,6 +250,12 @@ class FakeVenue:
                                   (14, 0), (151, o["qty"]), (584, req),
                                   (912, "Y" if i == len(self.resting) - 1 else "N")))
         elif t == X.NEW_ORDER:
+            if self.business_reject_next:
+                text, self.business_reject_next = self.business_reject_next, ""
+                threading.Thread(target=sess.on_message, daemon=True, args=(
+                    m((35, "j"), (45, "1"), (372, "D"), (379, b[11]), (380, "0"),
+                      (58, text)),)).start()
+                return
             if self.reject_next:
                 text, self.reject_next = self.reject_next, ""
                 self.report(sess, (37, "NONE"), (11, b[11]), (17, "r"), (150, "8"), (39, "8"),
@@ -247,10 +264,23 @@ class FakeVenue:
             self.n += 1
             oid = f"ord-{self.n}"
             self.orders[oid] = {"id": oid, "cl": b[11], "side": X.SIDE_OF[b[54]],
-                                "qty": float(b[38]), "px": float(b[44]), "cum": 0.0}
-            self.report(sess, (37, oid), (11, b[11]), (17, f"e{self.n}"), (150, "0"),
-                        (39, "0"), (48, XAU_ID), (22, 111), (54, b[54]), (38, b[38]),
-                        (44, b[44]), (14, 0), (151, b[38]), (59, b[59]))
+                                "qty": float(b[38]), "px": float(b[44]), "cum": 0.0,
+                                "accepted": not self.pending_s}
+            fields = ((37, oid), (11, b[11]), (48, XAU_ID), (22, 111), (54, b[54]),
+                      (38, b[38]), (44, b[44]), (14, 0), (151, b[38]), (59, b[59]))
+            if self.pending_s:
+                self.report(sess, (17, f"p{self.n}"), (150, "A"), (39, "A"), *fields)
+
+                def accept(o=self.orders[oid]):
+                    if self.reject_after_pending:     # EXANTE live, 2026-11-02
+                        self.report(sess, (17, f"r{o['id']}"), (150, "8"), (39, "8"),
+                                    (58, self.reject_after_pending), *fields)
+                        return
+                    o["accepted"] = True
+                    self.report(sess, (17, f"e{o['id']}"), (150, "0"), (39, "0"), *fields)
+                threading.Timer(self.pending_s, accept).start()
+                return
+            self.report(sess, (17, f"e{self.n}"), (150, "0"), (39, "0"), *fields)
         elif t == X.REPLACE:
             o = next((o for o in self.orders.values() if o["cl"] == b[41]), None)
             if o is None:
@@ -266,6 +296,10 @@ class FakeVenue:
             o = next((o for o in self.orders.values() if o["cl"] == b[41]), None)
             if o is None:
                 return
+            if self.ignore_cancels or not o.get("accepted", True):
+                self.ignore_cancels = max(0, self.ignore_cancels - 1)
+                self.cancels_dropped += 1
+                return                          # no answer at all
             o["cl"] = b[11]
             self.report(sess, (37, o["id"]), (11, b[11]), (41, b[41]), (17, "cx"), (150, "4"),
                         (39, "4"), (48, XAU_ID), (22, 111), (54, b[54]), (38, o["qty"]),
@@ -346,13 +380,83 @@ class UpstreamTest(unittest.TestCase):
         trade = self.events["fill"][-1][1]
         self.assertEqual((trade["id"], trade["amount"], trade["price"], trade["fee"]),
                          ("ord-1@1", 1.0, 4001.0, None))
+        # when the gateway had the report: the hedge timing's first local hop
+        self.assertAlmostEqual(trade["info"]["gw_rx_ms"] / 1000, time.time(), delta=5)
+        from atjte.engines.arb.venue_feed import trade_from_ccxt
+        tr = trade_from_ccxt("exante", XAU, trade)
+        self.assertEqual(tr.raw, {"gw_rx_ms": trade["info"]["gw_rx_ms"]})   # carried to the bot
         self.up.cancel("main", XAU, ["ord-1"])
         self.assertTrue(wait_for(lambda: self.up._orders["ord-1"].status == "canceled"))
         with self.assertRaises(ccxt.OrderNotFound):
             self.up.cancel("main", XAU, ["ord-1"])
 
+    def _cancels_sent(self):
+        return [dict(b) for t, b in self.venue.sessions["trade"].sent if t == X.CANCEL]
+
+    def test_an_unanswered_cancel_raises_and_the_order_stays_open(self):
+        # was: a cancel EXANTE never answered came back "canceled" — the bot
+        # forgot an order still resting, and the reaper no longer owned it
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                      cloid=CL.make(3, 1, 1))
+        self.venue.ignore_cancels = 99
+        with mock.patch.object(U, "CANCEL_WAIT_S", 0.2):
+            with self.assertRaises(ccxt.RequestTimeout):
+                self.up.cancel("main", XAU, ["ord-1"])
+        self.assertEqual(self.up._orders["ord-1"].status, "open")
+        sent = self._cancels_sent()
+        self.assertEqual(len(sent), U.CANCEL_TRIES)              # sent again before giving up
+        self.assertEqual(len({c[11] for c in sent}), U.CANCEL_TRIES)   # a fresh ClOrdID each
+
+    def test_a_dropped_cancel_is_sent_again_and_confirmed(self):
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                      cloid=CL.make(3, 1, 2))
+        self.venue.ignore_cancels = 1
+        with mock.patch.object(U, "CANCEL_WAIT_S", 0.3):
+            out = self.up.cancel("main", XAU, ["ord-1"])
+        self.assertEqual(out[0]["status"], "canceled")
+        self.assertEqual(self.up._orders["ord-1"].status, "canceled")
+        self.assertEqual((len(self._cancels_sent()), self.venue.cancels_dropped), (2, 1))
+
+    def test_a_cancel_waits_until_exante_accepted_the_order(self):
+        # the demo trace: placed at PendingNew (~50 ms), New a few hundred ms
+        # later; a cancel sent in between is held or dropped by EXANTE
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.venue.pending_s = 0.3
+        o = self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                          cloid=CL.make(3, 1, 3))
+        self.assertEqual(o["status"], "open")                    # the bot's view: placed
+        # the place itself now waits for EXANTE's verdict (New or Rejected)
+        self.assertFalse(self.up._orders["ord-1"].pending)
+        self.up.cancel("main", XAU, ["ord-1"])                   # at once, as the bot does
+        self.assertEqual(self.up._orders["ord-1"].status, "canceled")
+        self.assertEqual((len(self._cancels_sent()), self.venue.cancels_dropped), (1, 0))
+
+    def test_an_amend_waits_until_exante_accepted_the_order(self):
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.venue.pending_s = 0.3
+        self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                      cloid=CL.make(3, 1, 4))
+        a = self.up.amend("main", XAU, "ord-1", "buy", 4001.0, None, cloid=CL.make(3, 1, 4),
+                          post_only=True, reduce_only=False)
+        self.assertEqual(a["price"], 4001.0)
+        self.assertFalse(self.up._orders["ord-1"].pending)
+
+    def test_an_order_filled_while_cancelling_is_not_called_cancelled(self):
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                      cloid=CL.make(3, 1, 5))
+        self.venue.ignore_cancels = 1
+        threading.Timer(0.1, lambda: self.venue.fill("ord-1", 1.0, 4000.0)).start()
+        with mock.patch.object(U, "CANCEL_WAIT_S", 0.3):
+            with self.assertRaises(ccxt.OrderNotFound):
+                self.up.cancel("main", XAU, ["ord-1"])
+        self.assertEqual(self.up._orders["ord-1"].status, "closed")
+
     def test_a_refusal_is_an_invalid_order_or_insufficient_funds(self):
         self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.enterContext(mock.patch.object(U, "REJECT_PAUSE_S", 0.0))   # each one sent
         self.venue.reject_next = "Insufficient margin"
         with self.assertRaises(ccxt.InsufficientFunds):
             self.up.place("main", XAU, "buy", 2, 4000.0, post_only=True, reduce_only=False,
@@ -361,6 +465,48 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaises(ccxt.InvalidOrder):
             self.up.place("main", XAU, "buy", 2, 4000.0, post_only=True, reduce_only=False,
                           cloid=CL.make(1, 1, 3))
+        self.venue.reject_next = "Rate limit exceeded"
+        with self.assertRaises(ccxt.RateLimitExceeded):
+            self.up.place("main", XAU, "buy", 2, 4000.0, post_only=True, reduce_only=False,
+                          cloid=CL.make(1, 1, 4))
+
+    def _orders_sent(self):
+        return sum(1 for t, _b in self.venue.sessions["trade"].sent if t == X.NEW_ORDER)
+
+    def test_a_rejection_after_pending_new_is_raised_and_pauses_the_symbol(self):
+        # was: answered "open" on PendingNew — the bot took a rejected order
+        # for resting, found it gone at its amend and placed again: 69
+        # orders in 43 s on the live account, every one "Not allowed to trade"
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.venue.pending_s = 0.1
+        self.venue.reject_after_pending = "Not allowed to trade"
+        with self.assertRaises(ccxt.InvalidOrder) as cm:
+            self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                          cloid=CL.make(1, 2, 1))
+        self.assertIn("Not allowed to trade", str(cm.exception))
+        self.assertEqual(self.up.counters["rejects"], 1)
+        with self.assertRaises(ccxt.InvalidOrder) as cm:        # paused: never sent
+            self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                          cloid=CL.make(1, 2, 2))
+        self.assertIn("paused until", str(cm.exception))
+        self.assertEqual(self._orders_sent(), 1)
+        self.up._reject_pause.clear()                           # the pause over
+        self.venue.reject_after_pending = ""
+        o = self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                          cloid=CL.make(1, 2, 3))
+        self.assertEqual(o["status"], "open")                   # accepted: New, not pending
+        self.assertFalse(self.up._orders[o["id"]].pending)
+
+    def test_a_business_reject_answers_its_order_at_once(self):
+        # was: a 35=j was only logged, so the order waited out ACK_WAIT_S
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        self.venue.business_reject_next = "Rate limit exceeded"
+        t0 = time.monotonic()
+        with self.assertRaises(ccxt.RateLimitExceeded):
+            self.up.place("main", XAU, "buy", 1, 4000.0, post_only=True, reduce_only=False,
+                          cloid=CL.make(1, 1, 5))
+        self.assertLess(time.monotonic() - t0, U.ACK_WAIT_S / 2)
+        self.assertEqual(self.up.counters["rejects"], 1)       # counted once
 
     def test_the_fee_follows_over_rest_and_the_fill_is_pushed_again(self):
         self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
@@ -412,6 +558,12 @@ class UpstreamTest(unittest.TestCase):
         pos = self.up.read("main", "fetch_positions", {"symbols": [XAU]})
         self.assertEqual((pos[0]["symbol"], pos[0]["side"], pos[0]["contracts"]),
                          (XAU, "short", 3.0))
+        # an older shape that named the instrument "id" still reads
+        legacy = dict(SUMMARY, positions=[{**{k: v for k, v in SUMMARY["positions"][0].items()
+                                              if k != "symbolId"}, "id": XAU_ID}])
+        with mock.patch.object(self.up, "_summary", lambda *_a: legacy):
+            pos = self.up.read("main", "fetch_positions", {"symbols": [XAU]})
+        self.assertEqual((pos[0]["symbol"], pos[0]["contracts"]), (XAU, 3.0))
         bars = self.up.read("main", "fetch_ohlcv", {"symbol": XAU, "timeframe": "1m"})
         self.assertEqual([b[0] for b in bars], [1_800_000_060_000, 1_800_000_120_000])
 
@@ -455,6 +607,32 @@ class GatewayEndToEndTest(unittest.TestCase):
         self.venue.fill(o["id"], 1.0, 4009.0)
         self.assertTrue(wait_for(lambda: bool(fills)))
 
+    def _orders_sent(self):
+        return sum(1 for t, _b in self.venue.sessions["trade"].sent if t == X.NEW_ORDER)
+
+    def test_a_rate_limit_refusal_pauses_new_orders_but_not_cancels(self):
+        c = self.lease()
+        self.venue.snapshot("4009.84", "4010.02")
+        self.assertTrue(wait_for(lambda: self.up.private_ok("main")))
+        o = c.place("buy", 1, 4009.0, post_only=True)
+        with mock.patch.object(GW, "RATE_LIMIT_PAUSE_S", 0.5):
+            self.venue.reject_next = "Rate limit exceeded"
+            with self.assertRaises(ccxt.ExchangeError) as cm:
+                c.place("buy", 1, 4008.0, post_only=True)
+            self.assertIn("Rate limit", str(cm.exception))
+            sent = self._orders_sent()
+            with self.assertRaises(ccxt.ExchangeError) as cm:   # paused: never sent
+                c.place("buy", 1, 4007.0, post_only=True)
+            self.assertIn("paused", str(cm.exception))
+            self.assertEqual(self._orders_sent(), sent)
+            c.cancel(o["id"])                                  # a cancel always goes
+            self.assertEqual((self.gw.counters["rate_limited"],
+                              self.gw.counters["held_rate_limit"]), (1, 1))
+            self.assertGreater(self.gw.status()["rate_limit_pause_s"], 0)
+            time.sleep(0.6)
+            c.place("buy", 1, 4007.0, post_only=True)          # the pause is over
+        self.assertEqual(self._orders_sent(), sent + 1)
+
     def test_the_account_snapshot_is_in_usd(self):
         snap = self.gw.account_snapshot()
         acc = snap["accounts"][0]
@@ -489,6 +667,19 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg.status()["rest_auth"], "basic")
         self.assertEqual(cfg.senders(ACCOUNT)["trade"], ("ABC1234_TRADE_UAT", "EXANTE_TRADE_UAT"))
 
+    def test_the_issued_comp_ids_replace_the_documented_ones(self):
+        # EXANTE may issue other CompIDs than it documents (the demo TRADE
+        # sender came suffixed): each side of each session can be set
+        d = CFG.scaffold("exante_demo", "demo")
+        p = d / CFG.CONFIG_NAME
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        raw.update(trade_sender=" ABC1234_TRADE_UAT_1a2b3c4d ", trade_target="EXANTE_TRADE_X",
+                   feed_target="EXANTE_FEED_X")
+        p.write_text(json.dumps(raw), encoding="utf-8")
+        ids = CFG.load("exante_demo").senders(ACCOUNT)
+        self.assertEqual(ids["trade"], ("ABC1234_TRADE_UAT_1a2b3c4d", "EXANTE_TRADE_X"))
+        self.assertEqual(ids["feed"], ("ABC1234_FEED_UAT", "EXANTE_FEED_X"))   # sender: default
+
     def test_live_needs_its_bridge_and_never_the_demo_one(self):
         CFG.scaffold("exante_live", "live")
         cfg = CFG.load("exante_live")
@@ -509,10 +700,15 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(CFG.ConfigError):
             CFG.load(str(other))
 
-    def test_the_order_budget_stays_under_exante_s_limit(self):
+    def test_the_order_budget_may_test_above_exante_s_limit_up_to_a_ceiling(self):
         d = CFG.scaffold("exante_demo", "demo")
         raw = json.loads((d / CFG.CONFIG_NAME).read_text(encoding="utf-8"))
-        raw["msgs_per_min"] = 300
+        raw["msgs_per_min"] = 1200                         # 20 / s: a test, allowed
+        (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
+        cfg = CFG.load("exante_demo")
+        self.assertEqual(cfg.msgs_per_min, 1200)
+        self.assertTrue(cfg.status()["over_exante_limit"])
+        raw["msgs_per_min"] = CFG.MAX_MSGS_PER_MIN + 1
         (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
         with self.assertRaises(CFG.ConfigError):
             CFG.load("exante_demo")
@@ -562,11 +758,27 @@ GC_SPEC = {"contractMultiplier": "100.0", "lotSize": "1.0", "priceUnit": "1.0",
 
 
 class CmeRest(FakeRest):
+    def __init__(self):
+        super().__init__()
+        self.groups_asked = []
+
     def symbol(self, sid):
         return dict(GC_SYMBOL) if sid == GC_ID else super().symbol(sid)
 
     def specification(self, sid):
         return dict(GC_SPEC) if sid == GC_ID else super().specification(sid)
+
+    def group(self, group):
+        # /md/3.0/groups/GC.COMEX as EXANTE serves it: every contract month
+        self.groups_asked.append(group)
+        if group != "GC.COMEX":
+            raise ccxt.BadRequest(f"exante REST /md/3.0/groups/{group}: 404 not found ()")
+        # the calendar spread FIRST, as EXANTE's live group can list it: same
+        # ticker and expiry as the outright, so the same market symbol
+        return [dict(GC_SYMBOL, symbolId="GC.COMEX.CS/Z2026-G2027", symbolType="CALENDAR_SPREAD"),
+                dict(GC_SYMBOL, symbolId="GC.COMEX.G2027", expiration="2027-02-24T00:00:00Z"),
+                dict(GC_SYMBOL),
+                dict(GC_SYMBOL, symbolId="GC.COMEX.Z2026.C4000", symbolType="OPTION")]
 
 
 class FakeQuotes:
@@ -575,9 +787,16 @@ class FakeQuotes:
     def __init__(self):
         self.subscribed, self.healthy, self.started = [], True, False
         self.handler = None
+        self.rows, self.ohlcv_calls, self.ohlcv_error = [], [], None
 
     def set_handler(self, fn):
         self.handler = fn
+
+    def ohlcv(self, db, timeframe, since=None, limit=None):
+        self.ohlcv_calls.append((db, timeframe, since, limit))
+        if self.ohlcv_error:
+            raise self.ohlcv_error
+        return list(self.rows)
 
     def start(self):
         self.started = True
@@ -608,6 +827,208 @@ def cme_upstream(venue, symbols, quotes, feed_password="f"):
                             trade={"sender": "ABC1234_TRADE_UAT",
                                    "target": "EXANTE_TRADE_UAT", "password": "t"},
                             session_factory=venue.factory, quotes=quotes)
+
+
+class PrivateCaTest(unittest.TestCase):
+    """EXANTE signs its live FIX bridges with its own CA (CN=ca, O=EXANTE),
+    which no public store holds (2026-11-02: "terminated in a root
+    certificate which is not trusted"). ``fix_ca_file`` trusts it for this
+    gateway's connection only — never by turning verification off."""
+
+    @classmethod
+    def setUpClass(cls):
+        import datetime as _dt
+        import socket
+        import ssl
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+        cls._td = tempfile.TemporaryDirectory()
+        d = Path(cls._td.name)
+        now = _dt.datetime.now(_dt.timezone.utc)
+        ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ca"),
+                             x509.NameAttribute(NameOID.ORGANIZATION_NAME, "TEST-EXANTE")])
+        ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+              .public_key(ca_key.public_key()).serial_number(1)
+              .not_valid_before(now - _dt.timedelta(days=1))
+              .not_valid_after(now + _dt.timedelta(days=30))
+              .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+              .sign(ca_key, hashes.SHA256()))
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        srv = (x509.CertificateBuilder()
+               .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+               .issuer_name(ca_name).public_key(key.public_key()).serial_number(2)
+               .not_valid_before(now - _dt.timedelta(days=1))
+               .not_valid_after(now + _dt.timedelta(days=30))
+               .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]),
+                              critical=False)
+               .sign(ca_key, hashes.SHA256()))
+        cls.ca_pem = d / "exante_ca.pem"
+        cls.ca_pem.write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+        chain = d / "server.pem"
+        chain.write_bytes(srv.public_bytes(serialization.Encoding.PEM) + key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption()))
+        try:   # the venv's pip-system-certs swaps ssl.SSLContext for truststore's
+            from pip._vendor.truststore._api import _original_SSLContext as server_cls
+        except Exception:                               # noqa: BLE001
+            server_cls = ssl.SSLContext
+        sctx = server_cls(ssl.PROTOCOL_TLS_SERVER)
+        sctx.load_cert_chain(str(chain))
+        cls._ls = socket.socket()
+        cls._ls.bind(("127.0.0.1", 0))
+        cls._ls.listen(8)
+        cls.port = cls._ls.getsockname()[1]
+
+        def serve():
+            while True:
+                try:
+                    c, _ = cls._ls.accept()
+                except OSError:
+                    return
+                try:
+                    sctx.wrap_socket(c, server_side=True).close()
+                except Exception:                       # noqa: BLE001 — a refused client
+                    c.close()
+        threading.Thread(target=serve, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._ls.close()
+        cls._td.cleanup()
+
+    def test_a_private_ca_bridge_is_refused_with_what_to_do(self):
+        import ssl
+        with self.assertRaises(ssl.SSLCertVerificationError) as cm:
+            S.tls_connect("localhost", self.port, 5.0)
+        self.assertIn("fix_ca_file", str(cm.exception))
+
+    def test_its_ca_file_lets_it_through(self):
+        s = S.tls_connect("localhost", self.port, 5.0, cafile=str(self.ca_pem))
+        s.close()
+
+    def test_the_hostname_is_still_checked(self):
+        import ssl
+        with self.assertRaises(ssl.SSLCertVerificationError):   # the cert names localhost
+            S.tls_connect("127.0.0.1", self.port, 5.0, cafile=str(self.ca_pem))
+
+    def test_the_setting_reaches_both_fix_sessions(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = Path(td.name)
+        (d / CFG.CONFIG_NAME).write_text(json.dumps({
+            "name": "ex", "venue": "exante", "network": "live",
+            "fix_host": "fixprodny.exante.eu", "fix_ca_file": "exante_ca.pem"}),
+            encoding="utf-8")
+        (d / CFG.ENV_NAME).write_text("exante_application_id = A\nexante_access_key = K\n"
+                                      "exante_fix_trade_password = T\n", encoding="utf-8")
+        cfg = CFG.load(str(d))
+        self.assertIn("fix_ca_file exante_ca.pem", " ".join(cfg.missing))   # not there yet
+        (d / "exante_ca.pem").write_bytes(self.ca_pem.read_bytes())
+        cfg = CFG.load(str(d))
+        self.assertEqual(Path(cfg.fix_ca_file), d / "exante_ca.pem")
+        self.assertNotIn("fix_ca_file", " ".join(cfg.missing))
+        self.assertEqual(cfg.status()["fix_ca_file"], "exante_ca.pem")
+        venue = FakeVenue()
+        up = U.ExanteUpstream(network="live", account_id=ACCOUNT, symbols=[XAU_ID],
+                              rest=FakeRest(), fix_host="fixprodny.exante.eu",
+                              feed={"sender": "A_FEED", "target": "EXANTE_FEED", "password": "f"},
+                              trade={"sender": "A_TRADE", "target": "EXANTE_TRADE",
+                                     "password": "t"},
+                              session_factory=venue.factory, ca_file=cfg.fix_ca_file)
+        up.start()
+        self.addCleanup(up.stop)
+        for role in ("trade", "feed"):
+            self.assertEqual(venue.sessions[role].kw.get("ca_file"), cfg.fix_ca_file, role)
+        sess = S.ExanteSession("fixprodny.exante.eu", 27001, sender="A", target="B",
+                               password="p", role="trade", network="live",
+                               ca_file=cfg.fix_ca_file)
+        self.assertEqual(sess._connect.keywords, {"cafile": cfg.fix_ca_file})
+
+
+class OnDemandInstrumentTest(unittest.TestCase):
+    """A gateway needs no instrument list: each bot's instrument is loaded
+    when it attaches (a future resolves by ticker + expiry), and a restart
+    lists what the bots loaded before."""
+
+    def setUp(self):
+        self.venue, self.quotes = FakeVenue(), FakeQuotes()
+        self.up = cme_upstream(self.venue, [], self.quotes)
+        self.told = []
+        self.up.on_markets = lambda: self.told.append(sorted(self.up._markets))
+        self.up.start()
+        self.addCleanup(self.up.stop)
+
+    def test_a_gateway_starts_with_no_instrument(self):
+        self.assertEqual(self.up._markets, {})
+        self.assertTrue(self.quotes.started)              # ready for a CME future later
+        self.assertIsNone(self.up.feed)                   # nothing needs the FEED yet
+
+    def test_a_bots_future_is_loaded_when_it_asks(self):
+        self.assertTrue(self.up.ensure_symbol(GC))
+        self.assertEqual(self.up._exante_id(GC), GC_ID)    # not G2027, not the spread
+        self.assertEqual(self.quotes.subscribed, ["GCZ6"])  # its Databento stream, at once
+        self.assertEqual(self.up.quote_source_of(GC), "databento")
+        self.assertEqual(self.told, [[GC]])               # markets.json rewritten
+        self.assertEqual(self.up.rest.groups_asked, ["GC.COMEX"])
+        self.assertFalse(self.up.ensure_symbol(GC))        # already listed: nothing asked
+        self.assertEqual(self.up.rest.groups_asked, ["GC.COMEX"])
+        self.assertIn(GC_ID, self.up.symbols)
+
+    def test_what_cannot_be_resolved_is_refused_with_what_to_do(self):
+        with self.assertRaises(ccxt.BadSymbol) as cm:
+            self.up.ensure_symbol("GC/USD:USD-270331")     # no such expiry
+        self.assertIn("no EXANTE future GC expiring 2027-03-31", str(cm.exception))
+        with self.assertRaises(ccxt.BadSymbol) as cm:
+            self.up.ensure_symbol(XAU)                     # spot FX: names no venue id
+        self.assertIn("add its EXANTE id", str(cm.exception))
+        self.assertEqual(self.up._markets, {})
+
+    def test_a_bot_attaching_with_an_unlisted_future_is_served(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        gw = ExanteGateway(self.up, port=0, token=TOKEN,
+                           slots=CL.SlotRegistry(Path(td.name) / "slots.json"))
+        gw.start()
+        self.addCleanup(gw.stop)
+        c = Lease("gc_grid", GC, "main", port=gw.port, token=TOKEN, dms_s=60.0,
+                  request_timeout_s=8.0, network="demo")
+        self.addCleanup(c.stop)
+        self.assertTrue(c.start(wait_s=3.0), c.reason)
+        self.assertIn(GC, self.up._markets)
+        bad = Lease("xau_grid", XAU, "main", port=gw.port, token=TOKEN, dms_s=60.0,
+                    request_timeout_s=3.0, network="demo")
+        self.addCleanup(bad.stop)
+        self.assertFalse(bad.start(wait_s=2.0))            # refused, with why
+        self.assertIn("add its EXANTE id", bad.reason)
+
+    def test_a_restart_lists_what_the_bots_loaded(self):
+        from atjte.gateways.exante import daemon as D
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        folder = Path(td.name)
+        self.up.ensure_symbol(GC)
+        D.write_markets(folder, "demo", self.up)
+        now = time.time()
+        self.assertEqual(D.remembered_symbols(folder, "demo", now=now), [GC_ID])
+        self.assertEqual(D.remembered_symbols(folder, "live", now=now), [])   # other network
+        later = 1_830_000_000.0                                              # 2027-12: expired
+        self.assertEqual(D.remembered_symbols(folder, "demo", now=later), [])
+
+    def test_a_gateway_with_no_instrument_is_complete(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        d = Path(td.name)
+        (d / CFG.CONFIG_NAME).write_text(json.dumps({"name": "ex", "venue": "exante",
+                                                     "network": "demo", "symbols": []}),
+                                         encoding="utf-8")
+        (d / CFG.ENV_NAME).write_text("exante_application_id = A\nexante_access_key = K\n"
+                                      "exante_fix_trade_password = T\n"
+                                      "exante_fix_feed_password = F\n", encoding="utf-8")
+        cfg = CFG.load(str(d))
+        self.assertTrue(cfg.complete, cfg.missing)
 
 
 class DatabentoSymbolTest(unittest.TestCase):
@@ -658,6 +1079,22 @@ class DatabentoPricedTest(unittest.TestCase):
         self.assertTrue(up.public_ok_for(GC))
         self.quotes.healthy = False                             # Databento silent / down
         self.assertFalse(up.public_ok_for(GC))
+
+    def test_a_cme_future_s_candles_come_from_databento_else_from_exante(self):
+        # was: EXANTE's OHLC alone, served once a minute — the bot's chart
+        # history came back 429 and the exchange leg started empty
+        up = self.start([XAU_ID, GC_ID])
+        self.quotes.rows = [[1_800_000_060_000, 3973.6, 3973.8, 3973.5, 3973.7, 0.0]]
+        args = {"symbol": GC, "timeframe": "1m", "since": 1_800_000_000_000, "limit": 720}
+        self.assertEqual(up.read("main", "fetch_ohlcv", args), self.quotes.rows)
+        self.assertEqual(self.quotes.ohlcv_calls[-1], ("GCZ6", "1m", 1_800_000_000_000, 720))
+        rest = up.read("main", "fetch_ohlcv", {**args, "symbol": XAU})    # FX: EXANTE's
+        self.assertEqual(len(self.quotes.ohlcv_calls), 1)
+        self.quotes.rows = []                                   # Databento has none
+        self.assertEqual(len(up.read("main", "fetch_ohlcv", args)), len(rest) or 0)
+        self.quotes.ohlcv_error = ccxt.RequestTimeout("slow")   # or fails: EXANTE's too
+        up.read("main", "fetch_ohlcv", args)
+        self.assertEqual(len(self.quotes.ohlcv_calls), 3)
 
     def test_cme_futures_alone_need_no_feed_login(self):
         up = self.start([GC_ID], feed_password="")
@@ -735,6 +1172,9 @@ class ConnectorTest(unittest.TestCase):
         self.assertEqual(ExanteGatewayClient.NETWORKS, ("live", "demo"))
         self.assertTrue(ExanteGatewayClient.supports_amend)
         self.assertTrue(ExanteGatewayClient.fees_follow_fills)
+        # EXANTE's own margin rate judges an entry, never LEVERAGE (1 = the
+        # whole notional blocked every MGC entry live, 2026-11-02)
+        self.assertTrue(ExanteGatewayClient.broker_margin)
         x = ExanteExchange({})
         x.set_markets([U.market_from_rest(SYMBOL, SPEC)])
         self.assertEqual(x.price_to_precision(XAU, 4010.123), "4010.12")

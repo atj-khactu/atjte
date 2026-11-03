@@ -28,6 +28,7 @@ fund — shortable, no expiry: a perpetual's shape, without funding) and
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -41,8 +42,26 @@ from atjte.gateways.hyperliquid import cloid as CL
 
 from ..common import BOOK_LEVELS, book_payload, jsonable
 
-#: how long a place / amend / cancel waits for EXANTE's answer
+#: how long a place / amend waits for EXANTE's answer
 ACK_WAIT_S = 5.0
+#: OrdStatus (39) of an order EXANTE has not accepted yet: PendingNew,
+#: Suspended, PendingReplace. A cancel or replace that lands then is held by
+#: EXANTE until the order is New, and sometimes dropped (demo, 2026-11-02)
+PENDING_STATUSES = ("A", "9", "E")
+#: how long a cancel / amend waits for a pending order to become New first
+#: (then it is sent anyway)
+PENDING_WAIT_S = 2.0
+#: after EXANTE rejects a NEW order (not for its rate limit — the gateway
+#: has its own pause for that), the symbol's new orders are refused for this
+#: long, worded "paused until", which the bot logs once instead of placing
+#: again on every pass (live, 2026-11-02: 69 orders in 43 s, every one
+#: rejected "Not allowed to trade")
+REJECT_PAUSE_S = 60.0
+#: a cancel is sent up to this many times (a fresh ClOrdID each) before the
+#: gateway says it is unconfirmed; each waits CANCEL_WAIT_S. The total stays
+#: under the bot's 10 s request timeout
+CANCEL_TRIES = 2
+CANCEL_WAIT_S = 3.0
 #: a FEED snapshot older than this is a stale symbol (the gateway's post-only
 #: check has its own, stricter age)
 TICKER_STALE_S = 60.0
@@ -56,6 +75,10 @@ MISSED_FILLS_GRACE_S = 5.0
 FUTURE_TYPES = ("FUTURE", "CALENDAR_SPREAD")
 #: types the gateway lists as tradable quote legs
 TRADABLE_TYPES = ("FX_SPOT", "CFD", "STOCK", "FUND", "FUTURE", "BOND", "CURRENCY")
+#: where a future a bot asks for is looked up (product group ``TICKER.EXCHANGE``),
+#: in this order: CME Group first (Databento prices those), then the rest
+RESOLVE_EXCHANGES = ("COMEX", "NYMEX", "CBOT", "CME", "ICE", "ICEUS", "EUREX", "SGX", "OSE")
+_FUTURE_SYMBOL = re.compile(r"^([^/]+)/([^:]+):([^-]+)-(\d{6})$")
 
 
 def _f(v) -> Optional[float]:
@@ -119,7 +142,7 @@ class _Order:
     """What the gateway knows of one order of ours (or adopted)."""
 
     __slots__ = ("order_id", "cl_ord_id", "cloid", "symbol", "exante_id", "side", "qty",
-                 "price", "cum", "avg", "status", "ts", "account", "tif")
+                 "price", "cum", "avg", "status", "ts", "account", "tif", "pending")
 
     def __init__(self, **kw) -> None:
         for k in self.__slots__:
@@ -148,9 +171,12 @@ class ExanteUpstream:
                  session_factory: Optional[Callable] = None, depth: int = BOOK_LEVELS,
                  tif: str = X.TIF_DAY, heartbeat_s: int = 30,
                  quotes: Any = None, quote_symbols: Optional[dict] = None,
+                 ca_file: str = "",
                  clock: Callable[[], float] = time.time,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.network = network
+        #: EXANTE's own CA (PEM) the live FIX bridges' certificates chain to
+        self.ca_file = str(ca_file or "")
         self.account_id = account_id
         self.symbols = list(symbols)
         self.rest = rest
@@ -185,6 +211,7 @@ class ExanteUpstream:
         self._orders: dict[str, _Order] = {}         # EXANTE OrderID -> order
         self._by_cl: dict[str, str] = {}             # every ClOrdID we sent -> OrderID
         self._answers: dict[str, dict] = {}          # ClOrdID -> the report that answered it
+        self._reject_pause: dict[str, tuple[float, str]] = {}   # symbol -> (until, why)
         self._mass_done = threading.Event()
         self._pushed: dict[str, dict] = {}           # fill id -> the trade pushed
         self._fee_due: dict[str, float] = {}         # fill id -> pushed at (no fee yet)
@@ -193,6 +220,9 @@ class ExanteUpstream:
 
         self.feed = None
         self.trade = None
+        #: called after an instrument was added on demand (the daemon
+        #: rewrites markets.json, which the panel and the next start read)
+        self.on_markets: Optional[Callable[[], None]] = None
         self._stop = threading.Event()
         self._poller: Optional[threading.Thread] = None
         self.counters = {"tickers": 0, "snapshots": 0, "md_rejects": 0, "exec_reports": 0,
@@ -228,26 +258,46 @@ class ExanteUpstream:
             return f"{prefix}{int(self._clock())}-{self._req_n}"
 
     # ── lifecycle ────────────────────────────────────────────────────────────
+    def _load_one(self, sid: str) -> dict:
+        """One instrument + its specification, over REST, as a market."""
+        m = market_from_rest(self.rest.symbol(sid), self.rest.specification(sid))
+        if m["info"]["symbolType"] not in TRADABLE_TYPES:
+            self._log(f"exante: {sid} is a {m['info']['symbolType']} — listed, but the "
+                      f"engine quotes {', '.join(TRADABLE_TYPES)}")
+        return m
+
+    def _db_symbol_of(self, m: dict) -> Optional[str]:
+        """The Databento contract a market is priced from, or None (FEED)."""
+        if self.quotes is None:
+            return None
+        from . import quotes as Q
+        info = m["info"]
+        if not Q.is_cme_future(m["id"], str(info.get("exchange") or ""),
+                               str(info.get("symbolType") or "")):
+            return None
+        try:
+            return Q.databento_symbol(m["id"], self._quote_overrides)
+        except ValueError as e:
+            self._log(f"exante: {e} — priced from the FIX FEED")
+            return None
+
     def load_markets(self) -> None:
-        """Every configured instrument + its specification, over REST."""
+        """Every configured instrument + its specification, over REST. The
+        list may be empty: a bot's symbol is then loaded when it attaches
+        (:meth:`ensure_symbol`)."""
         listed: dict[str, dict] = {}
         for sid in self.symbols:
-            m = market_from_rest(self.rest.symbol(sid), self.rest.specification(sid))
-            if m["info"]["symbolType"] not in TRADABLE_TYPES:
-                self._log(f"exante: {sid} is a {m['info']['symbolType']} — listed, but the "
-                          f"engine quotes {', '.join(TRADABLE_TYPES)}")
+            try:
+                m = self._load_one(sid)
+            except ccxt.BadRequest as e:        # gone (an expired contract kept on file)
+                self._log(f"exante: {sid} skipped — {e}")
+                continue
             listed[m["symbol"]] = m
         db_of: dict[str, str] = {}
-        if self.quotes is not None:
-            from . import quotes as Q
-            for s, m in listed.items():
-                info = m["info"]
-                if Q.is_cme_future(m["id"], str(info.get("exchange") or ""),
-                                   str(info.get("symbolType") or "")):
-                    try:
-                        db_of[s] = Q.databento_symbol(m["id"], self._quote_overrides)
-                    except ValueError as e:
-                        self._log(f"exante: {e} — priced from the FIX FEED")
+        for s, m in listed.items():
+            d = self._db_symbol_of(m)
+            if d is not None:
+                db_of[s] = d
         with self._lock:
             self._markets = listed
             self._sym_of = {m["id"]: s for s, m in listed.items()}
@@ -265,21 +315,38 @@ class ExanteUpstream:
         or not a CME Group future)."""
         return any(s not in self._db_of for s in self._markets)
 
+    def _common(self) -> dict:
+        out = {"host": self.fix_host, "network": self.network,
+               "heartbeat_s": self.heartbeat_s, "log": self._log, "clock": self._clock}
+        if self.ca_file:
+            out["ca_file"] = self.ca_file
+        return out
+
+    def _make_feed(self) -> bool:
+        """The FIX FEED session, once an instrument needs it (not priced from
+        Databento). True when it exists after the call; not started here."""
+        if self.feed is not None:
+            return True
+        if not self._feed_cfg.get("password"):
+            self._log("exante: no FIX FEED password — the instruments not priced from "
+                      "Databento have no quotes")
+            return False
+        mk = self._factory or _default_factory
+        self.feed = mk("feed", sender=self._feed_cfg["sender"],
+                       target=self._feed_cfg["target"],
+                       password=self._feed_cfg["password"],
+                       port=int(self._feed_cfg.get("port") or X.PORTS[self.network]["feed"]),
+                       on_message=self._on_feed, on_event=self._on_feed_event, **self._common())
+        return True
+
     def start(self) -> None:
         self.load_markets()
         mk = self._factory or _default_factory
-        common = {"host": self.fix_host, "network": self.network,
-                  "heartbeat_s": self.heartbeat_s, "log": self._log, "clock": self._clock}
-        if self.feed_needed and self._feed_cfg.get("password"):
-            self.feed = mk("feed", sender=self._feed_cfg["sender"],
-                           target=self._feed_cfg["target"],
-                           password=self._feed_cfg["password"],
-                           port=int(self._feed_cfg.get("port") or X.PORTS[self.network]["feed"]),
-                           on_message=self._on_feed, on_event=self._on_feed_event, **common)
-        elif self.feed_needed:
-            self._log("exante: no FIX FEED password — the instruments not priced from "
-                      "Databento have no quotes")
-        if self.quotes is not None and self._db_of:
+        if self.feed_needed:
+            self._make_feed()
+        if self.quotes is not None:
+            # started even with nothing to price yet: a bot's CME future added
+            # on demand (ensure_symbol) subscribes on a lease already up
             self.quotes.set_handler(self._on_db_ticker)
             self.quotes.start()
             # every contract streams from the start (not only once a bot
@@ -292,7 +359,8 @@ class ExanteUpstream:
                         password=self._trade_cfg["password"],
                         port=int(self._trade_cfg.get("port") or X.PORTS[self.network]["trade"]),
                         cancel_on_disconnect=True,
-                        on_message=self._on_trade, on_event=self._on_trade_event, **common)
+                        on_message=self._on_trade, on_event=self._on_trade_event,
+                        **self._common())
         if self.feed is not None:
             self.feed.start()
         self.trade.start()
@@ -358,6 +426,88 @@ class ExanteUpstream:
         if m is None:
             raise ccxt.BadSymbol(f"{symbol} is not among this gateway's symbols")
         return m["id"]
+
+    def ensure_symbol(self, symbol: str) -> bool:
+        """Make ``symbol`` (a bot's market, ``MGC/USD:USD-261130``) one of this
+        gateway's instruments, loading it now if it is not: the gateway needs
+        no configured list — each bot's instrument is loaded when it attaches.
+        Its quotes start at once (Databento for a CME Group future, else the
+        FIX FEED) and :attr:`on_markets` is told, so ``markets.json`` (the
+        panel, the next start) carries it. True = added now, False = already
+        listed. Raises ``ccxt.BadSymbol`` with what to do when it cannot be
+        resolved."""
+        with self._lock:
+            if symbol in self._markets:
+                return False
+        sid = self._resolve_exante_id(symbol)
+        m = self._load_one(sid)
+        if m["symbol"] != symbol:
+            raise ccxt.BadSymbol(f"{sid} is the market {m['symbol']}, not {symbol}")
+        db = self._db_symbol_of(m)
+        with self._lock:
+            if symbol in self._markets:         # another bot won the race
+                return False
+            self._markets[symbol] = m
+            self._sym_of[m["id"]] = symbol
+            if db is not None:
+                self._db_of[symbol] = db
+                self._syms_of_db.setdefault(db, []).append(symbol)
+            if sid not in self.symbols:
+                self.symbols.append(sid)
+        self._log(f"exante: {sid} loaded for {symbol} (asked by a bot) — priced from "
+                  + (f"Databento as {db}" if db is not None else "the FIX FEED"))
+        if db is not None:
+            self.quotes.subscribe(db)
+        elif self.feed is None and self._make_feed():
+            self.feed.start()                   # subscribes what is wanted once up
+        cb = self.on_markets
+        if cb is not None:
+            try:
+                cb()
+            except Exception as e:              # noqa: BLE001 — the file is a convenience
+                self._log(f"exante: markets.json not rewritten: {type(e).__name__}: {e}")
+        return True
+
+    def _resolve_exante_id(self, symbol: str) -> str:
+        """A bot's future (``MGC/USD:USD-261130``: ticker, currency, the
+        expiry's UTC date) as its EXANTE id, from the product group
+        ``TICKER.EXCHANGE`` — each listed exchange in turn, the contract whose
+        market (:func:`market_from_rest`) is exactly ``symbol``. An instrument
+        without an expiry (FX, CFD, stock) names no exchange or venue id in its
+        symbol: it must be listed in gateway.json."""
+        mt = _FUTURE_SYMBOL.match(symbol or "")
+        if mt is None:
+            raise ccxt.BadSymbol(
+                f"{symbol} is not among this gateway's instruments, and only a future "
+                f"(TICKER/CCY:CCY-YYMMDD) resolves by itself — add its EXANTE id "
+                f"(e.g. XAU/USD.E.FX) to the gateway's Instruments")
+        base = mt.group(1)
+        for ex in RESOLVE_EXCHANGES:
+            try:
+                rows = self.rest.group(f"{base}.{ex}")
+            except ccxt.BadRequest:
+                continue                        # no such product on that exchange
+            found = []
+            for r in rows:
+                # the OUTRIGHT future only: a group also lists calendar spreads
+                # (GC.COMEX.CS/Z2026-F2027) whose market has the same ticker and
+                # expiry — the demo resolved GC Dec-26 to the spread (2026-11-02)
+                if str(r.get("symbolType") or "") != "FUTURE":
+                    continue
+                try:
+                    if market_from_rest(r, {})["symbol"] == symbol:
+                        found.append(str(r["symbolId"]))
+                except Exception:               # noqa: BLE001 — a malformed row
+                    continue
+            if len(found) == 1:
+                return found[0]
+            if len(found) > 1:
+                raise ccxt.BadSymbol(f"{symbol} matches {', '.join(sorted(found))} — list the "
+                                     f"one to trade in the gateway's Instruments")
+        raise ccxt.BadSymbol(
+            f"{symbol}: no EXANTE future {base} expiring 20{mt.group(4)[:2]}-"
+            f"{mt.group(4)[2:4]}-{mt.group(4)[4:]} on {', '.join(RESOLVE_EXCHANGES)} — "
+            f"check the strategy's symbol, or add its EXANTE id to the gateway's Instruments")
 
     def markets(self, symbol: str = "") -> dict:
         out = {}
@@ -465,6 +615,41 @@ class ExanteUpstream:
         if self.trade is None or not self.trade.ready:
             raise ccxt.ExchangeNotAvailable("the EXANTE TRADE session is down")
 
+    def _wait_accepted(self, o: "_Order", wait_s: float = PENDING_WAIT_S,
+                       then: str = "sending anyway") -> None:
+        """Hold a cancel / replace while EXANTE has not accepted the order
+        yet (PendingNew / Suspended): one sent then is held until New, or
+        dropped. Bounded — after ``wait_s`` it goes anyway."""
+        end = self._clock() + wait_s
+        with self._cond:
+            while o.pending and o.status == "open":
+                left = end - self._clock()
+                if left <= 0:
+                    self._log(f"exante: {o.order_id} still pending after {wait_s:g}s — "
+                              f"{then}")
+                    return
+                self._cond.wait(min(left, 0.05))
+
+    def _paused(self, symbol: str) -> str:
+        """Why ``symbol``'s new orders are refused now, or ""."""
+        until, why = self._reject_pause.get(symbol, (0.0, ""))
+        if self._clock() >= until:
+            return ""
+        # the END, not a countdown: the bot logs a refusal again only when its
+        # text changes, so it logs this once per rejection
+        end = datetime.fromtimestamp(until, tz=timezone.utc).strftime("%H:%M:%S")
+        return (f"orders on {symbol} paused until {end} UTC: EXANTE rejected the last one "
+                f"({why})")
+
+    def _rejected(self, symbol: str, cloid: str, text: str) -> Exception:
+        """A new order EXANTE rejected: logged with its reason, the symbol
+        paused (:data:`REJECT_PAUSE_S`) unless it was the rate limit, and the
+        refusal to raise."""
+        self._log(f"exante: order {cloid} on {symbol} rejected: {text}")
+        if REJECT_PAUSE_S > 0 and not X.is_rate_limited(text):
+            self._reject_pause[symbol] = (self._clock() + REJECT_PAUSE_S, text)
+        return _refusal(text)
+
     def _wait_answer(self, cl: str, wait_s: float = ACK_WAIT_S) -> Optional[dict]:
         end = self._clock() + wait_s
         with self._cond:
@@ -485,6 +670,9 @@ class ExanteUpstream:
     def place(self, account, symbol, side, amount, price, *, post_only, reduce_only,
               cloid) -> dict:
         self._require_trade()
+        paused = self._paused(symbol)
+        if paused:
+            raise ccxt.InvalidOrder(paused)
         sid = self._exante_id(symbol)
         self._send(X.NEW_ORDER, X.new_order(cl_ord_id=cloid, exante_id=sid, side=side,
                                             qty=amount, price=price, account=self.account_id,
@@ -498,9 +686,18 @@ class ExanteUpstream:
             raise ccxt.RequestTimeout(f"EXANTE did not answer the order {cloid} within "
                                       f"{ACK_WAIT_S:g}s")
         if ans.get("rejected"):
-            self.counters["rejects"] += 1
-            raise _refusal(ans["text"])
+            raise self._rejected(symbol, cloid, ans["text"])
         o = self._orders.get(ans["order_id"])
+        if o is not None and o.pending:
+            # answered PendingNew: EXANTE's verdict (New or Rejected) is the
+            # next report — returned as "open" before it, a rejected order
+            # read as resting until its amend found it gone, and the bot
+            # placed again (live, 2026-11-02)
+            self._wait_accepted(o, then="answered as resting")
+            if o.status == "rejected":
+                with self._cond:
+                    late = self._answers.pop(cloid, None) or {}
+                raise self._rejected(symbol, cloid, late.get("text") or "rejected")
         d = o.as_ccxt() if o is not None else {"id": ans["order_id"], "status": "open"}
         d["clientOrderId"] = cloid
         d["postOnly"], d["reduceOnly"] = bool(post_only), bool(reduce_only)
@@ -513,6 +710,9 @@ class ExanteUpstream:
         self._require_trade()
         o = self._orders.get(str(order_id))
         if o is None or o.status != "open":
+            raise ccxt.OrderNotFound(f"order {order_id} is not resting")
+        self._wait_accepted(o)
+        if o.status != "open":
             raise ccxt.OrderNotFound(f"order {order_id} is not resting")
         slot = CL.slot_of(o.cloid) or 0
         new_cl = self._ids.next(slot)
@@ -539,19 +739,46 @@ class ExanteUpstream:
             o = self._orders.get(str(oid))
             if o is None or o.status != "open":
                 raise ccxt.OrderNotFound(f"order {oid} is not resting")
+            self._cancel_one(o)
+            out.append({"id": o.order_id, "status": "canceled", "clientOrderId": o.cloid})
+        return out
+
+    def _cancel_one(self, o: "_Order") -> None:
+        """Cancel one order and return only once EXANTE confirmed it gone.
+        A cancel EXANTE does not answer is sent again (a fresh ClOrdID); one
+        still unconfirmed RAISES — never "canceled": the order stays tracked
+        and owned, so the bot retries and the reaper still covers it."""
+        self._wait_accepted(o)
+        for attempt in range(1, CANCEL_TRIES + 1):
+            if o.status == "canceled":
+                return                          # cancelled meanwhile
+            if o.status != "open":              # filled / rejected meanwhile: not ours to call cancelled
+                raise ccxt.OrderNotFound(f"order {o.order_id} is not resting ({o.status})")
             cl = self._ids.next(CL.slot_of(o.cloid) or 0)
             with self._lock:
                 self._by_cl[cl] = o.order_id
             self._send(X.CANCEL, X.cancel_request(cl_ord_id=cl, orig_cl_ord_id=o.cl_ord_id,
                                                   exante_id=o.exante_id, side=o.side,
                                                   qty=o.qty or 0.0, now=self._clock()))
-            ans = self._wait_answer(cl)
-            if ans is not None and ans.get("rejected"):
+            ans = self._wait_answer(cl, CANCEL_WAIT_S)
+            if ans is None:
+                if o.status == "canceled":
+                    return                      # confirmed under an earlier ClOrdID
+                self._log(f"exante: no answer to the cancel of {o.order_id} within "
+                          f"{CANCEL_WAIT_S:g}s (try {attempt} of {CANCEL_TRIES})")
+                continue
+            if ans.get("rejected"):
+                if o.status == "canceled":
+                    return                      # an earlier try took; this one was too late
                 if ans.get("unknown") or o.status != "open":
-                    raise ccxt.OrderNotFound(f"order {oid}: {ans['text']}")
-                raise ccxt.ExchangeError(f"cancel of {oid} refused: {ans['text']}")
-            out.append({"id": o.order_id, "status": "canceled", "clientOrderId": o.cloid})
-        return out
+                    raise ccxt.OrderNotFound(f"order {o.order_id}: {ans['text']}")
+                raise ccxt.ExchangeError(f"cancel of {o.order_id} refused: {ans['text']}")
+            return
+        if o.status == "canceled":
+            return
+        raise ccxt.RequestTimeout(
+            f"EXANTE did not confirm the cancel of {o.order_id} after {CANCEL_TRIES} tries "
+            f"({CANCEL_WAIT_S:g}s each): it may still be resting — kept as open")
 
     def schedule_cancel(self, account: str, when_ms: Optional[int]) -> None:
         raise ccxt.NotSupported("EXANTE has no cancel-all timer; CancelOnDisconnect on the "
@@ -586,7 +813,15 @@ class ExanteUpstream:
                               "order_id": msg.get(37) or ""})
         elif t in (X.BUSINESS_REJECT, X.REJECT):
             self.counters["rejects"] += 1
-            self._log(f"exante: {t} {X.reject_text(msg)}")
+            text = X.reject_text(msg)
+            self._log(f"exante: {t} {text}")
+            # SPEC: a Business Message Reject names the refused request's
+            # ClOrdID in BusinessRejectRefID (379), FIX 4.4's own rule — the
+            # request waiting for it is answered at once (a rate-limit
+            # refusal included) instead of timing out
+            if t == X.BUSINESS_REJECT and msg.get(379):
+                self._answer(msg.get(379), {"rejected": True, "text": text,
+                                            "unknown": False, "order_id": ""})
 
     def _answer(self, cl: str, ans: dict) -> None:
         if not cl:
@@ -654,6 +889,8 @@ class ExanteUpstream:
             if r["cum"] is not None:
                 o.cum = max(float(o.cum or 0.0), r["cum"])
             o.status = X.STATUS.get(r["status"], o.status)
+            # "open" to the bots either way; a cancel / replace waits it out
+            o.pending = r["status"] in PENDING_STATUSES
             return o
 
     def _original_cloid(self, cl: str) -> Optional[str]:
@@ -671,7 +908,10 @@ class ExanteUpstream:
                  "timestamp": X.fix_time_ms(r["time"]) or int(self._clock() * 1000),
                  "fee": None, "takerOrMaker": "maker",
                  "info": {"execId": r["exec_id"], "cumQty": r["cum"], "source": "fix",
-                          "orderPos": r["order_pos"]}}
+                          "orderPos": r["order_pos"],
+                          # when this gateway had the execution report (this
+                          # machine's clock): the hedge timing's first local hop
+                          "gw_rx_ms": int(self._clock() * 1000)}}
         self._record_fill(trade)
 
     def _record_fill(self, trade: dict) -> None:
@@ -816,14 +1056,18 @@ class ExanteUpstream:
     def _positions(self, symbols: Optional[list]) -> list[dict]:
         out = []
         for p in self._summary("USD").get("positions") or []:
-            sym = self._sym_of.get(str(p.get("id") or ""))
+            # the instrument is "symbolId" (demo, 2026-11-02: no "id" at all);
+            # reading "id" alone dropped every position — the engine saw a
+            # flat venue and its parity check unwound a correct hedge
+            sid = str(p.get("symbolId") or p.get("id") or "")
+            sym = self._sym_of.get(sid)
             if sym is None or (symbols and sym not in symbols):
                 continue
             qty = _f(p.get("quantity")) or 0.0
             if not qty:
                 continue
             mult = float(self._markets[sym]["contractSize"] or 1.0)
-            out.append({"symbol": sym, "id": p.get("id"), "contracts": abs(qty),
+            out.append({"symbol": sym, "id": sid, "contracts": abs(qty),
                         "contractSize": mult, "side": "long" if qty > 0 else "short",
                         "entryPrice": _f(p.get("averagePrice")), "markPrice": _f(p.get("price")),
                         "unrealizedPnl": _f(p.get("pnl")), "liquidationPrice": None,
@@ -880,13 +1124,28 @@ class ExanteUpstream:
         return out[-int(limit):] if limit else out
 
     def _ohlcv(self, symbol: str, timeframe: str, since, limit) -> list[list]:
-        """EXANTE's quote candles (BID prices, newest first — read on demo
-        2026-10-27), oldest first as CCXT wants, volume 0."""
+        """Candles, oldest first as CCXT wants: a Databento-priced future's
+        from the Databento gateway (mid, the price it is quoted on), else —
+        or when Databento has none — EXANTE's own (:meth:`_rest_ohlcv`)."""
         secs = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400,
                 "1d": 86400}.get(timeframe or "1m")
         if secs is None:
             raise ccxt.BadRequest(f"exante: timeframe {timeframe!r} is not one of 1m, 5m, "
                                   f"15m, 1h, 4h, 1d")
+        db = self._db_of.get(symbol)
+        if db is not None and self.quotes is not None:
+            try:
+                rows = self.quotes.ohlcv(db, timeframe or "1m", since, limit)
+                if rows:
+                    return rows
+            except Exception as e:                          # noqa: BLE001
+                self._log(f"exante: {symbol} candles from Databento ({db}) failed "
+                          f"({type(e).__name__}: {e}) — EXANTE's own instead")
+        return self._rest_ohlcv(symbol, secs, since, limit)
+
+    def _rest_ohlcv(self, symbol: str, secs: int, since, limit) -> list[list]:
+        """EXANTE's quote candles (BID prices, newest first — read on demo
+        2026-10-27), volume 0. EXANTE serves them once a minute."""
         size = int(limit or 1000)
         to_ms = int(since) + size * secs * 1000 if since else None
         rows = self.rest.ohlc(self._exante_id(symbol), secs,

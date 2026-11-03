@@ -68,8 +68,27 @@ _PERIOD_S = {"M1": 60, "M2": 120, "M3": 180, "M4": 240, "M5": 300, "M10": 600,
 _SWAP_MODE = {MM.PIPS: 1, MM.PERCENTAGE: 5}
 _TERMINAL = {MM.ORDER_FILLED, MM.ORDER_REJECTED, MM.ORDER_CANCELLED, MM.ORDER_EXPIRED}
 _FILLED_DEALS = {MM.FILLED, MM.PARTIALLY_FILLED}
+#: MT5 ACCOUNT_MARGIN_MODE for cTrader's account type: RETAIL_HEDGING 2, else
+#: RETAIL_NETTING 0 (a spread-betting account nets: one position per symbol)
+_MARGIN_MODE = {MM.HEDGED: 2, MM.NETTED: 0, MM.SPREAD_BETTING: 0}
+#: cTrader refusals an unchanged resend cannot fix, as the MT5 retcode the
+#: engine's refusal hold reads (hedge_orders.PERMANENT_RETCODES)
+_PERMANENT_AS_RETCODE = {"TRADING_BAD_VOLUME": 10014, "TRADING_DISABLED": 10017,
+                         "TRADING_NOT_ALLOWED": 10017, "TOO_MANY_POSITIONS": 10040,
+                         "SHORT_SELLING_NOT_ALLOWED": 10042, "UNKNOWN_SYMBOL": 10013,
+                         "SYMBOL_NOT_FOUND": 10013}
 #: errors after which only a fresh access token helps
 TOKEN_ERRORS = {"CH_ACCESS_TOKEN_INVALID", "OA_AUTH_TOKEN_EXPIRED"}
+
+
+def _refusal_text(code: Any, description: Any = "") -> str:
+    """A refused hedge's error text. One an unchanged resend cannot fix
+    carries MT5's retcode, so the engine HOLDS it (MT5_REFUSED_HOLD_S)
+    instead of sending it again at every re-check."""
+    code = str(code or "").strip()
+    rc = _PERMANENT_AS_RETCODE.get(code)
+    return (f"cTrader refused the hedge: {code} {description or ''}".strip()
+            + (f" (retcode={rc})" if rc else ""))
 
 
 def _money(v: Any, digits: Any) -> float:
@@ -87,6 +106,27 @@ def _ms(dt: datetime) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
+
+
+def token_accounts(*, client_id: str, client_secret: str, access_token: str,
+                   network: str = "demo", timeout_s: float = 10.0,
+                   transport_factory: Optional[Callable[..., Any]] = None) -> list[dict]:
+    """The accounts an access token grants (the application authorized
+    first): ``[{"account_id", "live", "login"}]`` — the ctidTraderAccountId a
+    gateway is set up with is NOT the login number, and this is where it is
+    found. Read-only; nothing is renewed."""
+    host = T.host_for("live" if str(network).lower() == "live" else "demo")
+    factory = transport_factory or (lambda **kw: T.Transport(host, T.PORT, **kw))
+    t = factory(timeout_s=float(timeout_s))
+    t.connect()
+    try:
+        t.request(M.ProtoOAApplicationAuthReq(clientId=client_id, clientSecret=client_secret))
+        res = t.request(M.ProtoOAGetAccountListByAccessTokenReq(accessToken=access_token))
+        return [{"account_id": int(a.ctidTraderAccountId), "live": bool(a.isLive),
+                 "login": int(a.traderLogin) if a.HasField("traderLogin") else None}
+                for a in res.ctidTraderAccount]
+    finally:
+        t.close("account list")
 
 
 class CTraderBackend:
@@ -135,7 +175,7 @@ class CTraderBackend:
                 self.t.close("reconnecting")
             except Exception:
                 pass
-        self._authorized, self._auth_lost = False, ""
+        self._authorized = False
         self._spots.clear()
         self._subscribed.clear()
         self._first_tried.clear()
@@ -155,16 +195,36 @@ class CTraderBackend:
         self.is_connected = True
 
     def _account_auth(self) -> None:
+        """The account, with the access token — renewed with the refresh
+        token when it is refused as expired / invalid. What cannot be fixed
+        here is kept in ``_auth_lost`` with what the OPERATOR must do: it is
+        the session's reason, and the alert's ("gateway … is DISCONNECTED —
+        <reason>")."""
         try:
             self.t.request(M.ProtoOAAccountAuthReq(ctidTraderAccountId=self.account_id,
                                                    accessToken=self._access))
         except T.ApiError as e:
-            if e.code not in TOKEN_ERRORS or not self._refresh:
+            if e.code not in TOKEN_ERRORS:
+                self._auth_lost = (f"cTrader refused the account ({e.code})"
+                                   + (" — choose it again with Find accounts in the "
+                                      "gateway's Settings" if "ACCOUNT_NOT_FOUND" in e.code
+                                      else ""))
                 raise ConnectionError(f"account auth refused ({e.code})") from None
-            self.refresh_tokens()
+            if not self._refresh:
+                self._auth_lost = (f"the access token expired or was revoked ({e.code}) and "
+                                   f"there is no refresh token — issue a new token and enter "
+                                   f"it in the gateway's Settings")
+                raise ConnectionError(self._auth_lost) from None
+            try:
+                self.refresh_tokens()
+            except T.ApiError as r:
+                self._auth_lost = (f"the access token expired ({e.code}) and the refresh "
+                                   f"token was refused ({r.code}) — issue a new token pair "
+                                   f"and enter both in the gateway's Settings")
+                raise ConnectionError(self._auth_lost) from None
             self.t.request(M.ProtoOAAccountAuthReq(ctidTraderAccountId=self.account_id,
                                                    accessToken=self._access))
-        self._authorized = True
+        self._authorized, self._auth_lost = True, ""
 
     def refresh_tokens(self) -> None:
         """A new access token from the refresh token (the old pair is spent),
@@ -306,7 +366,11 @@ class CTraderBackend:
                        raw={"balance": f["balance"], "equity": f["equity"],
                             "profit": f["profit"], "margin": f["used"],
                             "currency": f["currency"],
-                            "account_type": MM.ProtoOAAccountType.Name(f["trader"].accountType)})
+                            "account_type": MM.ProtoOAAccountType.Name(f["trader"].accountType),
+                            # MT5's ACCOUNT_MARGIN_MODE: the gateway's netting
+                            # guard (one bot per symbol on a NETTED account) and
+                            # its close-first path (HEDGED) read it
+                            "margin_mode": _MARGIN_MODE.get(f["trader"].accountType, 0)})
 
     def get_margin(self) -> Margin:
         f = self._figures()
@@ -576,16 +640,30 @@ class CTraderBackend:
         return [rows[t] for t in sorted(rows)]
 
     def bar_open(self, symbol: str, timeframe: str = "H1") -> Optional[float]:
-        """The OPEN of the current ``timeframe`` bar, or None without one."""
+        """The OPEN of the current ``timeframe`` bar (MT5's ``bar_open``), or
+        None without one. The Open API serves CLOSED trendbars only — the
+        forming bar is never in the history — so the open is the first
+        closed SUB-bar's since the bar began (M1; H1 for a bar of 12 h or
+        more, M1 within its first hour), and in the bar's first minute the
+        live bid (trendbars are bids, as MT5's are)."""
         sec = _PERIOD_S.get(timeframe.upper())
         if sec is None:
             raise ValueError(f"unknown timeframe {timeframe!r}")
         now = self._clock()
         start = int(now // sec * sec)
-        rows = self.rates(symbol, datetime.fromtimestamp(start, tz=timezone.utc),
-                          datetime.fromtimestamp(now + 60, tz=timezone.utc), timeframe)
-        rows = [r for r in rows if r["time"] >= start]
-        return rows[0]["open"] if rows and rows[0]["open"] > 0 else None
+        frm = datetime.fromtimestamp(start, tz=timezone.utc)
+        to = datetime.fromtimestamp(now + 60, tz=timezone.utc)
+        for sub in (("H1", "M1") if sec >= _PERIOD_S["H12"] else ("M1",)):
+            if _PERIOD_S[sub] >= sec:
+                continue
+            rows = [r for r in self.rates(symbol, frm, to, sub) if r["time"] >= start]
+            if rows and rows[0]["open"] > 0:
+                return rows[0]["open"]
+        try:
+            bid = self.get_ticker(symbol).bid
+        except Exception:                                           # noqa: BLE001
+            return None
+        return float(bid) if bid else None
 
     # ── trading ──────────────────────────────────────────────────────────────
     def _volume(self, sid: int, lots: float) -> int:
@@ -617,9 +695,8 @@ class CTraderBackend:
             while True:
                 err = self._errors.pop(cid, None)
                 if err is not None:
-                    raise RuntimeError(f"cTrader refused the hedge: "
-                                       f"{getattr(err, 'errorCode', '')} "
-                                       f"{getattr(err, 'description', '')}".strip())
+                    raise RuntimeError(_refusal_text(getattr(err, "errorCode", ""),
+                                                     getattr(err, "description", "")))
                 done = None
                 for _t, e in self._exec:
                     if e.order.clientOrderId != coid:
@@ -637,10 +714,13 @@ class CTraderBackend:
                                        f"the position")
                 self._ev_lock.wait(min(left, 0.5))
         filled = sum(d.filledVolume for d in deals.values())
-        if done.executionType in (MM.ORDER_REJECTED, MM.ORDER_EXPIRED) and not filled:
-            raise RuntimeError(f"cTrader rejected the hedge "
-                               f"({MM.ProtoOAExecutionType.Name(done.executionType)} "
-                               f"{done.errorCode})".strip())
+        if not filled:
+            # nothing filled, whatever ended it (rejected, expired, CANCELLED):
+            # raise. A market order that RETURNS is booked as done by the
+            # engine (hedge_orders.send_split), so it must never return empty
+            raise RuntimeError(_refusal_text(
+                done.errorCode,
+                f"not filled ({MM.ProtoOAExecutionType.Name(done.executionType)})"))
         vwap = (sum(d.executionPrice * d.filledVolume for d in deals.values()) / filled
                 if filled else 0.0)
         return filled, vwap, list(deals.values())
@@ -654,6 +734,7 @@ class CTraderBackend:
         if order_type is not OrderType.MARKET:
             raise ValueError("the cTrader gateway sends market hedges only")
         magic = int(kwargs.get("magic") or 0)
+        position = kwargs.get("position")          # the gateway's close-first: THIS ticket
         label = str(magic) if magic else ""
         # "" = the caller's "no comment" (MT5_COMMENT None); not given = ours
         comment = str(kwargs.get("comment", "atjte hedge") or "")
@@ -665,7 +746,10 @@ class CTraderBackend:
                 self._trader()
             legs: list[tuple[int, Optional[int]]] = []
             left = want
-            if magic and self.trader.accountType == MM.HEDGED:
+            if position:
+                legs.append((want, int(position)))
+                left = 0
+            elif magic and self.trader.accountType == MM.HEDGED:
                 opposite = sorted(
                     (p for p in self._reconcile().position
                      if p.tradeData.symbolId == sid and _magic(p.tradeData.label) == magic
@@ -680,8 +764,18 @@ class CTraderBackend:
             if left > 0:
                 legs.append((left, None))
             filled, notional, all_deals = 0, 0.0, []
+            failed: Optional[BaseException] = None
             for vol, pid in legs:
-                f, px, deals = self._market(sid, side_pb, vol, label, comment, pid)
+                try:
+                    f, px, deals = self._market(sid, side_pb, vol, label, comment, pid)
+                except Exception as e:
+                    if not filled:
+                        raise
+                    # an earlier leg FILLED: report it (partial) rather than
+                    # lose it in the exception. The caller books what filled
+                    # and the reconciler sends the rest, never all of it again
+                    failed = e
+                    break
                 filled += f
                 notional += f * px
                 all_deals.extend(deals)
@@ -696,7 +790,9 @@ class CTraderBackend:
                      timestamp=datetime.now(timezone.utc),
                      raw={"price": vwap, "volume": lots, "magic": magic,
                           "legs": len(legs), "deals": [d.dealId for d in all_deals],
-                          "closed_positions": [pid for _v, pid in legs if pid]})
+                          "closed_positions": [pid for _v, pid in legs if pid],
+                          **({"error": f"{type(failed).__name__}: {failed}"}
+                             if failed else {})})
 
     def close_by(self, position_id: str, opposite_id: str) -> bool:
         """cTrader has no close-by. The hedges reduce first, so opposite pairs

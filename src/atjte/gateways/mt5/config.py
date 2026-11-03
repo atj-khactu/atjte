@@ -17,6 +17,11 @@ on two ports.
     {"name": "mt5_main", "venue": "mt5", "listen_port": 5620,
      "tick_poll_ms": 10, "clients": []}
 
+``icon_letter`` / ``icon_colour`` (optional, cosmetic): the letter and the
+``#rrggbb`` colour of the badge the control panel draws on this terminal's
+taskbar icon; empty = picked from the gateway's name. A malformed value is
+ignored, never an error — it must not stop a gateway that hedges.
+
 ``books``: ``"broker"`` (the default) serves the terminal's positions as
 they are — on a NETTING account one magic per symbol, a second is refused.
 ``"ledger"`` (a netting account only) keeps one book per (symbol, magic) in
@@ -62,8 +67,11 @@ QUOTES_REQUEST_NAME = "quotes.request"
 DEFAULT_LISTEN_PORT = 5620
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
-_KNOWN = {"name", "venue", "listen_port", "tick_poll_ms", "clients", "books", "_comment"}
+_KNOWN = {"name", "venue", "listen_port", "tick_poll_ms", "clients", "books",
+          "icon_letter", "icon_colour", "_comment"}
 _KNOWN |= _A.KEYS       # publish_accounts, accounts_every_s
+_ICON_LETTER_RE = re.compile(r"^[A-Za-z0-9]$")
+_ICON_COLOUR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
 class ConfigError(ValueError):
@@ -82,6 +90,9 @@ class GatewayConfig:
     #: account_state.json (:mod:`atjte.gateways.accounts`)
     publish_accounts: bool = True
     accounts_every_s: float = _A.EVERY_S
+    #: the taskbar badge (the control panel's): "" = from the name
+    icon_letter: str = ""
+    icon_colour: str = ""
     path: str = ""
     login: Optional[int] = None
     password: str = ""
@@ -135,6 +146,15 @@ def _resolve(name_or_path: str) -> Path:
     raise ConfigError(f"no MT5 gateway {name_or_path!r} (looked in {gateways_dir()})")
 
 
+def parse_icon(raw: dict) -> tuple[str, str]:
+    """``(letter, colour)`` of the taskbar badge, each "" unless well-formed:
+    one letter or digit (upper-cased), and ``#rrggbb`` (lower-cased)."""
+    letter = str(raw.get("icon_letter") or "").strip()
+    colour = str(raw.get("icon_colour") or "").strip()
+    return (letter.upper() if _ICON_LETTER_RE.match(letter) else "",
+            colour.lower() if _ICON_COLOUR_RE.match(colour) else "")
+
+
 def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
     d = _resolve(name_or_path)
     try:
@@ -154,6 +174,7 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
     if cfg.books not in BOOKS:
         raise ConfigError(f"{CONFIG_NAME}: books must be one of {', '.join(BOOKS)}")
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
+    cfg.icon_letter, cfg.icon_colour = parse_icon(raw)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
         env = {k.lower(): v for k, v in parse_env_text(envp.read_text(encoding="utf-8")).items()}

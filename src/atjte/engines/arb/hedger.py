@@ -52,11 +52,23 @@ so neither thread races the other's arithmetic:
   reconciler read while the hedger has been quiet (idle, empty queue, no
   fill for :data:`QUIET_S`). Never from a read that could already include
   a fill whose push has not landed -- that would count it twice;
-- :meth:`parity_sent` -- RELATIVE: the parity hedge sent this many signed
-  units on MT5, so the residue owes that much less. Relative because the
-  fills behind that drift may still be on their way here (the socket, or
-  the 30 s REST poll that also submits), and when they arrive they add
-  back exactly what was subtracted -- consistent whichever order.
+- :meth:`parity_sent` -- a CREDIT: the parity hedge sent this many signed
+  units on MT5 AHEAD of the fills behind the drift, which may still be on
+  their way here (the socket, or the 30 s REST poll that also submits).
+  The credit pays the residue only in the direction it was sent: what the
+  residue already owes that way at once (a refused event hedge the
+  reconciler re-sent), a late fill when it lands. A credit nothing claims
+  in :data:`CREDIT_TTL_S` is dropped -- the parity hedge was a correction
+  of THIS book, not an advance on fills.
+
+  It used to be subtracted from the residue outright, which is the same
+  whenever this book is right -- and a loop when it is not (2026-11-01,
+  HL + IC cTrader EURUSD, a 20-pip spread): an event hedge the broker
+  CANCELLED was booked as filled, the reconciler sold the 0.03 lot it
+  still owed, the subtraction swung the residue from +773.9 to +3773.9
+  units, and the next 22-unit fill bought the 0.03 lot straight back;
+  15 s later the reconciler sold it again. A credit the residue does not
+  owe is never sent back.
 """
 from __future__ import annotations
 
@@ -75,6 +87,41 @@ from ..common.hedge_orders import HedgeTooLarge, send_split
 #: REBASE its residue (a fill's push and the REST position read can cross
 #: by a few hundred ms; two seconds is far outside that)
 QUIET_S = 2.0
+
+#: how long a parity hedge's credit waits for the fills it went out ahead
+#: of: the reconciler hedges a drift that persisted its 15 s re-check, and
+#: the REST poll (30 s) delivers a fill the socket missed well inside this
+CREDIT_TTL_S = 60.0
+
+
+def timing_line(tr: Trade, rx_t: Optional[float], sent_t: float, done_t: float,
+                order=None) -> str:
+    """One hedge's path, hop by hop, in ms: the venue's fill time (ITS
+    clock), the venue gateway's receipt (``tr.raw["gw_rx_ms"]``), this
+    hedger's (``rx_t``), the MT5 order leaving (``sent_t``), the MT5
+    gateway's receipt and the terminal's answer (``order.raw["gw_ms"]``) and
+    the answer back here (``done_t``). Every hop after the first is on this
+    machine's one clock; the first crosses to the venue's, so it carries the
+    two clocks' offset too. A hop whose stamps are missing reads "?"."""
+    def ms(v) -> Optional[float]:
+        return None if v is None else float(v)
+
+    def gap(a: Optional[float], b: Optional[float]) -> str:
+        return "?" if a is None or b is None else f"{b - a:.0f}"
+    venue = ms(tr.timestamp.timestamp() * 1000) if tr.timestamp is not None else None
+    gw_rx = ms((tr.raw or {}).get("gw_rx_ms")) if isinstance(tr.raw, dict) else None
+    rx = ms(rx_t * 1000) if rx_t is not None else None
+    sent, done = sent_t * 1000, done_t * 1000
+    g = ((getattr(order, "raw", None) or {}).get("gw_ms") or {}) \
+        if isinstance(getattr(order, "raw", None), dict) else {}
+    mt5_in, mt5_out = ms(g.get("in")), ms(g.get("out"))
+    when = (tr.timestamp.strftime("%H:%M:%S.%f")[:-3] if tr.timestamp is not None else "?")
+    total = gap(gw_rx if gw_rx is not None else rx, done)
+    return (f"HEDGE TIMING {str(tr.trade_id or '')[:8]}: venue fill {when} -> venue gateway "
+            f"+{gap(venue, gw_rx)} ms (incl. clock offset) -> bot +{gap(gw_rx, rx)} -> MT5 "
+            f"order out +{gap(rx, sent)} -> MT5 gateway +{gap(sent, mt5_in)} -> terminal + "
+            f"broker {gap(mt5_in, mt5_out)} -> back +{gap(mt5_out, done)} | fill received -> "
+            f"hedge confirmed {total} ms")
 
 
 @dataclass(frozen=True)
@@ -120,6 +167,8 @@ class EventHedger:
         self._log = log or (lambda _m: None)
         self._clock = clock
         self._q: "queue.Queue[Trade]" = queue.Queue()
+        #: trade id -> when :meth:`submit` had it (the timing line's bot hop)
+        self._rx_t: dict[str, float] = {}
         self._seen: set[str] = set()
         self._seen_lock = threading.Lock()
         self._busy = threading.Event()          # set while an order is in flight
@@ -127,6 +176,9 @@ class EventHedger:
         self._thread: Optional[threading.Thread] = None
         #: signed base units MT5 still owes the venue leg (sub-lot residue)
         self.residue_units = 0.0
+        #: parity hedges sent ahead of their fills: [when, signed units] (+ =
+        #: MT5 bought), oldest first; worker thread only
+        self._credits: list[list[float]] = []
         self.last_hedge_t = 0.0
         self.last_submit_t = 0.0
         self.last_rebase: Optional[str] = None
@@ -134,7 +186,7 @@ class EventHedger:
         self.counters = {"submitted": 0, "duplicates": 0, "hedges": 0, "coalesced": 0,
                          "residue_holds": 0, "failures": 0, "dry": 0,
                          "rebases": 0, "parity_sent": 0, "split_orders": 0,
-                         "partial": 0}
+                         "partial": 0, "credits_expired": 0}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -175,8 +227,8 @@ class EventHedger:
 
     def parity_sent(self, sent_units: float, why: str) -> None:
         """The parity hedge sent ``sent_units`` (signed base units: + when
-        MT5 bought) — the residue owes that much less. Relative, so a fill
-        still on its way here adds back exactly its own share."""
+        MT5 bought) — a credit against what the residue owes THAT way, now
+        or when a fill still on its way here lands (module docstring)."""
         self._q.put(_ParitySent(float(sent_units), str(why)))
 
     # ── the feed thread's side ───────────────────────────────────────────────
@@ -198,6 +250,10 @@ class EventHedger:
             self._seen.add(key)
         self.counters["submitted"] += 1
         self.last_submit_t = self._clock()
+        self._rx_t[key] = self.last_submit_t
+        if len(self._rx_t) > 1000:                  # never grows: oldest out
+            for k in list(self._rx_t)[:500]:
+                self._rx_t.pop(k, None)
         self._q.put(tr)
         return "queued"
 
@@ -237,20 +293,53 @@ class EventHedger:
             finally:
                 self._busy.clear()
 
+    @property
+    def credit_units(self) -> float:
+        """Signed units parity hedges sent that no fill has claimed yet."""
+        return round(sum(c[1] for c in list(self._credits)), 8)
+
+    def _expire_credits(self) -> None:
+        now = self._clock()
+        while self._credits and now - self._credits[0][0] >= CREDIT_TTL_S:
+            _t, units = self._credits.pop(0)
+            self.counters["credits_expired"] += 1
+            self._log(f"event hedger: {units:+.4f} units of a parity hedge unclaimed by any "
+                      f"fill in {CREDIT_TTL_S:g}s -- dropped (it corrected this hedger's "
+                      f"book; residue {self.residue_units:+.4f} units)")
+
+    def _claim_credits(self, owed: float) -> float:
+        """``owed`` (signed units MT5 owes) less the credits sent the SAME
+        way, oldest first; a credit the other way is left untouched."""
+        for c in list(self._credits):
+            if owed * c[1] <= 0:            # nothing owed, or owed the other way
+                continue
+            take = min(abs(owed), abs(c[1])) * (1.0 if owed > 0 else -1.0)
+            owed = round(owed - take, 8)
+            c[1] = round(c[1] - take, 8)
+            if abs(c[1]) < 1e-9:
+                self._credits.remove(c)
+        return owed
+
     def _apply(self, it) -> None:
         old = self.residue_units
         if isinstance(it, _Rebase):
             self.residue_units = it.units
+            self._credits.clear()           # an absolute read: nothing is ahead
             self.counters["rebases"] += 1
             self.last_rebase = it.why
             if abs(old - it.units) > 1e-9:
                 self._log(f"event hedger: residue re-based {old:+.4f} -> {it.units:+.4f} "
                           f"units ({it.why})")
         else:
-            self.residue_units = old - it.units
+            self._expire_credits()
+            self._credits.append([self._clock(), float(it.units)])
+            self.residue_units = self._claim_credits(old)
             self.counters["parity_sent"] += 1
+            left = self.credit_units
             self._log(f"event hedger: parity hedge sent {it.units:+.4f} units ({it.why}) "
-                      f"-- residue {old:+.4f} -> {self.residue_units:+.4f}")
+                      f"-- residue {old:+.4f} -> {self.residue_units:+.4f}"
+                      + (f", {left:+.4f} units credited to fills still to come"
+                         if abs(left) > 1e-9 else ""))
 
     def _hedge_batch(self, fills: list[Trade]) -> None:
         # a venue BUY is offset by an MT5 SELL: the delta MT5 owes is minus
@@ -263,6 +352,16 @@ class EventHedger:
         # whole lot (0.99999999 for 1 oz), which read as 'under one lot' and
         # was never hedged (PAXG perp 2026-10-15 02:20: 1 oz unhedged)
         delta = round(self.residue_units - signed, 8)
+        # a parity hedge already sent this way pays for it first (the fills
+        # it went out ahead of, arriving now); one sent the other way never
+        # makes this hedger send it back
+        self._expire_credits()
+        claimed = round(delta - self._claim_credits(delta), 8)
+        if abs(claimed) > 1e-9:
+            delta = round(delta - claimed, 8)
+            self._log(f"event hedge: {len(fills)} fill(s) net {-signed:+.4f} units -- "
+                      f"{claimed:+.4f} already sent by a parity hedge (credit left "
+                      f"{self.credit_units:+.4f})")
         if len(fills) > 1:
             self.counters["coalesced"] += len(fills) - 1
         lots = round_to_step(abs(delta) / self.contract_size, self.volume_step)
@@ -307,6 +406,9 @@ class EventHedger:
                      f"{self.volume_max:g} lot" if len(res.chunks) > 1 else "")
             self._log(f"HEDGE (event) {side.value} {filled:g} lot (delta {delta:+.4f} units, "
                       f"{len(fills)} fill(s), order_send {latency_ms:.0f} ms{split})")
+            self._log(timing_line(fills[0], self._rx_t.pop(str(fills[0].trade_id or ""), None),
+                                  t0, t0 + latency_ms / 1000.0,
+                                  res.orders[0][1] if res.orders else None))
             if self._on_result is not None:
                 for got, order in res.orders:
                     self._on_result(side, got, order, delta, latency_ms, len(fills))
@@ -330,6 +432,7 @@ class EventHedger:
     def status(self) -> dict:
         q = self.quiet_s()
         return {"idle": self.idle, "residue_units": round(self.residue_units, 6),
+                "credit_units": round(self.credit_units, 6),
                 "quiet_s": None if q == float("inf") else round(q, 1),
                 "last_rebase": self.last_rebase,
                 "last_hedge_t": self.last_hedge_t, "last_latency_ms": self.last_latency_ms,

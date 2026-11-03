@@ -1168,7 +1168,10 @@ def trade_from_ccxt(exchange_id: str, symbol: str, t: dict) -> Optional[Trade]:
         # exchange time when given (a fills snapshot replays old fills the bot
         # uses this to stay quiet about)
         timestamp=ms_to_dt(t.get("timestamp")) or datetime.now(timezone.utc),
-        raw=None,  # keep the queue light; the bot doesn't need it
+        # keep the queue light: only the gateway's receive time, where it
+        # stamps one (the event hedger's timing line)
+        raw=({"gw_rx_ms": (t.get("info") or {})["gw_rx_ms"]}
+             if isinstance(t.get("info"), dict) and t["info"].get("gw_rx_ms") else None),
     )
 
 

@@ -499,6 +499,12 @@ if BASIS_MODE not in BASIS_MODES:
 #: after a market pair, the venue's position read can still miss the new
 #: ticket; the tracked position stands this long before a read may replace it
 PAIR_POSITION_SETTLE_S = 3.0
+#: the position-fault guard (:meth:`ArbBot._venue_read_contradicts`): a venue
+#: position read that disagrees with this bot's own fills since the last read
+#: is held back; still disagreeing after this long, it is a FAULT — entries
+#: stop, parity hedges freeze, the heartbeat says so — until a read agrees.
+#: A read the venue just had not caught up on clears well inside it.
+POSITION_FAULT_GRACE_S = 10.0
 #: the same order key is not fired twice within this long
 PAIR_REFIRE_S = 2.0
 #: a level whose quote leg the venue REFUSED is not fired again for this
@@ -577,6 +583,8 @@ def _eod_start(now: float) -> Optional[float]:
 RECONCILE_INTERVAL_S = _cfg("RECONCILE_INTERVAL_S")
 RECONCILE_RECHECK_DELAY_S = _cfg("RECONCILE_RECHECK_DELAY_S")
 RECONCILE_TOLERANCE_UNITS = _cfg("RECONCILE_TOLERANCE_UNITS")
+#: reconciler fixes in a row that HALT the bot (base_settings; 0 = off)
+MAX_RECONCILE_FIXES = int(_cfg("MAX_RECONCILE_FIXES") or 0)
 #: how long after an MT5 order_send the terminal is given to list the new
 #: ticket before the net is cached and the book compacted as read (not a
 #: strategy setting: it is the terminal's IPC, the same on every project)
@@ -1189,6 +1197,22 @@ def _basis_pair(v_bid: float, v_ask: float, r_bid: float,
 
 
 class ArbBot:
+    # defaults for the halt state (set again in __init__)
+    hedge_halt: Optional[str] = None
+    reconcile_fix_streak = 0
+    _recheck_defer_until: Optional[float] = None
+
+    # ``hedge_ok`` is set True again from a dozen places (a booked hedge, a
+    # clean parity read); a latched HALT must outlast all of them, so the
+    # attribute reads False while ``hedge_halt`` is set
+    @property
+    def hedge_ok(self) -> bool:
+        return bool(self.__dict__.get("_hedge_ok", True)) and not self.__dict__.get("hedge_halt")
+
+    @hedge_ok.setter
+    def hedge_ok(self, value: bool) -> None:
+        self.__dict__["_hedge_ok"] = bool(value)
+
     """The shared engine. A strategy subclasses this in its own folder under
     ``strategies/`` and supplies the quoting logic through the hooks below;
     everything else — feed, fills, hedging, reconcile, margin gates,
@@ -1225,6 +1249,13 @@ class ArbBot:
     #: basis and the lowest ask basis; None until the window has coverage
     basis_max_bid: Optional[float] = None
     basis_min_ask: Optional[float] = None
+    #: the position-fault guard (_venue_read_contradicts): units this bot's
+    #: fills moved the venue position since the last ACCEPTED read; when a
+    #: contradicting read was first seen; the fault, once it outlasted
+    #: POSITION_FAULT_GRACE_S ({"read", "expected", "since"}) — None = clear
+    _fills_since_read = 0.0
+    _pos_suspect_since: Optional[float] = None
+    pos_fault: Optional[dict] = None
 
     # ── strategy hooks (each strategy overrides) ─────────────────────────────
     STRATEGY_KEY = "bot"          # short id: the heartbeat's ``strategy`` field
@@ -1501,6 +1532,8 @@ class ArbBot:
         # reconcile state machine
         self._next_check_at = time.time() + RECONCILE_INTERVAL_S
         self._recheck_at: Optional[float] = None
+        #: how long a due re-check may still wait for the event hedger to go quiet
+        self._recheck_defer_until: Optional[float] = None
         self.reconcile_last: Optional[str] = None
         # the MT5 book right after a hedge (see _arm_mt5_settle)
         self._mt5_settle_until = 0.0
@@ -1539,6 +1572,10 @@ class ArbBot:
                          "quotes_cancelled": 0,
                          "reconcile_checks": 0, "reconcile_fixes": 0,
                          "pos_resyncs": 0}
+        #: reconciler fixes since the last clean parity read (MAX_RECONCILE_FIXES)
+        self.reconcile_fix_streak = 0
+        #: why the bot HALTED its hedging (quotes down until a restart), else None
+        self.hedge_halt: Optional[str] = None
         self.last_error: Optional[str] = None
         # reporting (atjte.reporting): created in startup once the state
         # files may be touched; the broker clock offset is inferred from
@@ -2079,6 +2116,7 @@ class ArbBot:
         self.pos_units = round(self.pos_units + signed, 8)
         if self.venue_pos_units is not None:   # keep the quoting anchor current
             self.venue_pos_units = round(self.venue_pos_units + signed, 8)
+        self._fills_since_read = round(self._fills_since_read + delta, 8)
         self.counters["fills_booked_units"] = round(
             self.counters["fills_booked_units"] + delta, 8)
         # the day's risk book: this leg's realized PnL and traded notional
@@ -2909,6 +2947,14 @@ class ArbBot:
         if source == "fill" and self.hedger is not None:
             self._verify_after_event_hedge()
             return
+        if self.pos_fault is not None and source != "fill":
+            # the venue figure parity would hedge to is the one in doubt: a
+            # "correction" from it is exactly what unhedged EXANTE (2026-11-02)
+            self._log_once("pos_fault_parity",
+                           f"parity hedge ({source}) FROZEN by the position fault — "
+                           f"{EXCHANGE_ID} reads {self.pos_fault['read']:+g}, this bot's "
+                           f"fills say {self.pos_fault['expected']:+g} {UNIT_LABEL}")
+            return
         if LIVE_TRADING:
             try:
                 self._read_venue_position()
@@ -2943,6 +2989,8 @@ class ArbBot:
                            f"hedge ({source}) HELD: {side.value} {lots:g} lot {SYMBOL_MT5} is "
                            f"the order MT5 refused at {held['at']} ({held['why']}) — not "
                            f"resent unchanged until {held['until_s']}; quotes stay down")
+            return
+        if source == "reconcile" and self._reconcile_over_volume(side, lots):
             return
         try:
             res = send_split(self._mt5_market, side, lots, self.volume_max,
@@ -3239,9 +3287,75 @@ class ArbBot:
         if MARKET_PAIR and time.time() - self._last_fire_t < PAIR_POSITION_SETTLE_S:
             return      # the terminal may not list the new ticket yet
         self.venue.read_position()
+        if self._venue_read_contradicts(self.venue_pos_units, self.venue.position_units,
+                                        time.time()):
+            return      # held back: the fills' figure stays the anchor
         self.venue_pos_units = self.venue.position_units
+        self._fills_since_read = 0.0
         self.venue_entry_px, self.venue_upnl = self.venue.entry_px, self.venue.upnl
         self.venue_ufunding, self.venue_liq_px = self.venue.ufunding, self.venue.liq_px
+
+    def _pos_fault_tolerance(self) -> float:
+        """How far a venue read may sit from the fills' figure and still be
+        the same position: half the venue's minimum order (one fill can never
+        hide inside it), never below the position-reconcile tolerance."""
+        return max((self.amount_min or 0.0) / 2.0,
+                   float(POSITION_RECONCILE_TOLERANCE_UNITS or 0.0), POS_EPS)
+
+    def _venue_read_contradicts(self, expected: Optional[float], read: float,
+                                now: float) -> bool:
+        """The position-fault guard: True = do NOT take ``read``.
+
+        ``expected`` is the anchor as this bot's own fills have moved it since
+        the last accepted read. A read that disagrees with it right after
+        fills is either a venue that has not booked them yet (it catches up
+        within seconds) or a read that is WRONG — EXANTE's gateway once
+        dropped every position (2026-11-02): the bot took "flat" a second
+        after each fill, re-quoted the same grid levels past its cap and the
+        parity check bought back a correct hedge. Trusting either figure is
+        unsafe, so the anchor stays on the fills, the read is retried, and a
+        disagreement that outlasts ``POSITION_FAULT_GRACE_S`` becomes
+        :attr:`pos_fault`: entries stop (the gate), parity hedges freeze
+        (:meth:`_hedge`), the heartbeat carries it. A read that agrees clears
+        it. A read that moved with NO fill of ours behind it (a liquidation,
+        a manual trade) is taken as before — the parity check is for that."""
+        tol = self._pos_fault_tolerance()
+        if expected is None or abs(read - expected) < tol:
+            if self.pos_fault is not None:
+                _log(f"position check: {EXCHANGE_ID} reads {read:+g} {UNIT_LABEL}, as this "
+                     f"bot's fills say — position fault cleared, entries and parity resume")
+                self.pos_fault = None
+                self._pos_suspect_since = None
+                self._update_gate_reasons()
+            elif self._pos_suspect_since is not None:
+                _log(f"position check: {EXCHANGE_ID} caught up ({read:+g} {UNIT_LABEL})")
+                self._pos_suspect_since = None
+            return False
+        if self._pos_suspect_since is None and self._fills_since_read < tol:
+            return False    # moved with no fill of ours: the venue's own change
+        if self._pos_suspect_since is None:
+            self._pos_suspect_since = now
+            self._bal_dirty = True              # re-read on the next pass
+            _log(f"position check: {EXCHANGE_ID} reads {read:+g} {UNIT_LABEL} but this bot's "
+                 f"fills make it {expected:+g} — keeping the fills' figure, re-reading "
+                 f"(a fault after {POSITION_FAULT_GRACE_S:g}s)")
+            return True
+        if self.pos_fault is None:
+            self._bal_dirty = True
+            if now - self._pos_suspect_since < POSITION_FAULT_GRACE_S:
+                return True
+            self.pos_fault = {"read": round(read, 8), "expected": round(expected, 8),
+                              "since": _utcnow()}
+            _log(f"POSITION FAULT: {EXCHANGE_ID} has read {read:+g} {UNIT_LABEL} for "
+                 f"{now - self._pos_suspect_since:.0f}s while this bot's fills make it "
+                 f"{expected:+g} — NEW ENTRIES STOPPED and parity hedges FROZEN (exits keep "
+                 f"quoting on the fills' figure). Check the account: this clears by itself "
+                 f"when a read agrees; if the account really holds {read:+g}, stop the bot "
+                 f"and restart it — a start takes the venue's figure")
+            self._update_gate_reasons()
+        else:
+            self.pos_fault.update(read=round(read, 8), expected=round(expected, 8))
+        return True
 
     def _read_venue_margin(self) -> None:
         """One fetch_balance round-trip for the account figures the entry
@@ -3354,17 +3468,48 @@ class ArbBot:
         if self._recheck_at is not None:
             if now < self._recheck_at:
                 return
+            # an event hedge in flight (or a fill just pushed) is a drift the
+            # hedger is closing: a parity read now would hedge it a second
+            # time, and the next re-check would fix that back -- a double
+            # hedge, and a streak toward MAX_RECONCILE_FIXES on a healthy bot.
+            # Wait for quiet, at most one more re-check delay, then read anyway
+            if self.hedger is not None and not self.hedger.quiet(now):
+                if self._recheck_defer_until is None:
+                    self._recheck_defer_until = now + RECONCILE_RECHECK_DELAY_S
+                if now < self._recheck_defer_until:
+                    self._recheck_at = now + 1.0
+                    return
+            self._recheck_defer_until = None
             self._recheck_at = None
             self._next_check_at = now + RECONCILE_INTERVAL_S
             drift = self._parity_drift_units()
             if abs(drift) >= RECONCILE_TOLERANCE_UNITS:
+                if self.hedge_halt:
+                    self.reconcile_last = (f"{_utcnow()} drift {drift:+.4f} units — NOT "
+                                           f"hedged: the bot is halted")
+                    self._log_once(f"halt_drift_{int(now // 300)}",
+                                   f"RECONCILE: drift {drift:+.4f} units NOT fixed — hedging "
+                                   f"is HALTED ({self.hedge_halt}); restart the bot")
+                    return
                 self.counters["reconcile_fixes"] += 1
                 self.reconcile_last = (f"{_utcnow()} drift {drift:+.4f} units persisted "
                                        f"after re-check — hedged")
                 _log(f"RECONCILE: drift {drift:+.4f} units persisted after "
                      f"{RECONCILE_RECHECK_DELAY_S:g}s re-check — fixing hedge")
+                traded = self.counters["hedges"]
                 self._hedge(source="reconcile")
+                # only a fix that TRADED counts toward the halt: a refused or
+                # held hedge (no money, market closed, MT5_REFUSED_HOLD_S) is
+                # the broker's answer, not this bot's hedging being wrong, and
+                # has its own path (quotes down, the refusal hold)
+                if self.counters["hedges"] > traded:
+                    self.reconcile_fix_streak += 1
+                    _log(f"RECONCILE: fix {self.reconcile_fix_streak} in a row"
+                         + (f" (halt at {MAX_RECONCILE_FIXES})" if MAX_RECONCILE_FIXES > 0
+                            else ""))
+                    self._halt_if_reconciler_keeps_fixing()
             else:
+                self.reconcile_fix_streak = 0
                 self.hedge_ok = True   # parity verified fine — quoting may resume
                 self.reconcile_last = f"{_utcnow()} drift cleared on re-check"
                 _log("reconcile: drift cleared on re-check — no action")
@@ -3380,10 +3525,62 @@ class ArbBot:
                      f"{self.mt5_net_units:+.4f}) — "
                      f"re-checking in {RECONCILE_RECHECK_DELAY_S:g}s")
             else:
+                self.reconcile_fix_streak = 0
                 self.hedge_ok = True   # parity verified fine — quoting may resume
                 self._next_check_at = now + RECONCILE_INTERVAL_S
                 self.reconcile_last = f"{_utcnow()} in sync (drift {drift:+.4f} units)"
                 self._rebase_hedger_if_quiet(drift, now, "periodic parity")
+
+    def _reconcile_over_volume(self, side: OrderSide, lots: float) -> bool:
+        """The reconciler keeps to the day's hedge budget,
+        MAX_DAILY_MT5_VOLUME_USD (shared, no setting of its own): a fix that
+        would take today's MT5 hedge notional past it is NOT sent, and the
+        bot HALTS. The daily limits put the strategy close-only but never
+        block a hedge -- the event hedger must still hedge the exits -- so
+        the reconciler was the one path that could keep trading the hedge
+        leg past the cap (2026-11-01: 0.03 lot back and forth every cycle).
+        A fix that size, that late in a day, is the suspect trade. True =
+        halted, nothing sent. A price it cannot read blocks nothing."""
+        cap = self._limit("MAX_DAILY_MT5_VOLUME_USD", MAX_DAILY_MT5_VOLUME_USD)
+        if not cap:
+            return False
+        px = float((self.xau_ask if side is OrderSide.BUY else self.xau_bid) or 0.0)
+        est = float(lots) * self.contract_size * px * HEDGE_RATIO
+        if est <= 0:
+            return False
+        self._roll_day()
+        today = float(self.day.mt5_volume_usd)
+        if today + est <= float(cap):
+            return False
+        self.hedge_halt = (f"a reconcile fix of {lots:g} lot (~{est:,.0f} USD) would take "
+                           f"today's hedge volume {today:,.0f} past MAX_DAILY_MT5_VOLUME_USD "
+                           f"{float(cap):,.0f} at {_utcnow()}")
+        _log(f"ERROR: HEDGE HALTED — {self.hedge_halt}; NOT sent: {side.value} {lots:g} lot "
+             f"{SYMBOL_MT5}. The exposure stays unhedged by that drift. Check the venue "
+             f"position against the MT5 book (magic {MT5_MAGIC}), then restart the bot")
+        return True
+
+    def _halt_if_reconciler_keeps_fixing(self) -> None:
+        """MAX_RECONCILE_FIXES fixes in a row: the bot's own hedging is
+        wrong, and the safety net is now trading against it (2026-11-01, HL
+        + IC cTrader EURUSD: a cancelled event hedge booked as filled, then
+        the reconciler and the event hedger traded 0.03 lot back and forth
+        across a 20-pip spread every cycle). The last fix stands -- the
+        hedge is at parity as read -- and the bot HALTS: quotes come down
+        and stay down, the reconciler reads parity but sends nothing, until
+        an operator restarts the bot (startup re-reads both legs and
+        re-seeds the event hedger from them)."""
+        if (MAX_RECONCILE_FIXES <= 0 or self.hedge_halt
+                or self.reconcile_fix_streak < MAX_RECONCILE_FIXES):
+            return
+        self.hedge_halt = (f"{self.reconcile_fix_streak} reconciler fixes in a row "
+                           f"(MAX_RECONCILE_FIXES {MAX_RECONCILE_FIXES}) at {_utcnow()}")
+        _log(f"ERROR: HEDGE HALTED — {self.hedge_halt}. The reconciler is the safety "
+             f"net; fixing a drift every re-check means this bot's own hedging is "
+             f"wrong (a hedge booked that never filled, a size mismatch, something "
+             f"else moving the {SYMBOL_MT5} book). Quotes stay down and nothing more "
+             f"is hedged automatically. Check the venue position against the MT5 "
+             f"book (magic {MT5_MAGIC}), then restart the bot")
 
     def _rebase_hedger_if_quiet(self, drift: float, now: float, why: str) -> None:
         """A parity read just measured the real gap; if the event hedger has
@@ -3484,6 +3681,10 @@ class ArbBot:
         dlv = getattr(self, "delivery_close_reason", None)
         if dlv:
             reasons.append(dlv)         # no new entries this close to delivery
+        if self.pos_fault is not None:
+            reasons.append(f"position fault: {EXCHANGE_ID} reads {self.pos_fault['read']:+g} "
+                           f"{UNIT_LABEL}, this bot's fills say "
+                           f"{self.pos_fault['expected']:+g} (parity hedges frozen)")
         if self.derisk_active:
             reasons.append("liquidation threshold hit (sticky until restart): "
                            + "; ".join(self.derisk_reasons))
@@ -4683,7 +4884,10 @@ class ArbBot:
         for key, t in targets.items():
             rec = self.orders.get(key)
             if rec is not None:
-                same_size = abs(rec.remaining - t["amount"]) < size_tol
+                # an order under the venue's minimum value rests LIFTED
+                # (_place): compared at that size, or it is requoted each pass
+                want = self._lift_to_min_value(t) or t["amount"]
+                same_size = abs(rec.remaining - want) < size_tol
                 if abs(rec.price - t["price"]) < min_move and same_size:
                     continue
                 # a resting TAKER order that crosses the top of book is about
@@ -5425,11 +5629,20 @@ class ArbBot:
             if need is None or avail is None:
                 return amount          # cannot judge: the venue is the judge
             if need > avail:
-                self._log_once(f"margin_{key}",
-                               f"skip {key}: {amount:g} {UNIT_LABEL} needs {need:.2f} "
-                               f"{self.venue.quote} margin (notional / leverage"
-                               + (f" x {PLACE_MARGIN_SAFETY:g}" if PLACE_MARGIN_SAFETY != 1 else "")
-                               + f") but the account has {avail:.2f} available")
+                # once per blocked spell: the figures move with every tick,
+                # and a line per pass flooded the log (2026-11-02)
+                if f"margin_{key}" not in self._last_msgs:
+                    self._log_once(f"margin_{key}",
+                                   f"skip {key}: {amount:g} {UNIT_LABEL} needs {need:.2f} "
+                                   f"{self.venue.quote} margin ("
+                                   + ("notional x the market's initial margin"
+                                      if getattr(getattr(self.venue, "client", None),
+                                                 "broker_margin", False)
+                                      else "notional / leverage")
+                                   + (f" x {PLACE_MARGIN_SAFETY:g}"
+                                      if PLACE_MARGIN_SAFETY != 1 else "")
+                                   + f") but the account has {avail:.2f} available "
+                                   f"— skipped until it fits")
                 return None
             self._last_msgs.pop(f"margin_{key}", None)
             return amount
@@ -5571,13 +5784,23 @@ class ArbBot:
         t = self._fresh_target(key, {**t, "amount": amount})   # priced as of NOW
         if t is None:
             return
+        reduce_only = bool(REDUCE_ONLY_EXITS and t["purpose"] == "exit"
+                           and self.venue.supports_reduce_only)
+        lifted = self._lift_to_min_value(t)
+        if lifted is not None:
+            self._log_once(f"minvalue_{key}",
+                           f"{key} {t['amount']:g} {UNIT_LABEL} @ {t['price']} is under the "
+                           f"venue's minimum order value {self.venue.cost_min:g} — sent as "
+                           f"{lifted:g} {UNIT_LABEL}"
+                           + (" WITHOUT reduce-only (it may overshoot the position)"
+                              if reduce_only else ""))
+            t = {**t, "amount": lifted}
+            reduce_only = False   # an exit lifted past what it closes is refused reduce-only
         why = self._preplace_block(t)
         if why is not None:
             self._log_once(f"preplace_{key}", f"skip {key} {t['amount']:g} {UNIT_LABEL}: {why}")
             return
         self._last_msgs.pop(f"preplace_{key}", None)
-        reduce_only = bool(REDUCE_ONLY_EXITS and t["purpose"] == "exit"
-                           and self.venue.supports_reduce_only)
         try:
             o = self.venue.place_limit(t["side"], t["amount"], t["price"],
                                        post_only=not t.get("taker"),
@@ -5641,6 +5864,28 @@ class ArbBot:
         if rec.rest_cum > POS_EPS:
             self._book(rec, source="place")
         self._persist_position()
+
+    def _lift_to_min_value(self, t: dict) -> Optional[float]:
+        """The size an order under the venue's minimum order VALUE
+        (``Venue.cost_min``, Hyperliquid's $10) is sent at instead of being
+        refused: the smallest multiple of the size step worth at least the
+        minimum at the order's price. None when the order is worth enough
+        (or the venue publishes no minimum). The overshoot is accepted on
+        purpose: a remainder the venue will never take otherwise leaves the
+        exposure stuck, and every fill is hedged as usual."""
+        cost_min = getattr(self.venue, "cost_min", None)
+        try:
+            amount, price = float(t["amount"]), float(t["price"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not cost_min or price <= 0 or amount * price >= cost_min:
+            return None
+        step = float(getattr(self.venue, "amount_step", 0.0) or 0.0)
+        need = cost_min / price
+        if step > 0:
+            need = math.ceil(need / step - 1e-9) * step
+        need = round(max(need, float(getattr(self.venue, "amount_min", 0.0) or 0.0)), 8)
+        return need if need > amount else None
 
     # ── websocket gate: no live feed, no quotes ──────────────────────────────
     def _ws_gate(self) -> Optional[str]:
@@ -6233,7 +6478,8 @@ class ArbBot:
         self._phase("close_only", self._update_gate_reasons)   # close_only.signal, live
         self._phase("position_reconcile", self._reconcile_position, now)
         if not self.hedge_ok:
-            self._retire_all_quotes("hedge leg down — exposure parity broken")
+            self._retire_all_quotes(f"hedging HALTED — {self.hedge_halt}" if self.hedge_halt
+                                    else "hedge leg down — exposure parity broken")
         self._phase("report", self._report, now)   # snapshot + trade history
         self.dump_state()
 
@@ -6714,10 +6960,15 @@ class ArbBot:
             "pos_divergence_units": self.pos_divergence_units,
             "position_diverged": self.position_diverged,
             "position_reconcile_last": self.position_reconcile_last,
+            # the position-fault guard: the venue read contradicts the fills
+            # ({"read", "expected", "since"}; None = clear)
+            "position_fault": self.pos_fault,
             "mt5_net_units": self.mt5_net_units,
             "mt5_net_units_mt5": round(self.mt5_net_units * HEDGE_RATIO, 6),
             "exposure_drift_units": round(pos + self.mt5_net_units, 4),
             "hedge_ok": self.hedge_ok,
+            "hedge_halt": self.hedge_halt,
+            "reconcile_fix_streak": self.reconcile_fix_streak,
             # the hedge MT5 refused for the request itself, held (see _hedge)
             "hedge_refusal": ({k: v for k, v in self.hedge_refusal.items()
                                if k not in ("t", "until")}

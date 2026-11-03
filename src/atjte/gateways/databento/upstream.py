@@ -31,6 +31,12 @@
   CCXT-shaped ticker. The session asks Databento for a heartbeat every
   :data:`HEARTBEAT_S`: :meth:`live_alive` is "something arrived lately", the
   liveness the quoting gateways gate on — a quiet book is not a dead one.
+  The same stream builds 1 m MID bars per quoted symbol (the last
+  :data:`LIVE_KEEP_S`, free), served by ``fetch_ohlcv`` with ``price`` mid.
+- **an automatic fill** — ``fetch_ohlcv`` with ``max_cost_usd`` (a client's
+  chart history, never the Spread History page): the kept live bars first,
+  and only the part BEFORE them fetched, once its quoted cost is at most
+  ``max_cost_usd``; a dearer part is skipped and logged.
 
 The API key never leaves this object; nothing on the wire carries it.
 """
@@ -202,6 +208,8 @@ class DatabentoUpstream:
         #: symbol -> basis -> {bar open (s): [o, h, l, c, v]} (1 m, live)
         self._live_bars: dict[str, dict[str, dict[int, list]]] = {
             s: {"trades": {}, "mid": {}} for s in self.symbols}
+        #: symbol -> {bar open (s): [o, h, l, c, 0]}: 1 m mids from the quotes
+        self._quote_bars: dict[str, dict[int, list]] = {}
         #: instrument_id -> the symbols it was subscribed as (one contract
         #: can be both GCZ6 and GC.c.0)
         self._ids: dict[int, set[str]] = {}
@@ -210,7 +218,8 @@ class DatabentoUpstream:
         self.live_ok = False
         self.last_error = ""
         self.counters = {"reads": 0, "cost_quotes": 0, "live_records": 0, "quotes": 0,
-                         "heartbeats": 0, "reconnects": 0, "errors": 0}
+                         "heartbeats": 0, "reconnects": 0, "errors": 0,
+                         "auto_fetches": 0, "auto_skipped": 0, "auto_cost_usd": 0.0}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -284,6 +293,7 @@ class DatabentoUpstream:
                 return
             # before the subscription: its first record may beat this thread
             self._quote_syms.add(symbol)
+            self._quote_bars.setdefault(symbol, {})
         try:
             self._live_subscribe([(QUOTE_SCHEMA, [symbol], C.stype_of(symbol))])
         except Exception as e:                              # noqa: BLE001
@@ -368,6 +378,7 @@ class DatabentoUpstream:
         with self._lock:
             prev = self._quotes.get(sym)
             self._quotes[sym] = q
+            self._quote_bar(sym, q, rec)
         if prev is not None and all(prev[k] == q[k] for k in
                                     ("bid", "ask", "bidVolume", "askVolume")):
             return                                  # a trade that left the top as it was
@@ -378,6 +389,25 @@ class DatabentoUpstream:
                 fn(sym, q)
             except Exception as e:                          # noqa: BLE001
                 self._err("quote handler", e)
+
+    def _quote_bar(self, sym: str, q: dict, rec) -> None:
+        """Fold one top-of-book update into its minute's mid bar, at the
+        exchange's time (the gateway's when the record has none). Under
+        ``self._lock``."""
+        ns = getattr(rec, "ts_event", None)
+        t = float(ns) / NS if ns else self._clock()
+        mid = (q["bid"] + q["ask"]) / 2.0
+        b = int(t // 60) * 60
+        store = self._quote_bars.setdefault(sym, {})
+        bar = store.get(b)
+        if bar is None:
+            store[b] = [mid, mid, mid, mid, 0.0]
+            if len(store) > LIVE_KEEP_S // 60 + 120:
+                cut = t - LIVE_KEEP_S
+                for k in [k for k in store if k < cut]:
+                    del store[k]
+            return
+        bar[1], bar[2], bar[3] = max(bar[1], mid), min(bar[2], mid), mid
 
     def _bar(self, sym: str, rec) -> None:
         basis = "mid" if getattr(rec, "bid_px_00", None) is not None else "trades"
@@ -397,7 +427,9 @@ class DatabentoUpstream:
     def _live_rows(self, symbol: str, basis: str, start_s: float, end_s: float,
                    bar_s: int) -> dict[int, list]:
         with self._lock:
-            src = dict((self._live_bars.get(symbol) or {}).get(basis) or {})
+            # mid: the quotes' own bars, the subscribed bbo-1m's winning
+            src = dict(self._quote_bars.get(symbol) or {}) if basis == "mid" else {}
+            src.update((self._live_bars.get(symbol) or {}).get(basis) or {})
         recs = []
         for b, (o, h, lo, c, v) in src.items():
             if start_s <= b < end_s:
@@ -439,19 +471,26 @@ class DatabentoUpstream:
         return start, end
 
     def _check_symbol(self, symbol: str) -> None:
-        if symbol not in self.symbols:
+        with self._lock:
+            quoted = symbol in self._quote_syms
+        if symbol not in self.symbols and not quoted:
             raise ccxt.BadSymbol(f"databento: this gateway serves "
-                                 f"{', '.join(self.symbols) or 'no symbol'}, not {symbol!r}")
+                                 f"{', '.join(self.symbols) or 'no symbol'} (and the symbols "
+                                 f"it streams quotes for), not {symbol!r}")
 
     def ohlcv(self, symbol: str, timeframe: str, since=None, limit=None,
-              price: str = "trades") -> list[list]:
+              price: str = "trades", max_cost_usd: Optional[float] = None) -> list[list]:
         """CCXT ``fetch_ohlcv`` over ONE historical request (plus the live
-        buffer past the dataset's published end)."""
+        buffer past the dataset's published end). With ``max_cost_usd``, the
+        automatic fill: :meth:`_ohlcv_capped`."""
         self._check_symbol(symbol)
         schema, bar_s = self._schema(timeframe or "1m", price or "trades")
         start, end = self._window(timeframe, since, limit)
         if end <= start:
             return []
+        if max_cost_usd is not None:
+            return self._ohlcv_capped(symbol, schema, bar_s, price, start, end, since, limit,
+                                      float(max_cost_usd))
         hist_end = self._dataset_end()
         h_end = end if hist_end is None else min(end, hist_end)
         bars: dict[int, list] = {}
@@ -464,12 +503,45 @@ class DatabentoUpstream:
             for b, bar in self._live_rows(symbol, price, max(start, hist_end), end,
                                           bar_s).items():
                 bars.setdefault(b, bar)
+        return self._rows(bars, start, end, since, limit)
+
+    def _rows(self, bars: dict, start: float, end: float, since, limit) -> list[list]:
         rows = [r for r in rows_of(bars) if start * 1000 <= r[0] < end * 1000]
         lim = int(limit) if limit else None
         if lim:
             rows = rows[:lim] if since is not None else rows[-lim:]
         self.counters["reads"] += 1
         return rows
+
+    def _ohlcv_capped(self, symbol: str, schema: str, bar_s: int, price: str, start: float,
+                      end: float, since, limit, max_cost_usd: float) -> list[list]:
+        """The automatic fill: the kept live bars (free), and only the part of
+        the window BEFORE the first of them from the historical API — once
+        :meth:`metadata.get_cost` quotes it at no more than ``max_cost_usd``.
+        A dearer part is skipped (logged); what the buffer has is served."""
+        bars = self._live_rows(symbol, price, start, end, bar_s) if self.live_on else {}
+        first = min(bars) if bars else end
+        hist_end = self._dataset_end()
+        h_end = min(first, end if hist_end is None else min(end, hist_end))
+        if h_end - start >= bar_s:                  # at least one bar to fetch
+            kw = dict(dataset=self.dataset, start=_iso(start), end=_iso(h_end),
+                      symbols=[symbol], schema=schema, stype_in=C.stype_of(symbol))
+            usd = float(self._hist.metadata.get_cost(**kw))
+            self.counters["cost_quotes"] += 1
+            if usd <= max_cost_usd:
+                hist = bars_from_records(self._hist.timeseries.get_range(**kw), price, bar_s)
+                self.counters["auto_fetches"] += 1
+                self.counters["auto_cost_usd"] = round(self.counters["auto_cost_usd"] + usd, 4)
+                self._log(f"databento: automatic fill {symbol} {schema} {kw['start']} -> "
+                          f"{kw['end']}: {len(hist)} bars for {usd:.4f} USD")
+                for b, bar in hist.items():
+                    bars.setdefault(b, bar)
+            else:
+                self.counters["auto_skipped"] += 1
+                self._log(f"databento: automatic fill {symbol} {schema} {kw['start']} -> "
+                          f"{kw['end']} skipped: quoted {usd:.4f} USD, the cap is "
+                          f"{max_cost_usd:.4f} — fill it from Spread History")
+        return self._rows(bars, start, end, since, limit)
 
     def cost(self, symbol: str, timeframe: str, since, until, price: str = "trades") -> dict:
         """What fetching ``symbol`` from ``since`` to ``until`` (ms) costs, in
@@ -523,9 +595,11 @@ class DatabentoUpstream:
         if what == "markets":
             return self.markets()
         if what == "fetch_ohlcv":
+            cap = params.get("max_cost_usd", a.get("max_cost_usd"))
             return self.ohlcv(str(a.get("symbol")), a.get("timeframe") or "1m",
                               a.get("since"), a.get("limit"),
-                              str(params.get("price") or a.get("price") or "trades"))
+                              str(params.get("price") or a.get("price") or "trades"),
+                              max_cost_usd=None if cap is None else float(cap))
         if what == "ohlcv_cost":
             return self.cost(str(a.get("symbol")), a.get("timeframe") or "1h",
                              a.get("since"), a.get("until"),

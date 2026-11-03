@@ -163,11 +163,14 @@ class MT5GatewayClient:
     def get_ticker(self, symbol: str):
         if not self.wire.connected:
             raise ConnectionError(f"{self.GATEWAY_LABEL} not attached ({self.wire.reason})")
-        if not self.wire.ready:
-            # attached, but the gateway's TERMINAL is not answering: its last
-            # tick is history, not a price
+        s = self.wire.session or {}
+        if not s.get("prices_ok", self.wire.ready):
+            # attached, but the gateway's TERMINAL is not answering (or is off
+            # the broker's server): its last tick is history, not a price. A
+            # terminal that only may not TRADE (Algo Trading off) still
+            # prices; its hedges are refused by the gateway and by health()
             raise ConnectionError(f"{self.GATEWAY_LABEL}: platform not answering "
-                                  f"({self.wire.session.get('reason')})")
+                                  f"({s.get('reason')})")
         with self._lock:
             t = self._ticks.get(symbol)
         if t is not None:

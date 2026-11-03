@@ -283,6 +283,51 @@ class QuoteUpstreamTest(unittest.TestCase):
         lv.cb(_bbo(PUBLISHED + 60, 3999.0, 4001.0))     # a 1 m BBO still is one
         self.assertEqual(len(up._live_bars["GCZ6"]["mid"]), 1)
 
+    def _quoted(self):
+        """A quotes-only upstream (no bar symbols) streaming GCZ6 from 30 min
+        before the dataset's published end until now, one update a minute."""
+        hist, lv = FakeHistorical(), FakeLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: hist,
+                                 live_factory=lambda k: lv, clock=lambda: NOW)
+        up.start()
+        up.subscribe_quotes("GCZ6")
+        lv.cb(NS(stype_in_symbol="GCZ6", instrument_id=7))
+        self.first = PUBLISHED - 1800
+        for k, t in enumerate(range(self.first, NOW, 60)):
+            rec = _mbp1(4000.0 + k, 4001.0 + k)
+            rec.ts_event = t * NS_
+            lv.cb(rec)
+        return up, hist
+
+    def test_quotes_build_free_one_minute_mid_bars(self):
+        up, hist = self._quoted()
+        rows = up.ohlcv("GCZ6", "1m", (NOW - 600) * 1000, 5, price="mid")
+        self.assertEqual([r[0] // 1000 for r in rows], [NOW - 600 + 60 * k for k in range(5)])
+        k = (NOW - 600 - self.first) // 60
+        self.assertEqual(rows[0][1:5], [4000.5 + k] * 4)      # the mid
+        self.assertNotIn("get_range", [c[0] for c in hist.calls])   # all live: free
+
+    def test_the_automatic_fill_buys_only_the_part_before_the_buffer_under_the_cap(self):
+        up, hist = self._quoted()
+        since = (PUBLISHED - H) * 1000                         # 30 min before the buffer
+        rows = up.ohlcv("GCZ6", "1m", since, 200, price="mid", max_cost_usd=0.5)
+        fetch = [c for c in hist.calls if c[0] == "get_range"]
+        self.assertEqual(len(fetch), 1)
+        self.assertEqual((fetch[0][1], FakeHistorical._secs(fetch[0][3])),
+                         ("bbo-1m", self.first))               # stops where the buffer starts
+        self.assertEqual(rows[0][0] // 1000, PUBLISHED - H)
+        self.assertEqual(rows[-1][0] // 1000, NOW - 60)
+        self.assertEqual((up.counters["auto_fetches"], up.counters["auto_cost_usd"]), (1, 0.3))
+
+    def test_a_fill_dearer_than_the_cap_is_skipped(self):
+        up, hist = self._quoted()
+        rows = up.read("fetch_ohlcv", {"symbol": "GCZ6", "timeframe": "1m",
+                                       "since": (PUBLISHED - H) * 1000, "limit": 200,
+                                       "params": {"price": "mid", "max_cost_usd": 0.1}})
+        self.assertNotIn("get_range", [c[0] for c in hist.calls])
+        self.assertEqual(up.counters["auto_skipped"], 1)
+        self.assertEqual(rows[0][0] // 1000, self.first)      # the buffer only
+
     def test_liveness_is_anything_lately_heartbeats_included(self):
         now = [float(NOW)]
         lv = FakeLive()

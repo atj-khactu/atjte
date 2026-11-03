@@ -13,6 +13,7 @@ UTC, and a dropped session reads as unreachable until it is re-opened.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -24,7 +25,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from atjte.clients.base import OrderSide, OrderType, PositionSide
+from atjte.clients.base import OrderSide, OrderStatus, OrderType, PositionSide
 from atjte.clients.gateway import CTraderGatewayClient
 from atjte.gateways.ctrader import backend as B
 from atjte.gateways.ctrader import config as C
@@ -51,6 +52,10 @@ class FakeOpenApi:
         self.orders: list = []
         self.ids = iter(range(1000, 10**6))
         self.reject_volume = None
+        self.reject_code = "NOT_ENOUGH_MONEY"
+        self.cancel_volume = None          # a market order CANCELLED with nothing filled
+        self.fail_close = set()            # closing these positions is refused
+        self.no_bars = False
         self.conns: list[socket.socket] = []
         self.lock = threading.Lock()
         self.now_ms = int(time.time() * 1000)
@@ -99,6 +104,17 @@ class FakeOpenApi:
             return []
         if name == "ProtoOAApplicationAuthReq":
             return [M.ProtoOAApplicationAuthRes()]
+        if name == "ProtoOAGetAccountListByAccessTokenReq":
+            if m.accessToken != self.access:
+                return [M.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID",
+                                          description="expired")]
+            return [M.ProtoOAGetAccountListByAccessTokenRes(
+                accessToken=m.accessToken, permissionScope=MM.SCOPE_TRADE,
+                ctidTraderAccount=[
+                    MM.ProtoOACtidTraderAccount(ctidTraderAccountId=ACCOUNT, isLive=False,
+                                                traderLogin=5551234),
+                    MM.ProtoOACtidTraderAccount(ctidTraderAccountId=ACCOUNT + 1,
+                                                isLive=True, traderLogin=7770001)])]
         if name == "ProtoOAVersionReq":
             return [M.ProtoOAVersionRes(version="99")]
         if name == "ProtoOAAccountAuthReq":
@@ -158,8 +174,9 @@ class FakeOpenApi:
             sec = {MM.M1: 60, MM.H1: 3600}[m.period]
             start = m.fromTimestamp // 1000 // sec * sec
             bars = []
-            for t in range(start, m.toTimestamp // 1000, sec):
-                if t * 1000 < m.fromTimestamp:
+            closed = int(time.time()) // sec * sec          # the Open API: closed bars only
+            for t in range(start, min(m.toTimestamp // 1000, closed), sec):
+                if t * 1000 < m.fromTimestamp or self.no_bars:
                     continue
                 bars.append(MM.ProtoOATrendbar(volume=1, period=m.period, low=239_900_000,
                                                deltaOpen=5_000, deltaClose=10_000,
@@ -191,12 +208,17 @@ class FakeOpenApi:
                                 orderStatus=MM.ORDER_STATUS_ACCEPTED,
                                 clientOrderId=m.clientOrderId,
                                 utcLastUpdateTimestamp=self.now_ms)
-        if m.volume == self.reject_volume:
+        if m.volume == self.reject_volume or (m.HasField("positionId")
+                                              and m.positionId in self.fail_close):
             return [M.ProtoOAOrderErrorEvent(ctidTraderAccountId=ACCOUNT,
-                                             errorCode="NOT_ENOUGH_MONEY",
-                                             description="no money")]
+                                             errorCode=self.reject_code,
+                                             description="refused")]
         accepted = M.ProtoOAExecutionEvent(ctidTraderAccountId=ACCOUNT,
                                            executionType=MM.ORDER_ACCEPTED, order=order)
+        if m.volume == self.cancel_volume:
+            return [accepted, M.ProtoOAExecutionEvent(ctidTraderAccountId=ACCOUNT,
+                                                      executionType=MM.ORDER_CANCELLED,
+                                                      order=order)]
         px = self.ask if m.tradeSide == MM.BUY else self.bid
         self.now_ms += 1000
         pid = m.positionId if m.HasField("positionId") else next(self.ids)
@@ -307,6 +329,41 @@ class BackendTest(unittest.TestCase):
         with self.assertRaises(ValueError):               # below the 0.01 lot minimum
             self.be.place_order("XAUUSD", OrderSide.BUY, 0.001, magic=77)
 
+    def test_nothing_filled_never_returns(self):
+        # a returned market order is booked as DONE by the engine (send_split):
+        # one cancelled with nothing filled must raise, never return empty
+        self.srv.cancel_volume = 300
+        with self.assertRaises(RuntimeError) as e:
+            self.be.place_order("XAUUSD", OrderSide.BUY, 0.03, magic=77)
+        self.assertIn("not filled (ORDER_CANCELLED)", str(e.exception))
+        self.assertEqual(self.be.get_positions(), [])
+
+    def test_a_permanent_refusal_carries_the_retcode_the_engine_holds(self):
+        from atjte.engines.common.hedge_orders import permanent_retcode
+        self.srv.reject_volume, self.srv.reject_code = 300, "TRADING_BAD_VOLUME"
+        with self.assertRaises(RuntimeError) as e:
+            self.be.place_order("XAUUSD", OrderSide.BUY, 0.03, magic=77)
+        self.assertEqual(permanent_retcode(e.exception), 10014)
+        self.srv.reject_code = "NOT_ENOUGH_MONEY"          # margin moves: not held
+        with self.assertRaises(RuntimeError) as e:
+            self.be.place_order("XAUUSD", OrderSide.BUY, 0.03, magic=77)
+        self.assertIsNone(permanent_retcode(e.exception))
+
+    def test_a_failed_later_leg_keeps_what_filled(self):
+        self.be.place_order("XAUUSD", OrderSide.SELL, 0.01, magic=77)
+        self.be.place_order("XAUUSD", OrderSide.SELL, 0.02, magic=77)
+        second = max(self.srv.positions)
+        self.srv.fail_close = {second}
+        o = self.be.place_order("XAUUSD", OrderSide.BUY, 0.03, magic=77)
+        self.assertEqual((o.filled, o.status), (0.01, OrderStatus.PARTIALLY_FILLED))
+        self.assertIn("refused", o.raw["error"])
+        self.assertEqual([(p.side, p.size) for p in self.be.get_positions()],
+                         [(PositionSide.SHORT, 0.02)])
+        self.srv.fail_close = set()
+
+    def test_the_account_mode_in_mt5_terms(self):
+        self.assertEqual(self.be.get_account().raw["margin_mode"], 2)     # HEDGED
+
     def test_deals_carry_their_orders_magic(self):
         self.be.place_order("XAUUSD", OrderSide.BUY, 0.05, magic=77)
         self.be.place_order("XAUUSD", OrderSide.SELL, 0.05, magic=77)
@@ -341,7 +398,14 @@ class BackendTest(unittest.TestCase):
         r = rows[0]
         self.assertEqual((r["low"], r["open"], r["close"], r["high"], r["spread"]),
                          (2399.0, 2399.05, 2399.1, 2399.2, 30))
+        # the forming H1 bar is never served: its open is the first M1 bar's
         self.assertEqual(self.be.bar_open("XAUUSD", "H1"), 2399.05)
+
+    def test_bar_open_in_the_bars_first_minute_is_the_bid(self):
+        self.srv.no_bars = True                           # no closed sub-bar yet
+        self.assertEqual(self.be.bar_open("XAUUSD", "H1"), 2400.10)
+        with self.assertRaises(ValueError):
+            self.be.bar_open("XAUUSD", "H7")
 
     def test_health_follows_the_session(self):
         self.assertTrue(self.be.health()["ok"])
@@ -373,6 +437,174 @@ class TokenTest(unittest.TestCase):
             self.assertTrue(be.health()["ok"])
         finally:
             be.disconnect()
+            srv.drop()
+
+
+class _Flaky:
+    """A socket that answers "try again" now and then, as the TLS socket the
+    reader thread shares does on Windows (WSAEWOULDBLOCK 10035)."""
+
+    def __init__(self, sock):
+        self.s, self.n = sock, 0
+
+    def _maybe(self):
+        self.n += 1
+        if self.n % 3 == 0:
+            e = OSError(errno.EWOULDBLOCK, "A non-blocking socket operation could not be "
+                        "completed immediately")
+            e.winerror = 10035
+            raise e
+        if self.n % 5 == 0:
+            raise BlockingIOError(errno.EAGAIN, "try again")
+
+    def recv(self, n):
+        self._maybe()
+        return self.s.recv(n)
+
+    def send(self, data):
+        self._maybe()
+        return self.s.send(data[:7])          # partial writes too
+
+    def __getattr__(self, k):
+        return getattr(self.s, k)
+
+
+class WouldBlockTest(unittest.TestCase):
+    def test_try_again_is_not_a_lost_connection(self):
+        srv = FakeOpenApi()
+        lost = []
+        be = B.CTraderBackend(
+            client_id="app", client_secret="secret", access_token="good", account_id=ACCOUNT,
+            transport_factory=lambda **k: T.Transport(
+                "fake", 0, sock_factory=lambda: _Flaky(srv.connect()), **k),
+            log=lambda m: lost.append(m) if "lost" in m else None, timeout_s=3.0)
+        try:
+            be.connect()                              # app auth, account, symbols, trader
+            for _ in range(20):
+                self.assertEqual(be.get_symbol_specs("XAUUSD")["contract_size"], 100.0)
+                be.get_account()
+            self.assertTrue(be.health()["ok"])
+            self.assertEqual(lost, [])
+        finally:
+            be.disconnect()
+            srv.drop()
+
+    def test_a_real_socket_error_still_drops(self):
+        e = OSError(errno.ECONNRESET, "reset")
+        self.assertFalse(T._would_block(e))
+        w = OSError(errno.EWOULDBLOCK, "busy")
+        self.assertTrue(T._would_block(w))
+
+
+class AccountModeGatewayTest(unittest.TestCase):
+    """The gateway's netting guard and close-first path read the account's
+    mode: off on cTrader before (no margin_mode), so two bots on one symbol
+    of a NETTED account re-hedged on top of each other."""
+
+    def _gw(self, account_type):
+        self.srv = FakeOpenApi(account_type=account_type)
+        self.be, _ = make_backend(self.srv)
+        self.gw = CTraderGateway(self.be, port=0, token=TOKEN, tick_poll_s=0.01)
+        self.gw.start()
+        self.addCleanup(self.srv.drop)
+        self.addCleanup(self.be.disconnect)
+        self.addCleanup(self.gw.stop)
+
+    def _client(self, magic, name):
+        c = CTraderGatewayClient(magic=magic, client_name=name, gateway_port=self.gw.port,
+                                 gateway_token=TOKEN)
+        c.connect()
+        self.addCleanup(c.disconnect)
+        return c
+
+    def test_a_netted_account_takes_one_bot_per_symbol(self):
+        self._gw(MM.NETTED)
+        self.assertEqual(self.be.get_account().raw["margin_mode"], 0)
+        a, b = self._client(1001, "bot_a"), self._client(1002, "bot_b")
+        a.place_order("XAUUSD", OrderSide.SELL, 0.02, OrderType.MARKET)
+        with self.assertRaises(Exception) as e:
+            b.place_order("XAUUSD", OrderSide.BUY, 0.02, OrderType.MARKET)
+        self.assertIn("NETTING", str(e.exception))
+        self.assertEqual(len(self.srv.positions), 1)              # b sent nothing
+
+    def test_a_hedged_account_closes_the_callers_tickets_first(self):
+        self._gw(MM.HEDGED)
+        c = self._client(1001, "bot_a")
+        c.place_order("XAUUSD", OrderSide.SELL, 0.02, OrderType.MARKET)
+        o = c.place_order("XAUUSD", OrderSide.BUY, 0.03, OrderType.MARKET)
+        self.assertEqual(o.filled, 0.03)
+        self.assertEqual(len(o.raw["closed_tickets"]), 1)
+        self.assertEqual([(p.side, p.size) for p in c.get_positions("XAUUSD")],
+                         [(PositionSide.LONG, 0.01)])
+
+    def test_a_ticket_that_will_not_close_keeps_the_partial(self):
+        # the gateway's close-first (shared with MT5 and the IBKR hedge): a
+        # later ticket refused reports what closed, never raises it away
+        self._gw(MM.HEDGED)
+        c = self._client(1001, "bot_a")
+        c.place_order("XAUUSD", OrderSide.SELL, 0.01, OrderType.MARKET)
+        c.place_order("XAUUSD", OrderSide.SELL, 0.02, OrderType.MARKET)
+        self.srv.fail_close = {max(self.srv.positions)}
+        o = c.place_order("XAUUSD", OrderSide.BUY, 0.03, OrderType.MARKET)
+        self.assertEqual(o.filled, 0.01)
+        self.assertEqual([(p.side, p.size) for p in c.get_positions("XAUUSD")],
+                         [(PositionSide.SHORT, 0.02)])
+
+
+class TokenReasonTest(unittest.TestCase):
+    """What the operator must do is the session's reason (and so the
+    alert's) when the token cannot be fixed by the gateway."""
+
+    def _refused(self, refresh, refresh_ok=True):
+        srv = FakeOpenApi(access="good")
+        if not refresh_ok:
+            orig = srv.handle
+
+            def handle(m):
+                if type(m).__name__ == "ProtoOARefreshTokenReq":
+                    return [M.ProtoOAErrorRes(errorCode="CH_ACCESS_TOKEN_INVALID",
+                                              description="refresh token spent")]
+                return orig(m)
+            srv.handle = handle
+        be = B.CTraderBackend(
+            client_id="app", client_secret="secret", access_token="old",
+            refresh_token=refresh, account_id=ACCOUNT,
+            transport_factory=lambda **k: T.Transport("fake", 0, sock_factory=srv.connect, **k),
+            timeout_s=3.0)
+        try:
+            with self.assertRaises(ConnectionError):
+                be.connect()
+            return be.health()["reasons"][0]
+        finally:
+            be.disconnect()
+            srv.drop()
+
+    def test_no_refresh_token_says_issue_a_new_one(self):
+        why = self._refused("")
+        self.assertIn("no refresh token", why)
+        self.assertIn("gateway's Settings", why)
+
+    def test_a_refused_refresh_token_says_issue_a_new_pair(self):
+        why = self._refused("r1", refresh_ok=False)
+        self.assertIn("refresh token was refused", why)
+        self.assertIn("new token pair", why)
+
+
+class TokenAccountsTest(unittest.TestCase):
+    def test_the_token_lists_its_accounts_by_ctid_not_login(self):
+        srv = FakeOpenApi(access="good")
+        fac = lambda **k: T.Transport("fake", 0, sock_factory=srv.connect, **k)  # noqa: E731
+        try:
+            accts = B.token_accounts(client_id="app", client_secret="secret",
+                                     access_token="good", timeout_s=3.0,
+                                     transport_factory=fac)
+            self.assertEqual(accts, [
+                {"account_id": ACCOUNT, "live": False, "login": 5551234},
+                {"account_id": ACCOUNT + 1, "live": True, "login": 7770001}])
+            with self.assertRaises(T.ApiError):
+                B.token_accounts(client_id="app", client_secret="secret",
+                                 access_token="old", timeout_s=3.0, transport_factory=fac)
+        finally:
             srv.drop()
 
 

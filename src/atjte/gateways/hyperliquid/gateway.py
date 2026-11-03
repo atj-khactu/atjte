@@ -434,6 +434,16 @@ class HlGateway:
             refuse(f"unknown account {account!r} — this gateway trades "
                    f"{', '.join(self.up.accounts()) or 'no account'}")
             return None
+        # an upstream that loads instruments on demand (EXANTE): the bot's own
+        # instrument is loaded here, before it is accepted — or it is refused
+        # with why, never attached to a market the gateway does not have
+        ensure = getattr(self.up, "ensure_symbol", None)
+        if callable(ensure):
+            try:
+                ensure(symbol)
+            except Exception as e:              # noqa: BLE001
+                refuse(f"{symbol}: {e}")
+                return None
         readonly = bool(msg.get("readonly"))
         with self._lock:
             if name in self._clients:

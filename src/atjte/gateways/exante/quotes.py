@@ -24,6 +24,11 @@ Liveness, per contract: the lease is up, the Databento gateway's live
 session spoke lately (``quotes_ok`` — heartbeats count, so a quiet book is
 not a dead one), the dataset is ``GLBX.MDP3``, and Databento did not refuse
 the symbol.
+
+Candles (a bot's chart history) come from the same lease: 1 m MID bars,
+the Databento gateway's free live buffer first and the part before it from
+Databento's historical API when a fetch is quoted at no more than
+:data:`HISTORY_MAX_COST_USD` (EXANTE's own OHLC is allowed once a minute).
 """
 from __future__ import annotations
 
@@ -37,6 +42,9 @@ CME_GROUP = frozenset({"CME", "CBOT", "NYMEX", "COMEX"})
 DATASET = "GLBX.MDP3"
 #: the lease's ping interval is a third of this (the session refresh)
 LEASE_DMS_S = 15.0
+#: the most one automatic candle fetch may cost (Databento bills historical
+#: data per request); a dearer one is skipped by the Databento gateway
+HISTORY_MAX_COST_USD = 0.05
 _EXPIRY_RE = re.compile(r"^([FGHJKMNQUVXZ])(\d{4})$")
 
 
@@ -112,6 +120,15 @@ class DatabentoQuotes:
         except Exception:                                   # noqa: BLE001  (not connected yet)
             pass
 
+    def ohlcv(self, db_symbol: str, timeframe: str, since=None, limit=None) -> list:
+        """``db_symbol``'s mid candles, CCXT rows: the Databento gateway's
+        live buffer, filled before it at most :data:`HISTORY_MAX_COST_USD`."""
+        rows = self.lease.read("fetch_ohlcv", symbol=db_symbol, timeframe=timeframe,
+                               since=since, limit=limit,
+                               params={"price": "mid",
+                                       "max_cost_usd": HISTORY_MAX_COST_USD})
+        return list(rows or [])
+
     def _ticker(self, t: dict) -> None:
         sym = str(t.get("symbol") or "")
         fn = self._on_ticker
@@ -155,4 +172,4 @@ def _default_lease(*, client, host, port, token, on_ticker, log):
     from atjte.gateways.hyperliquid.client import HlGatewayClient
     return HlGatewayClient(client, "", "", host=host, port=port, token=token,
                            dms_s=LEASE_DMS_S, on_ticker=on_ticker, log=log,
-                           readonly=True)
+                           readonly=True, request_timeout_s=20.0)

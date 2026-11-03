@@ -20,6 +20,7 @@ import signal
 import sys
 import threading
 import time
+from typing import Optional
 
 from atjte.gateways.hyperliquid.daemon import stop_requested, write_state
 
@@ -41,6 +42,27 @@ def write_markets(folder, network: str, up) -> None:
     tmp.write_text(json.dumps({"t": time.time(), "network": network,
                                "markets": up.market_rows()}, indent=1), encoding="utf-8")
     replace_retrying(tmp, folder / C.MARKETS_NAME)
+
+
+def remembered_symbols(folder, network: str, now: Optional[float] = None) -> list[str]:
+    """The EXANTE ids ``markets.json`` holds from an earlier run — the
+    instruments the bots loaded on demand — so a restart lists them before
+    any bot attaches (the account's positions and orders in them read at
+    once). An expired contract and another network's file are left out."""
+    now = time.time() if now is None else now
+    try:
+        raw = json.loads((folder / C.MARKETS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if raw.get("network") != network:
+        return []
+    from .upstream import _iso_ms               # EXANTE's expiration: ms, or ISO text
+    out = []
+    for r in raw.get("markets") or []:
+        sid, exp = r.get("venue_name"), _iso_ms(r.get("expiry"))
+        if sid and (exp is None or exp / 1000.0 > now):
+            out.append(str(sid))
+    return out
 
 
 def check_rest(cfg: C.GatewayConfig, out=print) -> int:
@@ -145,7 +167,7 @@ def main(argv=None) -> int:
 
     from atjte.gateways.hyperliquid import cloid as CL
 
-    from .gateway import ExanteGateway
+    from .gateway import RATE_LIMIT_PAUSE_S, ExanteGateway
     from .upstream import ExanteUpstream
 
     stop = threading.Event()
@@ -170,18 +192,22 @@ def main(argv=None) -> int:
     if quotes is not None and not cfg.quote_token:
         log(f"WARNING: no {C.DB_TOKEN_NAME} in {C.ENV_NAME} — the Databento gateway "
             f"{cfg.quote_gateway} refuses the quote lease if it has a token")
+    # the configured instruments, plus those the bots loaded on an earlier run
+    symbols = list(dict.fromkeys(cfg.symbols + remembered_symbols(cfg.dir, cfg.network)))
     up = ExanteUpstream(
-        network=cfg.network, account_id=account, symbols=cfg.symbols, rest=rest,
+        network=cfg.network, account_id=account, symbols=symbols, rest=rest,
         fix_host=cfg.fix_host,
         feed={"sender": ids["feed"][0], "target": ids["feed"][1],
               "password": cfg.feed_password, "port": cfg.feed_port},
         trade={"sender": ids["trade"][0], "target": ids["trade"][1],
                "password": cfg.trade_password, "port": cfg.trade_port},
         depth=cfg.depth, tif=C.TIFS[cfg.tif], heartbeat_s=cfg.heartbeat_s,
-        quotes=quotes, quote_symbols=cfg.quote_symbols, log=log)
+        quotes=quotes, quote_symbols=cfg.quote_symbols, ca_file=cfg.fix_ca_file, log=log)
+    up.on_markets = lambda: write_markets(cfg.dir, cfg.network, up)
     log(f"{cfg.name}: {cfg.network.upper()} — account {account}, FIX {cfg.fix_host} "
         f"(TRADE {ids['trade'][0]}, FEED {ids['feed'][0]}), "
-        f"{len(cfg.symbols)} instrument(s)"
+        + (f"{len(symbols)} instrument(s)" if symbols else
+           "no instrument yet — each bot's is loaded when it attaches")
         + (f"; CME futures priced from the Databento gateway {cfg.quote_gateway} "
            f"(port {quotes.port})" if quotes is not None else ""))
     try:
@@ -199,6 +225,10 @@ def main(argv=None) -> int:
                        allowed_clients=set(cfg.clients), msgs_per_min=cfg.msgs_per_min,
                        max_inflight=cfg.max_inflight, network=cfg.network, log=log)
     gw.start()
+    if cfg.msgs_per_min > C.EXANTE_MSGS_PER_MIN:
+        log(f"{cfg.name}: order budget {cfg.msgs_per_min:g} / min is above EXANTE's published "
+            f"{C.EXANTE_MSGS_PER_MIN:g} (25 per 10 s) — a rate-limit refusal pauses new "
+            f"orders and amends {RATE_LIMIT_PAUSE_S:g} s")
     from atjte.gateways.accounts import AccountPublisher
     accounts = AccountPublisher(cfg.dir, gw.account_snapshot, name=cfg.name, venue="exante",
                                 every_s=cfg.accounts_every_s,

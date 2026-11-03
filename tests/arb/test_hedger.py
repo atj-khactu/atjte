@@ -61,13 +61,13 @@ def wait_for(cond, timeout=2.0):
 
 
 class EventHedgerTest(unittest.TestCase):
-    def hedger(self, mt5, live=True, to_units=lambda c: c, volume_max=0.0):
+    def hedger(self, mt5, live=True, to_units=lambda c: c, volume_max=0.0, clock=time.time):
         results, failures, logs = [], [], []
         h = EventHedger(place=mt5.place, symbol_venue="XAUT/USD:USD", to_units=to_units,
                         contract_size=100.0, volume_step=0.01, volume_min=0.01,
                         threshold_units=1.0, live=live, volume_max=volume_max, started_utc=NOW - timedelta(seconds=5),
                         on_result=lambda *a: results.append(a),
-                        on_failure=failures.append, log=logs.append)
+                        on_failure=failures.append, log=logs.append, clock=clock)
         h.start()
         self.addCleanup(h.stop)
         return h, results, failures, logs
@@ -86,6 +86,37 @@ class EventHedgerTest(unittest.TestCase):
         self.assertEqual(h.counters["hedges"], 1)
         self.assertAlmostEqual(h.residue_units, 0.0)
         self.assertTrue(any("HEDGE (event) sell 0.04 lot" in l for l in logs), logs)
+
+    def test_each_hedge_logs_its_timing_hop_by_hop(self):
+        mt5 = FakeMt5()
+        h, _r, _f, logs = self.hedger(mt5)
+        tr = fill("t-timing", "buy", 4.0)
+        tr.raw = {"gw_rx_ms": time.time() * 1000}           # the venue gateway's stamp
+        h.submit(tr)
+        self.assertTrue(wait_for(lambda: any(l.startswith("HEDGE TIMING") for l in logs)), logs)
+        line = next(l for l in logs if l.startswith("HEDGE TIMING"))
+        self.assertIn("t-timing", line)
+        self.assertIn("fill received -> hedge confirmed", line)
+        self.assertNotIn("bot +?", line)                    # the hedger's own hop is known
+        self.assertEqual(h._rx_t, {})                       # consumed, nothing kept
+
+    def test_the_timing_line_reads_every_hop(self):
+        from atjte.engines.arb.hedger import timing_line
+        t = datetime(2026, 11, 2, 13, 40, 30, 991000, tzinfo=timezone.utc)
+        base = t.timestamp()
+        tr = Trade(exchange="exante", trade_id="2a2b6a70@1", symbol="MGC", side=OrderSide.BUY,
+                   amount=1.0, price=3940.1, timestamp=t,
+                   raw={"gw_rx_ms": (base + 0.045) * 1000})
+        order = type("O", (), {"raw": {"gw_ms": {"in": (base + 0.060) * 1000,
+                                                 "out": (base + 0.320) * 1000}}})()
+        line = timing_line(tr, base + 0.047, base + 0.050, base + 0.325, order)
+        self.assertIn("venue fill 13:40:30.991", line)
+        for part in ("venue gateway +45 ms", "bot +2", "MT5 order out +3", "MT5 gateway +10",
+                     "terminal + broker 260", "back +5", "hedge confirmed 280 ms"):
+            self.assertIn(part, line)
+        bare = timing_line(fill("x", "buy", 1.0), None, base, base + 0.1, None)
+        self.assertIn("venue gateway +? ms", bare)          # no stamps: "?", never a crash
+        self.assertIn("terminal + broker ?", bare)
 
     def test_a_whole_lot_reached_by_float_sums_is_hedged(self):
         """PAXG perp 2026-10-15 02:20: a 0.227 residue plus fills summed in
@@ -167,7 +198,9 @@ class EventHedgerTest(unittest.TestCase):
         # a reconciler hedge (it sent +1.0 units on MT5) is relative
         h.parity_sent(1.0, "reconcile hedge")
         self.assertTrue(wait_for(lambda: h.counters["parity_sent"] == 1))
-        self.assertAlmostEqual(h.residue_units, -0.489)
+        # it pays the 0.511 owed that way now; 0.489 waits as a credit
+        self.assertAlmostEqual(h.residue_units, 0.0)
+        self.assertAlmostEqual(h.credit_units, 0.489)
         # ...so a fill that arrives late for that same drift adds it back
         h.submit(fill("t2", "sell", 1.0))
         self.assertTrue(wait_for(lambda: h.counters["residue_holds"] >= 1))
@@ -240,6 +273,49 @@ class EventHedgerTest(unittest.TestCase):
         # the reconciler sends the rest by parity: the residue lands on zero
         h.parity_sent(-150.0, "reconcile hedge")
         self.assertTrue(wait_for(lambda: abs(h.residue_units) < 1e-9))
+
+    def test_a_reconciler_correction_is_never_sent_back_by_the_next_fill(self):
+        """2026-11-01 22:05 UTC, HL + IC cTrader EURUSD (scaled here to a
+        100-unit lot): an event hedge the broker cancelled was booked as
+        filled, so the reconciler sold the lot MT5 still owed. The relative
+        hand-off swung the residue +0.7739 -> +3.7739 and the next 0.0221
+        fill bought 0.03 lot straight back, every reconcile cycle, across a
+        20-pip spread. A credit sent the other way is never sent back."""
+        mt5 = FakeMt5()
+        clock = [1000.0]
+        h, _r, failures, logs = self.hedger(mt5, clock=lambda: clock[0])
+        h.rebase(0.7739, "startup parity")
+        h.parity_sent(-3.0, "reconcile hedge")          # MT5 sold 0.03 lot
+        self.assertTrue(wait_for(lambda: h.counters["parity_sent"] == 1))
+        self.assertAlmostEqual(h.residue_units, 0.7739)  # not +3.7739
+        self.assertAlmostEqual(h.credit_units, -3.0)
+        h.submit(fill("t1", "buy", 0.0221))
+        self.assertTrue(wait_for(lambda: h.counters["residue_holds"] == 1))
+        self.assertEqual(mt5.orders, [])                 # nothing bought back
+        self.assertAlmostEqual(h.residue_units, 0.7518)
+        # unclaimed for CREDIT_TTL_S: dropped, and the hedger hedges normally
+        clock[0] += 61.0
+        h.submit(fill("t2", "buy", 2.0))                 # MT5 owes a sell: 0.7518 - 2
+        self.assertTrue(wait_for(lambda: mt5.orders))
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.01)])
+        self.assertEqual(h.counters["credits_expired"], 1)
+        self.assertAlmostEqual(h.credit_units, 0.0)
+        self.assertEqual(failures, [])
+
+    def test_a_credit_pays_the_late_fill_it_went_out_ahead_of(self):
+        """The case the hand-off exists for: the socket missed a fill, the
+        reconciler hedged it, and the REST poll delivers it afterwards. It
+        is claimed by the credit, never hedged a second time."""
+        mt5 = FakeMt5()
+        h, _r, _f, _l = self.hedger(mt5)
+        h.parity_sent(-2.0, "reconcile hedge")          # sold for a buy not seen yet
+        self.assertTrue(wait_for(lambda: h.counters["parity_sent"] == 1))
+        self.assertAlmostEqual(h.residue_units, 0.0)
+        h.submit(fill("late", "buy", 2.0))
+        self.assertTrue(wait_for(lambda: h.counters["residue_holds"] == 1))
+        self.assertEqual(mt5.orders, [])
+        self.assertAlmostEqual(h.residue_units, 0.0)
+        self.assertAlmostEqual(h.credit_units, 0.0)
 
     def test_dry_run_sends_nothing_but_says_what_it_would(self):
         mt5 = FakeMt5()

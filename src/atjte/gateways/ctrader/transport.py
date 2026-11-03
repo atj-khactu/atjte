@@ -16,6 +16,7 @@ Sends are immediate, serialized by one lock.
 """
 from __future__ import annotations
 
+import errno
 import itertools
 import socket
 import ssl
@@ -91,6 +92,17 @@ def decode(body: bytes) -> tuple[Any, str]:
     payload = cls()
     payload.ParseFromString(pm.payload)
     return payload, pm.clientMsgId
+
+
+#: "try again" from a socket — not a dead connection (Windows WSAEWOULDBLOCK
+#: 10035, POSIX EAGAIN / EWOULDBLOCK)
+_WOULD_BLOCK_WINERRORS = {10035}
+_WOULD_BLOCK_ERRNOS = {errno.EAGAIN, errno.EWOULDBLOCK}
+
+
+def _would_block(e: OSError) -> bool:
+    return (getattr(e, "winerror", None) in _WOULD_BLOCK_WINERRORS
+            or e.errno in _WOULD_BLOCK_ERRNOS)
 
 
 class Transport:
@@ -169,10 +181,33 @@ class Transport:
         data = encode(msg, client_msg_id)
         try:
             with self._send_lock:
-                self._sock.sendall(data)
+                self._send_all(data)
         except OSError as e:
             self._drop(f"send failed: {e}")
             raise ConnectionError(f"cTrader Open API send failed: {e}") from e
+
+    def _send_all(self, data: bytes) -> None:
+        """``sendall`` that survives "would block": the reader thread shares
+        the TLS socket (1 s timeout), and on Windows a write can then answer
+        WSAEWOULDBLOCK (10035) — try again, never read as a dead connection.
+        The bytes already sent are not sent twice."""
+        view, deadline = memoryview(data), time.time() + self.timeout_s
+        while view:
+            try:
+                n = self._sock.send(view)
+            except (socket.timeout, TimeoutError, ssl.SSLWantWriteError,
+                    ssl.SSLWantReadError, BlockingIOError) as e:
+                n = 0
+                if time.time() > deadline:
+                    raise OSError(f"send stalled for {self.timeout_s:g}s ({e})") from e
+            except OSError as e:
+                if not _would_block(e) or time.time() > deadline:
+                    raise
+                n = 0
+            if n:
+                view = view[n:]
+            else:
+                time.sleep(0.001)
 
     def request(self, msg: Any, timeout_s: Optional[float] = None) -> Any:
         """Send ``msg`` and return the payload the server answers it with;
@@ -204,10 +239,14 @@ class Transport:
                 return None
             try:
                 chunk = self._sock.recv(n - len(buf))
-            except (socket.timeout, TimeoutError):
+            except (socket.timeout, TimeoutError, ssl.SSLWantReadError,
+                    ssl.SSLWantWriteError, BlockingIOError):
                 continue
-            except ssl.SSLWantReadError:
-                continue
+            except OSError as e:
+                if _would_block(e):         # Windows 10035 on the shared TLS socket
+                    time.sleep(0.001)
+                    continue
+                raise
             if not chunk:
                 raise ConnectionError("the server closed the connection")
             buf += chunk

@@ -139,8 +139,9 @@ def send_split(place: Callable[[Any, float], Any], side: Any, lots: float,
                volume_min: float = 0.0) -> SplitResult:
     """Send ``lots`` through ``place(side, chunk)`` as :func:`split_lots`
     sizes, in order. An order is counted at its reported fill (``filled``
-    when the client reports one, else the size sent, as a market order that
-    returns is done); a refusal, or an order filled short, ends the sequence
+    when the client reports one — 0 included —, else, when it reports none
+    at all, the size sent, as a market order that returns is done); a
+    refusal, or an order filled short (or not at all), ends the sequence
     with ``error`` set. :class:`HedgeTooLarge` is raised before any order."""
     chunks = split_lots(lots, volume_max, volume_step, volume_min)
     res = SplitResult(requested_lots=round(float(lots), 8), chunks=chunks)
@@ -150,8 +151,12 @@ def send_split(place: Callable[[Any, float], Any], side: Any, lots: float,
         except Exception as e:                              # noqa: BLE001
             res.error = e
             break
+        # only a client that reports NO fill figure is taken at the size it
+        # was sent; an explicit 0 is nothing filled (a cTrader market order
+        # ended ORDER_CANCELLED came back filled=0.0 and was booked whole:
+        # a phantom hedge, 2026-11-01, IC EURUSD)
         f = getattr(o, "filled", None)
-        got = float(f) if f else chunk
+        got = chunk if f is None else max(float(f), 0.0)
         got = min(got, chunk)
         res.filled_lots = round(res.filled_lots + got, 8)
         res.orders.append((got, o))

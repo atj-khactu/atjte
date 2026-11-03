@@ -74,6 +74,18 @@ class SendSplitTest(unittest.TestCase):
         self.assertAlmostEqual(res.filled_lots, 150.0)
         self.assertIsNotNone(res.error)
 
+    def test_an_explicit_zero_fill_is_nothing_filled(self):
+        """2026-11-01: a cTrader market order ended ORDER_CANCELLED came back
+        filled=0.0 and was counted whole (``float(f) if f else chunk``)."""
+        place = lambda side, lots: types.SimpleNamespace(order_id="", filled=0.0, raw={})
+        res = ho.send_split(place, "sell", 0.01, 0.0, 0.01)
+        self.assertEqual(res.filled_lots, 0.0)
+        self.assertFalse(res.complete)
+        self.assertIn("filled 0 of", str(res.error))
+        # a client that reports no fill figure at all is still taken at its size
+        place = lambda side, lots: types.SimpleNamespace(order_id="T1", raw={})
+        self.assertTrue(ho.send_split(place, "sell", 0.01, 0.0, 0.01).complete)
+
     def test_a_refusal_of_the_first_order_fills_nothing(self):
         place, sent = self._place(refuse_at=0)
         res = ho.send_split(place, "buy", 5.0, 100.0, 0.01)

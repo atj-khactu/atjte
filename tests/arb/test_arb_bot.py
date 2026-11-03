@@ -553,6 +553,65 @@ class SettleAfterAFailedCancelTest(unittest.TestCase):
         self.assertAlmostEqual(bot.counters["fills_booked_units"], 1.0)
 
 
+class MinOrderValueTest(unittest.TestCase):
+    """Hyperliquid refuses an order worth under $10 ("Order must have
+    minimum value of $10", 2026-11-03: grid-entry-S2 3.2 @ 1.1192 = $3.58).
+    Such an order is sent at the smallest size worth the minimum instead."""
+
+    def setUp(self):
+        self._live = (pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY,
+                      pb.REDUCE_ONLY_EXITS)
+        pb.LIVE_TRADING = True
+        pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY = None, 1.0
+
+    def tearDown(self):
+        (pb.LIVE_TRADING, pb.LEVERAGE, pb.PLACE_MARGIN_SAFETY,
+         pb.REDUCE_ONLY_EXITS) = self._live
+
+    def _bot(self, logs):
+        bot = make_bot(logs)
+        bot.venue = StubVenue(StubExchange())
+        bot.venue.cost_min, bot.venue.amount_step, bot.venue.amount_min = 10.0, 0.1, 0.1
+        return bot
+
+    def test_an_entry_under_the_minimum_value_is_lifted_to_it(self):
+        logs = []
+        bot = self._bot(logs)
+        bot._place("grid-entry-S2", {"side": "sell", "purpose": "entry", "level_index": 2,
+                                     "level": 0.002, "price": 1.1192, "amount": 3.2})
+        self.assertEqual(len(bot.venue.placed), 1)
+        units = bot.venue.placed[0]["units"]
+        self.assertAlmostEqual(units, 9.0)                   # 9 x 1.1192 = $10.07
+        self.assertGreaterEqual(units * 1.1192, 10.0)
+        self.assertAlmostEqual(bot.orders["grid-entry-S2"].amount, 9.0)
+        self.assertTrue(any("minimum order value" in m for m in logs))
+
+    def test_an_order_worth_enough_is_sent_unchanged(self):
+        bot = self._bot([])
+        bot._place("grid-entry-S1", {"side": "sell", "purpose": "entry", "level_index": 1,
+                                     "level": 0.001, "price": 1.1192, "amount": 10.0})
+        self.assertAlmostEqual(bot.venue.placed[0]["units"], 10.0)
+        bot.venue.cost_min = None                            # no minimum published
+        self.assertIsNone(bot._lift_to_min_value({"amount": 0.1, "price": 1.0}))
+
+    def test_a_lifted_exit_drops_reduce_only(self):
+        pb.REDUCE_ONLY_EXITS = True
+        bot = self._bot([])
+        bot._place("grid-exit-S1", {"side": "buy", "purpose": "exit", "level_index": 1,
+                                    "level": 0.0, "price": 1.1192, "amount": 2.0})
+        sent = bot.venue.placed[0]
+        self.assertAlmostEqual(sent["units"], 9.0)
+        self.assertNotIn("reduceOnly", sent["params"])
+
+    def test_a_lifted_order_resting_is_not_requoted_for_its_size(self):
+        bot = self._bot([])
+        t = {"side": "sell", "purpose": "entry", "level_index": 2, "level": 0.002,
+             "price": 1.1192, "amount": 3.2}
+        bot._place("grid-entry-S2", dict(t))
+        want = bot._lift_to_min_value(t) or t["amount"]
+        self.assertAlmostEqual(abs(bot.orders["grid-entry-S2"].remaining - want), 0.0)
+
+
 class NoOrderIdTest(unittest.TestCase):
     """A venue answer that names no order (CCXT's Hyperliquid
     ``create_order_ws`` with no status in the reply) was tracked as resting
@@ -852,6 +911,115 @@ class BookAdvancesVenuePositionTest(unittest.TestCase):
         bot.pos_units = -0.7
         self.assertAlmostEqual(bot._position_units(), -0.7)
         self.assertAlmostEqual(bot._venue_exposure_units(), -0.7)
+
+
+class PositionFaultGuardTest(unittest.TestCase):
+    """The position-fault guard (2026-11-02, EXANTE demo): the gateway read
+    every position as flat, so a second after each fill the bot took "flat",
+    re-quoted the same grid levels to +110 oz against a 30 oz cap, and the
+    parity check bought back a correct hedge. A read that contradicts this
+    bot's own fills is now held back, retried, and after
+    POSITION_FAULT_GRACE_S becomes a fault: entries stop, parity freezes."""
+
+    def _bot(self, logs=None):
+        bot = make_bot(logs if logs is not None else [])
+        bot.venue.amount_min = 10.0            # MGC: 1 contract = 10 oz; tolerance 5
+        bot.venue_pos_units = 0.0              # the last accepted read: flat
+        state = {"read": 0.0, "now": 1000.0}
+        bot.venue.read_position = lambda: setattr(bot.venue, "position_units", state["read"])
+        return bot, state
+
+    def _fill(self, bot, units=10.0, key="grid-entry-L1"):
+        rec = resting(key=key, side="buy", purpose="entry", amount=units)
+        rec.ws_cum = units
+        bot._book(rec, "ws")
+
+    def _read(self, bot, state):
+        with mock.patch.object(pb.time, "time", lambda: state["now"]):
+            bot._read_venue_position()
+
+    def test_the_exante_bug_cannot_walk_the_grid_past_its_fills(self):
+        # fill, wrong read, fill, wrong read, fill: the anchor the grid and
+        # its cap measure against follows the FILLS, never the broken read
+        logs = []
+        bot, state = self._bot(logs)
+        for i in range(3):
+            self._fill(bot, key=f"grid-entry-L{i + 1}")
+            state["now"] += 2.0
+            self._read(bot, state)                       # EXANTE says 0
+        self.assertAlmostEqual(bot._position_units(), 30.0)
+        self.assertTrue(any("keeping the fills' figure" in m for m in logs), logs)
+
+    def test_a_read_that_lags_and_catches_up_clears_quietly(self):
+        bot, state = self._bot()
+        self._fill(bot)
+        self._read(bot, state)                           # venue has not booked it yet
+        self.assertAlmostEqual(bot.venue_pos_units, 10.0)
+        self.assertTrue(bot._bal_dirty)                  # re-read on the next pass
+        state["read"], state["now"] = 10.0, 1002.0
+        self._read(bot, state)                           # caught up
+        self.assertIsNone(bot._pos_suspect_since)
+        self.assertIsNone(bot.pos_fault)
+        self.assertEqual(bot._fills_since_read, 0.0)
+
+    def test_a_read_that_stays_wrong_is_a_fault_that_gates_and_freezes(self):
+        logs = []
+        bot, state = self._bot(logs)
+        self._fill(bot)
+        self._read(bot, state)                           # suspect
+        self.assertIsNone(bot.pos_fault)
+        state["now"] += pb.POSITION_FAULT_GRACE_S + 1
+        self._read(bot, state)                           # still 0: FAULT
+        self.assertEqual((bot.pos_fault["read"], bot.pos_fault["expected"]), (0.0, 10.0))
+        self.assertTrue(any("POSITION FAULT" in m for m in logs), logs)
+        self.assertTrue(any("position fault" in r for r in bot.close_only_reasons))
+        # entries gated: only exits survive _desired_orders' gate
+        # parity frozen: a reconcile hedge sends nothing
+        sent = []
+        bot.mt5 = types.SimpleNamespace(place_order=lambda *a, **k: sent.append(a),
+                                        get_positions=lambda sym: [])
+        live, pb.LIVE_TRADING = pb.LIVE_TRADING, True
+        try:
+            bot._hedge(source="reconcile")
+        finally:
+            pb.LIVE_TRADING = live
+        self.assertEqual(sent, [])
+        self.assertTrue(any("FROZEN by the position fault" in m for m in logs), logs)
+        self.assertAlmostEqual(bot._position_units(), 10.0)   # quoting stays on the fills
+        # the heartbeat field the panel alerts on
+        self.assertEqual(bot.pos_fault["expected"], 10.0)
+        # a read that agrees clears it all
+        state["read"], state["now"] = 10.0, state["now"] + 2
+        self._read(bot, state)
+        self.assertIsNone(bot.pos_fault)
+        self.assertFalse(any("position fault" in r for r in bot.close_only_reasons))
+        self.assertTrue(any("position fault cleared" in m for m in logs), logs)
+
+    def test_a_move_with_no_fill_of_ours_is_taken_as_before(self):
+        # a liquidation / a manual trade: the venue's figure, as always — the
+        # parity check is what answers that
+        bot, state = self._bot()
+        bot.venue_pos_units = 30.0
+        bot._fills_since_read = 0.0
+        state["read"] = 0.0
+        self._read(bot, state)
+        self.assertAlmostEqual(bot.venue_pos_units, 0.0)
+        self.assertIsNone(bot._pos_suspect_since)
+
+    def test_the_first_read_is_always_taken(self):
+        bot, state = self._bot()
+        bot.venue_pos_units = None                       # nothing read yet (start)
+        state["read"] = 20.0
+        self._read(bot, state)
+        self.assertAlmostEqual(bot.venue_pos_units, 20.0)
+
+    def test_a_partly_filled_level_inside_the_tolerance_is_no_fault(self):
+        bot, state = self._bot()
+        self._fill(bot, units=10.0)
+        state["read"] = 6.0                              # 4 oz off: inside half a contract
+        self._read(bot, state)
+        self.assertAlmostEqual(bot.venue_pos_units, 6.0)
+        self.assertIsNone(bot._pos_suspect_since)
 
 
 class _RefFeed:
@@ -2700,6 +2868,24 @@ class BrokerMarginTest(unittest.TestCase):
         bot.venue.im_rate = 0.10
         bot.venue.client = types.SimpleNamespace()
         self.assertAlmostEqual(bot._entry_margin(1.0, 4093.0), 4093.0)
+
+    def test_a_margin_skip_is_logged_once_while_the_figures_move(self):
+        # was: one line per pass, the needed margin moving with every tick
+        bot = make_bot([])
+        bot.venue.im_rate = 0.10
+        bot.venue.client = types.SimpleNamespace()
+        bot.venue.available_margin = 100.0
+        bot._margin_read_error, bot._venue_margin_t, bot._bal_dirty = None, time.time(), False
+        bot._entry_pause_until = 0.0
+        orig = pb.LIVE_TRADING
+        pb.LIVE_TRADING = True
+        self.addCleanup(setattr, pb, "LIVE_TRADING", orig)
+        logged = []
+        with mock.patch.object(pb, "_log", logged.append):
+            for px in (4093.0, 4094.0, 4095.0):
+                t = {"amount": 1.0, "price": px, "purpose": "entry", "side": "buy"}
+                self.assertIsNone(bot._placeable_amount("grid-entry-L1", t))
+        self.assertEqual(len([m for m in logged if "skip grid-entry-L1" in m]), 1)
 
 
 class SamePlatformTest(unittest.TestCase):
@@ -5127,6 +5313,163 @@ class InferredFillThenVenueTradeTest(unittest.TestCase):
         bot._flush_inferred(time.time(), final=True)
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["amount"], 0.275)
+
+
+class ReconcileHaltTest(unittest.TestCase):
+    """MAX_RECONCILE_FIXES: the reconciler is the safety net, so fixes IN A
+    ROW mean the bot's own hedging is wrong (2026-11-01, HL + IC cTrader
+    EURUSD: the reconciler and the event hedger traded 0.03 lot back and
+    forth). Only fixes that TRADED count, a clean read resets the streak,
+    and a re-check waits for the event hedger to go quiet."""
+
+    def _bot(self, drift=3.0, trades=True):
+        logs = []
+        bot = make_bot(logs)
+        bot.hedger = None
+        bot.reconcile_fix_streak, bot.hedge_halt = 0, None
+        bot._recheck_defer_until = None
+        bot._next_check_at = 1e12
+        for k in ("reconcile_fixes", "hedges", "reconcile_checks"):
+            bot.counters[k] = 0
+        bot.drift = drift
+        bot._parity_drift_units = lambda: bot.drift
+        bot.hedges_sent = []
+
+        def hedge(source="fill"):
+            bot.hedges_sent.append(source)
+            if trades:
+                bot.counters["hedges"] += 1
+            bot.hedge_ok = trades
+        bot._hedge = hedge
+        bot._rebase_hedger_if_quiet = lambda *a: None
+        self._saved = (pb.RECONCILE_TOLERANCE_UNITS, pb.MAX_RECONCILE_FIXES)
+        pb.RECONCILE_TOLERANCE_UNITS, pb.MAX_RECONCILE_FIXES = 1.0, 3
+        self.addCleanup(lambda: setattr(pb, "RECONCILE_TOLERANCE_UNITS", self._saved[0]))
+        self.addCleanup(lambda: setattr(pb, "MAX_RECONCILE_FIXES", self._saved[1]))
+        return bot, logs
+
+    def _recheck(self, bot, t):
+        bot._recheck_at = t
+        bot._reconcile(t)
+
+    def test_three_fixes_in_a_row_halt_and_the_halt_outlasts_hedge_ok(self):
+        bot, logs = self._bot()
+        for t in (100.0, 200.0):
+            self._recheck(bot, t)
+        self.assertIsNone(bot.hedge_halt)
+        self._recheck(bot, 300.0)
+        self.assertIn("3 reconciler fixes in a row", bot.hedge_halt)
+        self.assertEqual(len(bot.hedges_sent), 3)              # the last fix stands
+        self.assertTrue(any("HEDGE HALTED" in m for m in logs), logs)
+        bot.hedge_ok = True                                    # a booked hedge, a clean read
+        self.assertFalse(bot.hedge_ok)                         # ...cannot lift it
+        self._recheck(bot, 400.0)
+        self.assertEqual(len(bot.hedges_sent), 3)              # halted: nothing more sent
+        bot.drift = 0.0
+        self._recheck(bot, 500.0)                              # even a clean read
+        self.assertFalse(bot.hedge_ok)
+
+    def test_a_clean_read_resets_the_streak(self):
+        bot, _l = self._bot()
+        self._recheck(bot, 100.0)
+        self._recheck(bot, 200.0)
+        bot.drift = 0.0
+        self._recheck(bot, 300.0)
+        self.assertEqual(bot.reconcile_fix_streak, 0)
+        bot.drift = 3.0
+        self._recheck(bot, 400.0)
+        self.assertEqual(bot.reconcile_fix_streak, 1)
+        self.assertIsNone(bot.hedge_halt)
+
+    def test_a_refused_fix_is_not_counted(self):
+        """No money / market closed: the broker's answer, not this bot's
+        hedging being wrong; quotes are already down for it."""
+        bot, _l = self._bot(trades=False)
+        for t in (100.0, 200.0, 300.0, 400.0):
+            self._recheck(bot, t)
+        self.assertEqual(len(bot.hedges_sent), 4)
+        self.assertEqual(bot.reconcile_fix_streak, 0)
+        self.assertIsNone(bot.hedge_halt)
+
+    def test_zero_is_off(self):
+        bot, _l = self._bot()
+        pb.MAX_RECONCILE_FIXES = 0
+        for t in (100.0, 200.0, 300.0, 400.0):
+            self._recheck(bot, t)
+        self.assertIsNone(bot.hedge_halt)
+
+    def test_a_recheck_waits_for_the_event_hedger_then_reads_anyway(self):
+        """A parity read while an event hedge is in flight hedges that fill
+        a second time (and the next re-check fixes it back): a double hedge,
+        and a streak on a healthy bot. Bounded: one more re-check delay."""
+        bot, _l = self._bot()
+        quiet = [False]
+        bot.hedger = types.SimpleNamespace(quiet=lambda now: quiet[0])
+        self._recheck(bot, 100.0)
+        self.assertEqual(bot.hedges_sent, [])                  # deferred
+        self.assertEqual(bot._recheck_at, 101.0)
+        quiet[0] = True
+        bot._reconcile(101.0)
+        self.assertEqual(bot.hedges_sent, ["reconcile"])
+        quiet[0] = False                                       # never quiet: bounded
+        self._recheck(bot, 200.0)
+        bot._reconcile(200.0 + pb.RECONCILE_RECHECK_DELAY_S)
+        self.assertEqual(len(bot.hedges_sent), 2)
+
+
+    def _fix_bot(self, volume_today, cap):
+        """The real _hedge: MT5 short 0.03 lot (3 units), the venue flat, so
+        the fix BUYS 0.03 lot = 3 units x 4000 = ~12,000 USD."""
+        logs = []
+        bot = make_bot(logs)
+        bot.hedger = None
+        bot.contract_size = 100.0
+        bot.volume_step = bot.volume_min = 0.01
+        bot.xau_bid, bot.xau_ask = 3999.0, 4000.0
+        book = [types.SimpleNamespace(raw={"magic": pb.MT5_MAGIC}, size=0.03,
+                                      side=pb.PositionSide.SHORT, entry_price=4000.0)]
+        sent = []
+
+        def place_order(sym, side, lots, kind, **k):
+            sent.append((side, lots))
+            book.clear()
+            return types.SimpleNamespace(order_id=9, raw={"price": 4000.0})
+        bot.mt5 = types.SimpleNamespace(get_positions=lambda sym: list(book),
+                                        place_order=place_order)
+        bot._read_venue_position = lambda: None
+        bot._settle_mt5_book = lambda now: setattr(bot, "_mt5_settle_until", 0.0)
+        bot.venue_pos_units = 0.0
+        bot.counters.setdefault("hedges", 0)
+        bot._roll_day()                         # today's book, so the volume stays
+        bot.day.mt5_volume_usd = volume_today
+        saved = (pb.MAX_DAILY_MT5_VOLUME_USD, pb.LIVE_TRADING)
+        pb.MAX_DAILY_MT5_VOLUME_USD, pb.LIVE_TRADING = cap, True
+        self.addCleanup(lambda: (setattr(pb, "MAX_DAILY_MT5_VOLUME_USD", saved[0]),
+                                 setattr(pb, "LIVE_TRADING", saved[1])))
+        return bot, logs, sent
+
+    def test_a_fix_past_the_days_hedge_volume_is_not_sent_and_halts(self):
+        bot, logs, sent = self._fix_bot(volume_today=45_000.0, cap=50_000.0)
+        bot._hedge(source="reconcile")
+        self.assertEqual(sent, [])
+        self.assertIn("MAX_DAILY_MT5_VOLUME_USD", bot.hedge_halt)
+        self.assertFalse(bot.hedge_ok)
+        self.assertTrue(any("HEDGE HALTED" in m and "NOT sent" in m for m in logs), logs)
+
+    def test_a_fix_within_the_days_hedge_volume_goes_out(self):
+        bot, _l, sent = self._fix_bot(volume_today=30_000.0, cap=50_000.0)
+        bot._hedge(source="reconcile")
+        self.assertEqual(sent, [(pb.OrderSide.BUY, 0.03)])
+        self.assertIsNone(bot.hedge_halt)
+        self.assertAlmostEqual(bot.day.mt5_volume_usd, 42_000.0)
+
+    def test_the_hedge_volume_cap_never_blocks_a_non_reconcile_hedge(self):
+        """Startup / parity hedges (and the event hedger, which does not go
+        through here) still hedge past the cap: close-only must unwind."""
+        bot, _l, sent = self._fix_bot(volume_today=45_000.0, cap=50_000.0)
+        bot._hedge(source="startup")
+        self.assertEqual(sent, [(pb.OrderSide.BUY, 0.03)])
+        self.assertIsNone(bot.hedge_halt)
 
 
 if __name__ == "__main__":

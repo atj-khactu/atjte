@@ -53,6 +53,11 @@ class ExanteGatewayClient(IbkrGatewayClient):
     supports_amend = True
     #: a fill is pushed without its fee; the commission follows over REST
     fees_follow_fills = True
+    #: the margin is EXANTE's per instrument (its specification's initial
+    #: margin): the engine's LEVERAGE is not applied — EXANTE has no such
+    #: call — and not used to judge an entry (LEVERAGE 1 asked the whole
+    #: notional of an MGC contract, 2026-11-02, and blocked every entry)
+    broker_margin = True
     venue_label = "EXANTE"
     GATEWAY_CLASS = _ExLease
     DEFAULT_GATEWAY_PORT = DEMO_LISTEN_PORT

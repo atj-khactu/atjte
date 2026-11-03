@@ -219,6 +219,18 @@ class HedgeTest(Case):
         self.assertEqual((sent["magic"], sent["deviation"], sent["comment"]),
                          (77011, 20, "hedge xyz"))
 
+    def test_a_hedge_comes_back_with_the_gateways_timing(self):
+        # the hedge timing line's MT5 hops: when the gateway took the order
+        # and when the terminal answered, through the wire to the bot
+        c = self.client()
+        before = time.time() * 1000
+        o = c.place_order("XAUUSD", OrderSide.SELL, 0.1, OrderType.MARKET)
+        after = time.time() * 1000
+        g = o.raw["gw_ms"]
+        self.assertLessEqual(before - 1, g["in"])
+        self.assertLessEqual(g["in"], g["out"])
+        self.assertLessEqual(g["out"], after + 1)
+
     def test_pending_orders_are_refused(self):
         c = self.client()
         with self.assertRaises(ccxt.InvalidOrder):
@@ -345,6 +357,52 @@ class HealthTest(Case):
         self.assertIn("Algo Trading", str(cm.exception))
         self.assertEqual(self.term.orders, [])
 
+    #: what the live terminal answers with the button off: on the broker's
+    #: server, prices live, only trading refused
+    ALGO_OFF_LIVE = {**ALGO_OFF, "connected": True, "account_trade_allowed": True,
+                     "expert_allowed": True, "login_ok": True}
+
+    def _algo_off(self, state):
+        c = self.client()
+        self.term.health_state = state
+        self.gw.check_health(force=True)
+        self.gw._push_states()
+        self.assertTrue(wait_for(lambda: not c.health()["ok"]))
+        return c
+
+    def test_prices_flow_while_algo_trading_is_off(self):
+        # a dry run reads the hedge leg's price with the button off (the
+        # HEDGE_RATIO check at start, the reports) — was "platform not answering"
+        c = self._algo_off(self.ALGO_OFF_LIVE)
+        self.assertTrue(c.wire.session["prices_ok"])
+        t = c.get_ticker("XAUUSD")
+        self.assertEqual((t.bid, t.ask), (1.14000, 1.14002))
+        self.assertFalse(c.health()["ok"])                 # the quote gate stays shut
+        with self.assertRaises(ConnectionError):           # and no hedge goes out
+            c.place_order("XAUUSD", OrderSide.BUY, 0.01, OrderType.MARKET)
+        self.assertEqual(self.term.orders, [])
+
+    def test_no_price_from_a_terminal_off_the_brokers_server(self):
+        c = self._algo_off({**self.ALGO_OFF_LIVE, "connected": False,
+                            "reasons": ["the terminal is not connected to the broker's server"]})
+        self.assertFalse(c.wire.session["prices_ok"])
+        with self.assertRaises(ConnectionError) as cm:
+            c.get_ticker("XAUUSD")
+        self.assertIn("not answering", str(cm.exception))
+
+    def test_no_price_from_a_terminal_that_does_not_answer(self):
+        self.term.reconnect = lambda: None                  # re-opening does not help
+        c = self._algo_off({"ok": False, "reachable": False, "reasons": ["no IPC"]})
+        self.assertFalse(c.wire.session["prices_ok"])
+        with self.assertRaises(ConnectionError):
+            c.get_ticker("XAUUSD")
+
+    def test_an_older_gateway_without_prices_ok_keeps_the_old_gate(self):
+        c = self._algo_off(self.ALGO_OFF_LIVE)
+        c.wire.session.pop("prices_ok")
+        with self.assertRaises(ConnectionError):
+            c.get_ticker("XAUUSD")
+
     def test_a_silent_terminal_is_reopened_and_recovers(self):
         self.term.health_state = {"ok": False, "reachable": False, "reasons": ["no IPC"]}
         self.gw._reconnect_t = -1e9
@@ -364,6 +422,33 @@ class HealthTest(Case):
         self.gw._health_t -= G.HEALTH_RETRY_S + 0.1         # 1 s later: asked again
         self.gw.check_health()
         self.assertEqual(len(calls), 3)
+
+
+class IconConfigTest(unittest.TestCase):
+    """The control panel's taskbar badge, set in gateway.json: cosmetic, so a
+    malformed value is ignored — it never stops a gateway that hedges."""
+
+    def test_parsed_and_normalised(self):
+        from atjte.gateways.mt5 import config as MC
+        self.assertEqual(MC.parse_icon({"icon_letter": " i ", "icon_colour": "#1565C0"}),
+                         ("I", "#1565c0"))
+        self.assertEqual(MC.parse_icon({}), ("", ""))
+        for bad in ({"icon_letter": "IC"}, {"icon_letter": "#"}, {"icon_colour": "blue"},
+                    {"icon_colour": "#12345"}):
+            self.assertEqual(MC.parse_icon(bad), ("", ""), bad)
+
+    def test_a_gateway_with_a_bad_icon_still_loads(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        from atjte.gateways.mt5 import config as MC
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / MC.CONFIG_NAME).write_text(json.dumps(
+                {"name": "mt5_x", "venue": "mt5", "icon_letter": "XY",
+                 "icon_colour": "#00796b"}), encoding="utf-8")
+            cfg = MC.load(str(d))
+        self.assertEqual((cfg.icon_letter, cfg.icon_colour), ("", "#00796b"))
 
 
 class RefusalTest(Case):

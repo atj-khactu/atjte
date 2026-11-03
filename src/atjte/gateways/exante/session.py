@@ -19,6 +19,7 @@ status (35=AF) after each logon and reads the missed fills over REST.
 """
 from __future__ import annotations
 
+import functools
 import socket
 import ssl
 from datetime import datetime, timedelta, timezone
@@ -33,13 +34,23 @@ MAINTENANCE_NY = ((16, 58), (17, 0))
 MAINTENANCE_GRACE_S = 120.0
 
 
-def tls_connect(host: str, port: int, timeout_s: float):
-    """TLS with the certificate verified (the OS store + certifi's roots)."""
+def tls_connect(host: str, port: int, timeout_s: float, cafile: str = ""):
+    """TLS with the certificate verified (the OS store + certifi's roots,
+    plus ``cafile``: EXANTE's own CA, which signs its live FIX bridges)."""
     from atjte.tls import client_context
-    ctx = client_context()
+    ctx = client_context(cafile)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     raw = socket.create_connection((host, int(port)), timeout=timeout_s)
-    return ctx.wrap_socket(raw, server_hostname=host)
+    try:
+        return ctx.wrap_socket(raw, server_hostname=host)
+    except ssl.SSLCertVerificationError as e:
+        raw.close()
+        if cafile:
+            raise
+        raise ssl.SSLCertVerificationError(
+            f"{e} — EXANTE signs its live FIX bridges with its own CA: save the CA "
+            f"certificate EXANTE gives you (PEM) in this gateway's folder and name it in "
+            f"gateway.json as fix_ca_file") from None
 
 
 def plain_connect(host: str, port: int, timeout_s: float):
@@ -82,8 +93,12 @@ class ExanteSession(FixSession):
 
     def __init__(self, host: str, port: int, *, sender: str, target: str, password: str,
                  role: str, network: str = "live",
-                 cancel_on_disconnect: Optional[bool] = None, **kw: Any) -> None:
-        kw.setdefault("connect", plain_connect if network == "demo" else tls_connect)
+                 cancel_on_disconnect: Optional[bool] = None, ca_file: str = "",
+                 **kw: Any) -> None:
+        if "connect" not in kw:
+            kw["connect"] = (plain_connect if network == "demo" else
+                             functools.partial(tls_connect, cafile=ca_file) if ca_file else
+                             tls_connect)
         super().__init__(host, port, sender=sender, target=target, **kw)
         self._password = password
         self.role = role
