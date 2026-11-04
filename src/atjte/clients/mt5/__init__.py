@@ -14,6 +14,7 @@ name (e.g. ``"EURUSD"``).
 from __future__ import annotations
 
 import functools
+import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -27,6 +28,12 @@ from ..base import (
     Account, Margin, Order, OrderSide, OrderStatus, OrderType, Position,
     PositionSide, Ticker, Trade, UniversalClient, ms_to_dt,
 )
+from ...engines.common.hedge_orders import ARGUMENT_REFUSED, comment_refused, mt5_comment
+
+_log = logging.getLogger(__name__)
+
+#: MT5's "invalid request" retcode: a broker refusing the comment answers it
+_RETCODE_INVALID_REQUEST = 10013
 
 class _HedgeFirstLock:
     """The one lock every MT5 call takes — HEDGES FIRST.
@@ -121,6 +128,9 @@ class MT5Client(UniversalClient):
         #: the account this client trades: the configured login, else the
         #: one the terminal was on at connect. Every order checks it first.
         self._account: Optional[int] = login or expect_login
+        #: why this terminal refused an order COMMENT (then every order goes
+        #: without one: the comment is cosmetic, the magic is the book), else None
+        self.comment_refused: Optional[str] = None
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -379,7 +389,7 @@ class MT5Client(UniversalClient):
             "symbol": symbol,
             "volume": float(amount),
             "magic": kwargs.get("magic", self.magic),
-            "comment": kwargs.get("comment", "universal-client"),
+            "comment": mt5_comment(kwargs.get("comment", "universal-client")),
             "type_time": mt5.ORDER_TIME_GTC,
         }
         if kwargs.get("position"):
@@ -403,6 +413,9 @@ class MT5Client(UniversalClient):
 
         result = self._send_with_filling_fallback(req)
         filled = order_type is OrderType.MARKET and result.retcode == mt5.TRADE_RETCODE_DONE
+        raw = result._asdict()
+        if req["comment"] and self.comment_refused:
+            raw["comment_dropped"] = self.comment_refused   # the caller can say so
         return Order(
             exchange=self.name,
             order_id=str(result.order),
@@ -415,7 +428,7 @@ class MT5Client(UniversalClient):
             remaining=0.0 if filled else float(amount),
             status=OrderStatus.FILLED if filled else OrderStatus.OPEN,
             timestamp=datetime.now(timezone.utc),
-            raw=result._asdict(),
+            raw=raw,
         )
 
     @_serialised
@@ -576,9 +589,7 @@ class MT5Client(UniversalClient):
         """Brokers support different filling modes; try IOC → FOK → RETURN."""
         last = None
         for filling in (mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_FOK, mt5.ORDER_FILLING_RETURN):
-            result = mt5.order_send({**req, "type_filling": filling})
-            if result is None:
-                raise ConnectionError(f"order_send failed: {mt5.last_error()}")
+            result = self._order_send({**req, "type_filling": filling})
             if result.retcode != mt5.TRADE_RETCODE_INVALID_FILL:
                 last = result
                 break
@@ -586,3 +597,38 @@ class MT5Client(UniversalClient):
         if last.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
             raise RuntimeError(f"order rejected: retcode={last.retcode} {last.comment!r}")
         return last
+
+    def _order_send(self, req: dict):
+        """One ``order_send`` that the COMMENT can never stop: the comment is
+        cosmetic (the magic is how a bot knows its book), yet a terminal that
+        refused it left a member's hedge unsent for 2 h (2026-11-04). A
+        refused comment -- the MetaTrader5 package's ``Invalid "comment"
+        argument``, or a broker's 10013 that the same order without it
+        passes -- sends the order again at once without one, and every
+        order after it goes without (:attr:`comment_refused`). Any other
+        argument the package refuses is a permanent refusal
+        (``order rejected: invalid argument``), never a lost connection."""
+        if self.comment_refused and req.get("comment"):
+            req = {**req, "comment": ""}
+        result = mt5.order_send(req)
+        if result is None:
+            err = mt5.last_error()
+            if req.get("comment") and comment_refused(err):
+                self._drop_comment(req["comment"], f"the terminal refused it: {err}")
+                return self._order_send({**req, "comment": ""})
+            code = err[0] if isinstance(err, tuple) and err else None
+            if code == ARGUMENT_REFUSED:
+                raise RuntimeError(f"order rejected: invalid argument {err!r}")
+            raise ConnectionError(f"order_send failed: {err}")
+        if result.retcode == _RETCODE_INVALID_REQUEST and req.get("comment"):
+            retry = mt5.order_send({**req, "comment": ""})
+            if retry is not None and retry.retcode != _RETCODE_INVALID_REQUEST:
+                self._drop_comment(req["comment"], f"the broker refused it: retcode "
+                                                   f"{result.retcode} {result.comment!r}")
+                return retry
+        return result
+
+    def _drop_comment(self, comment: str, why: str) -> None:
+        self.comment_refused = f"comment {comment!r} ({len(comment)} characters): {why}"
+        _log.warning("MT5 order comment refused, orders now go without one -- %s",
+                     self.comment_refused)

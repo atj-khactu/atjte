@@ -473,8 +473,16 @@ MT5_QUOTE_COMMENT = (None if _cfg("MT5_QUOTE_COMMENT") is None
                      else str(_cfg("MT5_QUOTE_COMMENT")).strip())
 #: other magics whose SYMBOL_VENUE tickets count as an MT5 QUOTE leg's position
 MT5_QUOTE_ADOPT_MAGICS = tuple(int(m) for m in (_cfg("MT5_QUOTE_ADOPT_MAGICS") or ()))
-#: MT5 truncates an order comment at 31 characters
-MT5_COMMENT_MAX = 31
+from ..common.hedge_orders import MT5_COMMENT_MAX as _HO_COMMENT_MAX  # noqa: E402
+from ..common.hedge_orders import mt5_comment as _mt5_comment  # noqa: E402
+
+#: the longest MT5 order comment sent (hedge_orders.MT5_COMMENT_MAX: MT5
+#: documents 31, a terminal refused 31 on 2026-11-04)
+MT5_COMMENT_MAX = _HO_COMMENT_MAX
+#: the strategy key as the DEFAULT comment writes it: short, so "hedge
+#: <market> <key>" fits MT5_COMMENT_MAX ("hedge XYZ-SP500 fixed_entry_exit"
+#: was 32 characters)
+COMMENT_KEYS = {"fixed_entry_exit": "fee", "grid_futures": "gridf", "bollinger": "boll"}
 HEDGE_THRESHOLD_UNITS = _cfg("HEDGE_THRESHOLD_UNITS")
 # 'event' (a dedicated thread hedges each fill from its size the moment the
 # socket delivers it; the parity hedge becomes the safety net) | 'parity'
@@ -585,6 +593,8 @@ RECONCILE_RECHECK_DELAY_S = _cfg("RECONCILE_RECHECK_DELAY_S")
 RECONCILE_TOLERANCE_UNITS = _cfg("RECONCILE_TOLERANCE_UNITS")
 #: reconciler fixes in a row that HALT the bot (base_settings; 0 = off)
 MAX_RECONCILE_FIXES = int(_cfg("MAX_RECONCILE_FIXES") or 0)
+#: out of parity this long (s) raises the unhedged ALARM (base_settings; 0 = off)
+MAX_UNHEDGED_S = float(_cfg("MAX_UNHEDGED_S") or 0.0)
 #: how long after an MT5 order_send the terminal is given to list the new
 #: ticket before the net is cached and the book compacted as read (not a
 #: strategy setting: it is the terminal's IPC, the same on every project)
@@ -1200,6 +1210,9 @@ class ArbBot:
     # defaults for the halt state (set again in __init__)
     hedge_halt: Optional[str] = None
     reconcile_fix_streak = 0
+    unhedged_since: Optional[float] = None
+    unhedged_drift: Optional[float] = None
+    unhedged_alarm: Optional[str] = None
     _recheck_defer_until: Optional[float] = None
 
     # ``hedge_ok`` is set True again from a dozen places (a booked hedge, a
@@ -1267,17 +1280,19 @@ class ArbBot:
         """What the hedge writes in the MT5 order's comment field:
         ``MT5_COMMENT`` where the strategy sets one, nothing at all where it
         sets None, else ``hedge <market>
-        <key>`` — the venue symbol's base (``XYZ-EUR``, ``XAUT``) and the
+        <key>`` (the key shortened by COMMENT_KEYS) — the venue symbol's base (``XYZ-EUR``, ``XAUT``) and the
         strategy type, so the terminal tells two projects' hedges apart:
         before, every grid wrote ``hedge grid`` (2026-09-28: xyz:EUR, xyz:JPY
-        and xyz:JP225 on one terminal). Truncated to what MT5 accepts — a
-        longer string is rejected by some brokers rather than shortened.
+        and xyz:JP225 on one terminal). Cut to MT5_COMMENT_MAX, printable
+        ASCII only: a terminal refused 31 characters (2026-11-04), and the
+        MT5 client resends a refused comment without one.
         The magic, not this, is how the bot knows its own book."""
         market = str(SYMBOL_VENUE or "").split("/", 1)[0].strip()
-        default = f"hedge {market} {self.STRATEGY_KEY}" if market else f"hedge {self.STRATEGY_KEY}"
+        key = COMMENT_KEYS.get(self.STRATEGY_KEY, self.STRATEGY_KEY)
+        default = f"hedge {market} {key}" if market else f"hedge {key}"
         if MT5_COMMENT is None:
             return ""
-        return (MT5_COMMENT or default)[:MT5_COMMENT_MAX]
+        return _mt5_comment(MT5_COMMENT or default)
 
     @property
     def quote_comment(self) -> str:
@@ -1287,11 +1302,12 @@ class ArbBot:
         tickets from the hedge's on one account. None = no comment at all
         (over the client option too). Truncated as the hedge's."""
         market = str(SYMBOL_VENUE or "").split("/", 1)[0].strip()
-        default = f"quote {market} {self.STRATEGY_KEY}" if market else f"quote {self.STRATEGY_KEY}"
+        key = COMMENT_KEYS.get(self.STRATEGY_KEY, self.STRATEGY_KEY)
+        default = f"quote {market} {key}" if market else f"quote {key}"
         if MT5_QUOTE_COMMENT is None:
             return ""
         given = MT5_QUOTE_COMMENT or str(VENUE_CLIENT_OPTIONS.get("comment") or "").strip()
-        return (given or default)[:MT5_COMMENT_MAX]
+        return _mt5_comment(given or default)
     # 1 s spread history the engine keeps and persists (s). A strategy that
     # computes on the samples (the Bollinger bands) overrides this to cover
     # its own window + grace.
@@ -1576,6 +1592,11 @@ class ArbBot:
         self.reconcile_fix_streak = 0
         #: why the bot HALTED its hedging (quotes down until a restart), else None
         self.hedge_halt: Optional[str] = None
+        #: since when parity reads have shown a drift (epoch s), the last
+        #: drift, and the ALARM once that has lasted MAX_UNHEDGED_S
+        self.unhedged_since: Optional[float] = None
+        self.unhedged_drift: Optional[float] = None
+        self.unhedged_alarm: Optional[str] = None
         self.last_error: Optional[str] = None
         # reporting (atjte.reporting): created in startup once the state
         # files may be touched; the broker clock offset is inferred from
@@ -3212,6 +3233,13 @@ class ArbBot:
         The price is the execution price the terminal returned; the current
         tick is the fallback. Best-effort: a hedge is never held up by its
         own bookkeeping."""
+        dropped = ((getattr(order, "raw", None) or {}).get("comment_dropped")
+                   if order is not None else None)
+        if dropped:
+            self._log_once("hedge_comment_dropped",
+                           f"note: MT5 refused the hedge comment, so hedges go without "
+                           f"one (the magic, not the comment, is the book) -- {dropped}. "
+                           f"Set a shorter MT5_COMMENT, or None for no comment")
         try:
             units = float(lots) * self.contract_size
             px = float(((order.raw or {}).get("price") or 0.0) if order is not None else 0.0)
@@ -3455,6 +3483,7 @@ class ArbBot:
         except Exception:                                   # noqa: BLE001
             return                       # the reconciler's own cycle stays the backstop
         drift = round(self._venue_exposure_units() + mt5_units, 8)
+        self._note_parity(drift, now)
         if abs(drift) < RECONCILE_TOLERANCE_UNITS:
             return
         self.mt5_net_units = mt5_units
@@ -3483,6 +3512,7 @@ class ArbBot:
             self._recheck_at = None
             self._next_check_at = now + RECONCILE_INTERVAL_S
             drift = self._parity_drift_units()
+            self._note_parity(drift, now)
             if abs(drift) >= RECONCILE_TOLERANCE_UNITS:
                 if self.hedge_halt:
                     self.reconcile_last = (f"{_utcnow()} drift {drift:+.4f} units — NOT "
@@ -3518,6 +3548,7 @@ class ArbBot:
         if now >= self._next_check_at:
             self.counters["reconcile_checks"] += 1
             drift = self._parity_drift_units()
+            self._note_parity(drift, now)
             if abs(drift) >= RECONCILE_TOLERANCE_UNITS:
                 self._recheck_at = now + RECONCILE_RECHECK_DELAY_S
                 _log(f"reconcile: exposure drift {drift:+.4f} units "
@@ -3530,6 +3561,47 @@ class ArbBot:
                 self._next_check_at = now + RECONCILE_INTERVAL_S
                 self.reconcile_last = f"{_utcnow()} in sync (drift {drift:+.4f} units)"
                 self._rebase_hedger_if_quiet(drift, now, "periodic parity")
+
+    def _note_parity(self, drift: float, now: float) -> None:
+        """Every parity read (the reconciler's, the parity watch's): a drift
+        starts or continues the UNHEDGED clock, a read in tolerance stops it
+        and clears the alarm. Live only (a dry run's drift is paper)."""
+        if not LIVE_TRADING:
+            return
+        if abs(drift) >= RECONCILE_TOLERANCE_UNITS:
+            if self.unhedged_since is None:
+                self.unhedged_since = now
+            self.unhedged_drift = float(drift)
+            return
+        if self.unhedged_alarm:
+            _log(f"reconcile: parity restored after "
+                 f"{(now - float(self.unhedged_since or now)) / 60:.0f} min unhedged -- "
+                 f"unhedged alarm cleared")
+        self.unhedged_since = self.unhedged_drift = self.unhedged_alarm = None
+
+    def _unhedged_watch(self, now: float) -> None:
+        """MAX_UNHEDGED_S out of parity raises the ALARM, once per episode
+        (2026-11-04: every hedge of a member's bot refused for 2 h, nothing
+        louder than a log line). An alarm only: quotes are down already and
+        the reconciler keeps fixing -- halting it would keep the exposure
+        open. The panel's alerts and status bar carry it from the heartbeat."""
+        if (MAX_UNHEDGED_S <= 0 or self.unhedged_since is None or self.unhedged_alarm
+                or now - self.unhedged_since < MAX_UNHEDGED_S):
+            return
+        mins = (now - self.unhedged_since) / 60.0
+        why = (self.hedge_halt and f"hedging is HALTED ({self.hedge_halt})"
+               or (self.hedge_refusal or {}).get("error")
+               or self.last_error or "the hedge has not closed it")
+        self.unhedged_alarm = (f"UNHEDGED for {mins:.0f} min: drift "
+                               f"{float(self.unhedged_drift or 0.0):+.4f} {UNIT_LABEL} "
+                               f"(venue vs MT5 magic {MT5_MAGIC}) since "
+                               f"{datetime.fromtimestamp(self.unhedged_since).strftime('%H:%M:%S')}"
+                               f" -- {why}")
+        self.last_error = self.unhedged_alarm
+        _log(f"ERROR: {self.unhedged_alarm}. The {EXCHANGE_ID} position is open with no "
+             f"MT5 hedge against it: hedge {SYMBOL_MT5} by hand or close the venue "
+             f"position. The reconciler keeps trying every "
+             f"{RECONCILE_INTERVAL_S / 60:g} min (MAX_UNHEDGED_S {MAX_UNHEDGED_S:g}s)")
 
     def _reconcile_over_volume(self, side: OrderSide, lots: float) -> bool:
         """The reconciler keeps to the day's hedge budget,
@@ -6472,6 +6544,7 @@ class ArbBot:
             self._phase("hedge", self._hedge)     # single attempt — a broken
                                                   # leg waits for reconcile
         self._phase("reconcile", self._reconcile, now)
+        self._phase("unhedged_watch", self._unhedged_watch, now)
         self._phase("refresh_balances", self._refresh_balances, now)
         self._phase("place_margin", self._refresh_place_margin, now)   # an entry found it stale
         self._phase("risk", self._refresh_risk, now)   # daily limits + de-risk
@@ -6969,6 +7042,14 @@ class ArbBot:
             "hedge_ok": self.hedge_ok,
             "hedge_halt": self.hedge_halt,
             "reconcile_fix_streak": self.reconcile_fix_streak,
+            # out of parity since (None = in parity); "alarm" once that has
+            # lasted MAX_UNHEDGED_S
+            "unhedged": (None if self.unhedged_since is None else {
+                "since": datetime.fromtimestamp(self.unhedged_since, timezone.utc)
+                         .isoformat(timespec="seconds"),
+                "seconds": round(time.time() - self.unhedged_since),
+                "drift_units": self.unhedged_drift,
+                "alarm": self.unhedged_alarm}),
             # the hedge MT5 refused for the request itself, held (see _hedge)
             "hedge_refusal": ({k: v for k, v in self.hedge_refusal.items()
                                if k not in ("t", "until")}

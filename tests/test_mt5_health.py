@@ -128,5 +128,100 @@ class HedgeFirstLockTest(unittest.TestCase):
         self.assertEqual(done, [1])
 
 
+
+class CommentNeverStopsAnOrderTest(unittest.TestCase):
+    """2026-11-04: a member's terminal refused the hedge comment, and every
+    hedge failed for 2 h (raised as a lost connection, so never held or
+    escalated). A refused comment now sends the order again without one."""
+
+    DONE = 10009
+
+    def _client(self, f):
+        f.TRADE_RETCODE_DONE, f.TRADE_RETCODE_PLACED, f.TRADE_RETCODE_INVALID_FILL = (
+            self.DONE, 10008, 10030)
+        f.symbol_info_tick.return_value = types.SimpleNamespace(bid=1.1, ask=1.1001)
+        c = M.MT5Client(path="C:/t/terminal64.exe")
+        with mock.patch.object(M, "mt5", f):
+            c.connect()
+        return c
+
+    def _ok(self):
+        return types.SimpleNamespace(retcode=self.DONE, order=7, volume=0.01, comment="",
+                                     _asdict=lambda: {"retcode": self.DONE, "price": 1.1})
+
+    def _place(self, c, f, comment):
+        with mock.patch.object(M, "mt5", f):
+            return c.place_order("EURUSD", OrderSide.BUY, 0.01, OrderType.MARKET,
+                                 comment=comment)
+
+    def test_a_comment_the_package_refuses_is_dropped_not_the_order(self):
+        f = fake_mt5()
+        c = self._client(f)
+        sent = []
+
+        def order_send(req):
+            sent.append(req["comment"])
+            if req["comment"]:
+                f.last_error.return_value = (-2, 'Invalid "comment" argument')
+                return None
+            return self._ok()
+        f.order_send.side_effect = order_send
+        o = self._place(c, f, "hedge XYZ-SP500 fee")
+        self.assertEqual(sent, ["hedge XYZ-SP500 fee", ""])
+        self.assertEqual(o.filled, 0.01)
+        self.assertIn("comment_dropped", o.raw)
+        self.assertIn("refused", c.comment_refused)
+        sent.clear()
+        self._place(c, f, "hedge XYZ-SP500 fee")              # remembered: no second try
+        self.assertEqual(sent, [""])
+
+    def test_a_broker_refusing_the_comment_with_10013(self):
+        f = fake_mt5()
+        c = self._client(f)
+        sent = []
+
+        def order_send(req):
+            sent.append(req["comment"])
+            if req["comment"]:
+                return types.SimpleNamespace(retcode=10013, comment="Invalid request")
+            return self._ok()
+        f.order_send.side_effect = order_send
+        o = self._place(c, f, "hedge EURUSD grid")
+        self.assertEqual(sent, ["hedge EURUSD grid", ""])
+        self.assertEqual(o.filled, 0.01)
+
+    def test_a_10013_that_is_not_the_comment_stays_a_refusal(self):
+        f = fake_mt5()
+        c = self._client(f)
+        f.order_send.return_value = types.SimpleNamespace(retcode=10013, comment="Invalid request")
+        with self.assertRaises(RuntimeError) as cm:
+            self._place(c, f, "hedge EURUSD grid")
+        self.assertIn("retcode=10013", str(cm.exception))
+        self.assertIsNone(c.comment_refused)
+
+    def test_another_refused_argument_is_permanent_not_a_lost_connection(self):
+        from atjte.engines.common import hedge_orders as ho
+        f = fake_mt5()
+        c = self._client(f)
+        f.order_send.return_value = None
+        f.last_error.return_value = (-2, 'Invalid "volume" argument')
+        with self.assertRaises(RuntimeError) as cm:
+            self._place(c, f, "")
+        self.assertNotIsInstance(cm.exception, ConnectionError)
+        self.assertEqual(ho.permanent_retcode(cm.exception), ho.ARGUMENT_REFUSED)
+        f.last_error.return_value = (-10004, "No IPC connection")
+        with self.assertRaises(ConnectionError):          # a lost channel stays one
+            self._place(c, f, "")
+
+    def test_the_comment_is_cut_and_ascii(self):
+        f = fake_mt5()
+        c = self._client(f)
+        sent = []
+        f.order_send.side_effect = lambda req: (sent.append(req["comment"]), self._ok())[1]
+        self._place(c, f, "hedge XYZ-SP500 fixed_entry_exit")
+        self._place(c, f, "eur \u20ac desk")
+        self.assertEqual(sent, ["hedge XYZ-SP500 fixed_ent", "eur  desk"])
+
+
 if __name__ == "__main__":
     unittest.main()

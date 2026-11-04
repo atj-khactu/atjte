@@ -108,5 +108,29 @@ class RetcodeTest(unittest.TestCase):
         self.assertIsNone(ho.permanent_retcode(TimeoutError("timed out")))
 
 
+
+class CommentAndArgumentTest(unittest.TestCase):
+    def test_an_argument_refusal_is_permanent(self):
+        err = RuntimeError("order rejected: invalid argument (-2, 'Invalid \"volume\" argument')")
+        self.assertEqual(ho.permanent_retcode(err), ho.ARGUMENT_REFUSED)
+        self.assertIn(ho.ARGUMENT_REFUSED, ho.PERMANENT_RETCODES)
+        # through the gateway's reply text too
+        self.assertEqual(ho.permanent_retcode("RuntimeError: order rejected: invalid argument "
+                                              "(-2, 'Invalid \"comment\" argument')"),
+                         ho.ARGUMENT_REFUSED)
+        self.assertIsNone(ho.permanent_retcode("order_send failed: (-10004, 'No IPC connection')"))
+
+    def test_comment_refused(self):
+        self.assertTrue(ho.comment_refused((-2, 'Invalid "comment" argument')))
+        self.assertFalse(ho.comment_refused((-2, 'Invalid "volume" argument')))
+
+    def test_mt5_comment(self):
+        self.assertEqual(ho.mt5_comment(None), "")
+        self.assertEqual(ho.mt5_comment("  eur desk "), "eur desk")
+        self.assertEqual(len(ho.mt5_comment("x" * 40)), ho.MT5_COMMENT_MAX)
+        self.assertEqual(ho.mt5_comment("caf\u00e9 \u20ac"), "caf")
+        self.assertLess(ho.MT5_COMMENT_MAX, 31)       # 31 was refused (2026-11-04)
+
+
 if __name__ == "__main__":
     unittest.main()

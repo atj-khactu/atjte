@@ -1395,6 +1395,57 @@ class HedgeGateTest(unittest.TestCase):
              pb.POSITION_RECONCILE_TOLERANCE_UNITS) = orig
 
 
+class UnhedgedAlarmTest(unittest.TestCase):
+    """MAX_UNHEDGED_S out of parity raises the alarm (2026-11-04: a member's
+    every hedge refused for 2 h, nothing louder than a log line); a read in
+    tolerance clears it. It changes no trading."""
+
+    def setUp(self):
+        self._orig = (pb.LIVE_TRADING, pb.MAX_UNHEDGED_S, pb.RECONCILE_TOLERANCE_UNITS)
+        pb.LIVE_TRADING, pb.MAX_UNHEDGED_S, pb.RECONCILE_TOLERANCE_UNITS = True, 300.0, 1.0
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb.MAX_UNHEDGED_S, pb.RECONCILE_TOLERANCE_UNITS = self._orig
+
+    def _bot(self):
+        logs = []
+        bot = make_bot(logs)
+        bot.hedge_halt, bot.last_error = None, None
+        bot.unhedged_since = bot.unhedged_drift = bot.unhedged_alarm = None
+        bot.hedge_refusal = {"error": "order rejected: invalid argument (-2, 'Invalid "
+                                      "\"comment\" argument')"}
+        return bot, logs
+
+    def test_the_alarm_after_max_unhedged_s_and_cleared_by_parity(self):
+        bot, logs = self._bot()
+        bot._note_parity(-500.0, 1000.0)
+        bot._unhedged_watch(1000.0 + 299.0)
+        self.assertIsNone(bot.unhedged_alarm)
+        bot._note_parity(-500.0, 1000.0 + 200.0)         # still out: the clock keeps running
+        bot._unhedged_watch(1000.0 + 300.0)
+        self.assertIn("UNHEDGED for 5 min", bot.unhedged_alarm)
+        self.assertIn("comment", bot.unhedged_alarm)     # says why
+        self.assertEqual(bot.last_error, bot.unhedged_alarm)
+        self.assertEqual(sum("ERROR: UNHEDGED" in m for m in logs), 1)
+        bot._unhedged_watch(1000.0 + 900.0)              # once per episode
+        self.assertEqual(sum("ERROR: UNHEDGED" in m for m in logs), 1)
+        bot._note_parity(0.2, 1000.0 + 1000.0)           # in tolerance
+        self.assertIsNone(bot.unhedged_alarm)
+        self.assertIsNone(bot.unhedged_since)
+        self.assertTrue(any("alarm cleared" in m for m in logs), logs)
+
+    def test_off_and_dry_run(self):
+        bot, logs = self._bot()
+        pb.MAX_UNHEDGED_S = 0.0
+        bot._note_parity(-500.0, 0.0)
+        bot._unhedged_watch(10_000.0)
+        self.assertIsNone(bot.unhedged_alarm)
+        pb.MAX_UNHEDGED_S, pb.LIVE_TRADING = 300.0, False
+        bot, logs = self._bot()
+        bot._note_parity(-500.0, 0.0)
+        self.assertIsNone(bot.unhedged_since)
+
+
 class HedgeCommentTest(unittest.TestCase):
     """The MT5 hedge's comment names the market as well as the strategy
     type: every grid wrote "hedge grid" before, so three projects' hedges on
@@ -1415,13 +1466,20 @@ class HedgeCommentTest(unittest.TestCase):
     def test_the_default_names_the_market_and_the_type(self):
         self.assertEqual(self.comment("XYZ-EUR/USDC:USDC"), "hedge XYZ-EUR grid")
         self.assertEqual(self.comment("XYZ-JP225/USDC:USDC"), "hedge XYZ-JP225 grid")
-        self.assertEqual(self.comment("XAUT/USD:USD", "bollinger"), "hedge XAUT bollinger")
+        self.assertEqual(self.comment("XAUT/USD:USD", "bollinger"), "hedge XAUT boll")
 
     def test_an_explicit_comment_wins_and_everything_fits_mt5(self):
         self.assertEqual(self.comment("XYZ-EUR/USDC:USDC", explicit="eur desk"), "eur desk")
-        long = self.comment("XYZ-JP225/USDC:USDC", "fixed_entry_exit")
-        self.assertEqual(len(long), pb.MT5_COMMENT_MAX)
-        self.assertTrue(long.startswith("hedge XYZ-JP225 fixed"))
+        # the longest default: was 32 characters, cut to 31, refused (2026-11-04)
+        self.assertEqual(self.comment("XYZ-SP500/USDC:USDC", "fixed_entry_exit"),
+                         "hedge XYZ-SP500 fee")
+        self.assertEqual(self.comment("XYZ-SP500/USDC:USDC", "grid_futures"),
+                         "hedge XYZ-SP500 gridf")
+        self.assertEqual(len(self.comment("XYZ-EUR/USDC:USDC", explicit="x" * 40)),
+                         pb.MT5_COMMENT_MAX)
+        for key in ("grid", "grid_futures", "bollinger", "fixed", "fixed_entry_exit"):
+            self.assertLessEqual(len(self.comment("XYZ-JP225/USDC:USDC", key)),
+                                 pb.MT5_COMMENT_MAX, key)
         self.assertEqual(self.comment("", "grid"), "hedge grid")   # no symbol: as before
 
     def test_none_sends_no_comment_and_empty_keeps_the_default(self):

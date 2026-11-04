@@ -19,7 +19,7 @@
     "GRID_STEP": "0.04",
     "GRID_LEVELS": "2",
     "ORDER_VOLUME": "6.5",
-    "GRID_CENTER": "-0.08",
+    "GRID_CENTER": "-0.05",
     "GRID_TAKE_PROFIT": "0.05",
     "GRID_DIRECTION": "both",
     "GRID_LEVEL_UNITS": "6.5",

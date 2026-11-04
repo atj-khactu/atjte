@@ -18,7 +18,16 @@ PERMANENT REFUSALS. Some retcodes say the REQUEST is wrong — resending it
 unchanged gets the same answer (:data:`PERMANENT_RETCODES`).
 :func:`permanent_retcode` reads one from the error text the MT5 client
 raises (``order rejected: retcode=10014 'Invalid volume'``), through the
-gateway's reply as well."""
+gateway's reply as well. The MetaTrader5 package's own refusal of an
+ARGUMENT (``order_send`` returns None, ``last_error`` (-2, 'Invalid
+"comment" argument')) never reaches the broker and is permanent too
+(:data:`ARGUMENT_REFUSED`): it used to be raised as a lost connection, so
+nothing held or escalated it (2026-11-04, a member's hedge unsent for 2 h).
+
+THE COMMENT. :func:`mt5_comment` is what every MT5 order's comment goes
+out as: printable ASCII, at most :data:`MT5_COMMENT_MAX` characters. The
+comment is cosmetic (the magic is the book), so it must never stop an
+order: the MT5 client resends a refused one without it."""
 from __future__ import annotations
 
 import math
@@ -29,8 +38,18 @@ from typing import Any, Callable, Optional
 #: a hedge that needs more maximum-size orders than this is refused unsent
 MAX_SPLIT_ORDERS = 20
 
+#: the longest MT5 order comment sent. MT5 documents 31, but a terminal
+#: refused 31 characters on 2026-11-04 ("longer than 30"), and some brokers
+#: take fewer: 25 leaves room. Longer is cut, never sent.
+MT5_COMMENT_MAX = 25
+
+#: the "retcode" a refusal by the MetaTrader5 package itself carries (its
+#: ``last_error`` code -2, RES_E_INVALID_PARAMS): an argument it will not send
+ARGUMENT_REFUSED = -2
+
 #: retcodes that refuse the request itself: the same order gets the same answer
 PERMANENT_RETCODES = {
+    ARGUMENT_REFUSED: "invalid argument",
     10013: "invalid request",
     10014: "invalid volume",
     10016: "invalid stops",
@@ -47,6 +66,8 @@ PERMANENT_RETCODES = {
 }
 
 _RETCODE = re.compile(r"retcode\D{0,3}(\d{5})")
+#: the MetaTrader5 package's own refusal: ``Invalid "comment" argument``
+_ARGUMENT = re.compile(r"invalid\s+\W?\w+\W?\s+argument", re.I)
 
 #: an IBKR hedge's refusal (``ib_code=203 …``, the IBKR gateway's hedge
 #: side): the codes that refuse the request itself. Not 201 ("Order
@@ -71,8 +92,23 @@ def permanent_retcode(err: Any) -> Optional[int]:
     rc = retcode_of(err)
     if rc in PERMANENT_RETCODES:
         return rc
+    if _ARGUMENT.search(str(err or "")):
+        return ARGUMENT_REFUSED
     m = _IB_CODE.search(str(err or ""))
     return int(m.group(1)) if m and int(m.group(1)) in IB_PERMANENT_CODES else None
+
+
+def mt5_comment(text: Any) -> str:
+    """``text`` as an MT5 order comment: printable ASCII only (a character
+    outside it is dropped), at most :data:`MT5_COMMENT_MAX` characters, ends
+    trimmed. None / "" = no comment."""
+    s = "".join(c for c in str(text or "") if 32 <= ord(c) < 127)
+    return s.strip()[:MT5_COMMENT_MAX].strip()
+
+
+def comment_refused(err: Any) -> bool:
+    """The MetaTrader5 package refused the order's COMMENT argument."""
+    return bool(re.search(r"invalid\s+\W?comment\W?\s+argument", str(err or ""), re.I))
 
 
 class HedgeTooLarge(ValueError):

@@ -24,7 +24,7 @@
     "RISK_UNIT": "abs",
     "MAX_DAILY_LOSS_USD": "25",
     "GRID_LEVELS": "3",
-    "GRID_CENTER": "-0.0005",
+    "GRID_CENTER": "0.0003",
     "GRID_DIRECTION": "both",
     "GRID_STEP": "0.0005",
     "BASIS_RELEASE": "0.000125",

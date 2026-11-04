@@ -460,6 +460,10 @@ class MT5Gateway:
         raw = getattr(o, "raw", None)
         if isinstance(raw, dict):
             raw["gw_ms"] = {"in": int(t_in * 1000), "out": int(self._clock() * 1000)}
+            dropped = raw.get("comment_dropped")
+            if dropped and dropped != getattr(self, "_comment_dropped_said", None):
+                self._comment_dropped_said = dropped
+                self._log(f"{self.label}: hedges now go WITHOUT a comment -- {dropped}")
         return o
 
     def _place_order(self, c: _Client, args: list, kwargs: dict) -> Any:

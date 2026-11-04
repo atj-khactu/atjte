@@ -359,6 +359,15 @@ RECONCILE_TOLERANCE_UNITS = None  # >= one broker min lot in base units; None = 
 # sent, then the bot HALTS: quotes stay down and the reconciler stops
 # hedging until the bot is restarted. 0 = off.
 MAX_RECONCILE_FIXES = 3
+# An ALARM when the exposure has been out of parity this long (seconds): the
+# venue leg is open and MT5 does not offset it -- every hedge refused, a
+# terminal down. The bot logs an ERROR, sets last_error and publishes
+# `unhedged` (the panel's alerts and status bar say it). It changes no
+# trading: quotes are already down, and the reconciler keeps trying -- the
+# reconciler is what repairs it, so halting it would only make it last.
+# Clears on the first parity read in tolerance. 2026-11-04: a member's hedge
+# was refused for 2 h with nothing louder than a log line. 0 = off.
+MAX_UNHEDGED_S = 300.0
 
 # --- Basis trigger (ON by default; sample_project-style signal entries) ---
 # True (the default) = an order is SUBMITTED only while

@@ -41,6 +41,7 @@ from typing import Any, Callable, Optional
 import ccxt
 
 from atjte.clients.base import Order, OrderSide, OrderStatus, OrderType, PositionSide
+from atjte.engines.common.hedge_orders import mt5_comment
 
 from .base import GatewayConnector, GatewayFeed, refuse_network
 from .mt5_gateway import MT5GatewayClient
@@ -141,7 +142,7 @@ class MT5VenueClient(GatewayConnector):
         if self.magic in self.adopt_magics:
             raise ValueError(f"adopt_magics lists the quote leg's own magic ({self.magic})")
         self.deviation = int(deviation)
-        self.comment = "atjte quote" if comment is None else str(comment)[:31]
+        self.comment = "atjte quote" if comment is None else mt5_comment(comment)
         self.fx_symbol = str(fx_symbol or "")
         self._orders: dict[str, Order] = {}
         self._fx: Optional[float] = None
