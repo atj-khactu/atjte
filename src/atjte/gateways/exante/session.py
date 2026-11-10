@@ -40,7 +40,8 @@ def tls_connect(host: str, port: int, timeout_s: float, cafile: str = ""):
     from atjte.tls import client_context
     ctx = client_context(cafile)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    raw = socket.create_connection((host, int(port)), timeout=timeout_s)
+    from atjte.net import no_delay
+    raw = no_delay(socket.create_connection((host, int(port)), timeout=timeout_s))
     try:
         return ctx.wrap_socket(raw, server_hostname=host)
     except ssl.SSLCertVerificationError as e:
@@ -59,7 +60,8 @@ def plain_connect(host: str, port: int, timeout_s: float):
     if host != X.DEMO_HOST:
         raise RuntimeError(f"refusing an unencrypted FIX connection to {host!r}: only "
                            f"EXANTE's demo bridge ({X.DEMO_HOST}) is plain TCP")
-    return socket.create_connection((host, int(port)), timeout=timeout_s)
+    from atjte.net import no_delay
+    return no_delay(socket.create_connection((host, int(port)), timeout=timeout_s))
 
 
 def _new_york():

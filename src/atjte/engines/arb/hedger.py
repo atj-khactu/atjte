@@ -17,7 +17,10 @@ does. This module is the fast path that takes its place when
 - fills that land while an order is in flight are coalesced into the next
   one, so a burst costs one MT5 order for the net delta;
 - a delta under one broker lot is carried as a residue and folded into the
-  next hedge; under the threshold the parity hedge would not send it either;
+  next hedge; under the threshold the parity hedge would not send it either.
+  ``HEDGE_ROUND_FRACTION`` under 1.0 rounds a leftover of at least that
+  share of a lot step UP instead (``hedge_orders.hedge_lots``, the parity
+  hedge's sizing too), and the residue then goes the other way;
 - the parity hedge stays behind it as the SAFETY NET: the loop no longer
   fires it on a fill but schedules the reconciler's re-check instead, so a
   drift that PERSISTS after ``RECONCILE_RECHECK_DELAY_S`` -- a partial MT5
@@ -80,8 +83,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from ...clients.base import OrderSide, Trade
-from ..common.grid_model import round_to_step
-from ..common.hedge_orders import HedgeTooLarge, send_split
+from ..common.hedge_orders import HedgeTooLarge, hedge_lots, send_split
 
 #: how long the hedger must have seen no fill before a parity read may
 #: REBASE its residue (a fill's push and the REST position read can cross
@@ -94,20 +96,42 @@ QUIET_S = 2.0
 CREDIT_TTL_S = 60.0
 
 
-def timing_line(tr: Trade, rx_t: Optional[float], sent_t: float, done_t: float,
-                order=None) -> str:
+def _order_price(order) -> Optional[float]:
+    """An MT5 order result's fill price (``raw["price"]``, else ``price``)."""
+    if order is None:
+        return None
+    raw = getattr(order, "raw", None)
+    for v in ((raw or {}).get("price") if isinstance(raw, dict) else None,
+              getattr(order, "price", None), getattr(order, "avg_price", None)):
+        try:
+            if v is not None and float(v) > 0:
+                return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+#: the hops of :func:`timing_hops`, in path order
+HOPS = ("venue_to_gateway_ms", "gateway_to_bot_ms", "bot_to_order_ms",
+        "order_to_mt5_gateway_ms", "terminal_broker_ms", "back_ms", "total_ms")
+
+
+def timing_hops(tr: Trade, rx_t: Optional[float], sent_t: float, done_t: float,
+                order=None) -> dict:
     """One hedge's path, hop by hop, in ms: the venue's fill time (ITS
     clock), the venue gateway's receipt (``tr.raw["gw_rx_ms"]``), this
     hedger's (``rx_t``), the MT5 order leaving (``sent_t``), the MT5
     gateway's receipt and the terminal's answer (``order.raw["gw_ms"]``) and
     the answer back here (``done_t``). Every hop after the first is on this
     machine's one clock; the first crosses to the venue's, so it carries the
-    two clocks' offset too. A hop whose stamps are missing reads "?"."""
+    two clocks' offset too. A hop whose stamps are missing is None.
+    ``fill_ts``: the venue's fill time, epoch s; ``total_ms``: fill received
+    (by the venue gateway, else this hedger) -> hedge confirmed."""
     def ms(v) -> Optional[float]:
         return None if v is None else float(v)
 
-    def gap(a: Optional[float], b: Optional[float]) -> str:
-        return "?" if a is None or b is None else f"{b - a:.0f}"
+    def gap(a: Optional[float], b: Optional[float]) -> Optional[float]:
+        return None if a is None or b is None else round(b - a, 1)
     venue = ms(tr.timestamp.timestamp() * 1000) if tr.timestamp is not None else None
     gw_rx = ms((tr.raw or {}).get("gw_rx_ms")) if isinstance(tr.raw, dict) else None
     rx = ms(rx_t * 1000) if rx_t is not None else None
@@ -115,13 +139,40 @@ def timing_line(tr: Trade, rx_t: Optional[float], sent_t: float, done_t: float,
     g = ((getattr(order, "raw", None) or {}).get("gw_ms") or {}) \
         if isinstance(getattr(order, "raw", None), dict) else {}
     mt5_in, mt5_out = ms(g.get("in")), ms(g.get("out"))
+    raw = tr.raw if isinstance(tr.raw, dict) else {}
+    order_sent, transact = ms(raw.get("order_sent_ms")), ms(raw.get("venue_transact_ms"))
+    sending, sock_rx = ms(raw.get("venue_sending_ms")), ms(raw.get("rx_ms"))
+    return {"fill_ts": None if venue is None else round(venue / 1000.0, 3),
+            "order_sent_ts": None if order_sent is None else round(order_sent / 1000.0, 3),
+            # EXANTE's split of venue -> gateway, where the gateway stamps it:
+            # the order leaving -> the venue's TransactTime (across clocks),
+            # TransactTime -> SendingTime (both the venue's clock: exact),
+            # SendingTime -> read off the socket (network + clock offset),
+            # the socket -> the gateway's push (its own processing)
+            "send_to_fill_ms": gap(order_sent, transact),
+            "fill_to_report_ms": gap(transact, sending),
+            "report_to_socket_ms": gap(sending, sock_rx),
+            "socket_to_gateway_ms": gap(sock_rx, gw_rx),
+            "venue_to_gateway_ms": gap(venue, gw_rx), "gateway_to_bot_ms": gap(gw_rx, rx),
+            "bot_to_order_ms": gap(rx, sent), "order_to_mt5_gateway_ms": gap(sent, mt5_in),
+            "terminal_broker_ms": gap(mt5_in, mt5_out), "back_ms": gap(mt5_out, done),
+            "total_ms": gap(gw_rx if gw_rx is not None else rx, done)}
+
+
+def timing_line(tr: Trade, rx_t: Optional[float], sent_t: float, done_t: float,
+                order=None) -> str:
+    """:func:`timing_hops` as the log's one line ("?" for a missing hop)."""
+    h = timing_hops(tr, rx_t, sent_t, done_t, order)
+
+    def f(k: str) -> str:
+        return "?" if h[k] is None else f"{h[k]:.0f}"
     when = (tr.timestamp.strftime("%H:%M:%S.%f")[:-3] if tr.timestamp is not None else "?")
-    total = gap(gw_rx if gw_rx is not None else rx, done)
     return (f"HEDGE TIMING {str(tr.trade_id or '')[:8]}: venue fill {when} -> venue gateway "
-            f"+{gap(venue, gw_rx)} ms (incl. clock offset) -> bot +{gap(gw_rx, rx)} -> MT5 "
-            f"order out +{gap(rx, sent)} -> MT5 gateway +{gap(sent, mt5_in)} -> terminal + "
-            f"broker {gap(mt5_in, mt5_out)} -> back +{gap(mt5_out, done)} | fill received -> "
-            f"hedge confirmed {total} ms")
+            f"+{f('venue_to_gateway_ms')} ms (incl. clock offset) -> bot "
+            f"+{f('gateway_to_bot_ms')} -> MT5 order out +{f('bot_to_order_ms')} -> MT5 "
+            f"gateway +{f('order_to_mt5_gateway_ms')} -> terminal + broker "
+            f"{f('terminal_broker_ms')} -> back +{f('back_ms')} | fill received -> "
+            f"hedge confirmed {f('total_ms')} ms")
 
 
 @dataclass(frozen=True)
@@ -145,19 +196,27 @@ class EventHedger:
                  contract_size: float, volume_step: float, volume_min: float,
                  threshold_units: float, live: bool,
                  volume_max: float = 0.0,
+                 round_fraction: float = 1.0,
                  started_utc: Optional[datetime] = None,
                  on_result: Optional[Callable] = None,
                  on_failure: Optional[Callable[[Exception], None]] = None,
                  after_place: Optional[Callable[[], None]] = None,
                  log: Optional[Callable[[str], None]] = None,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 on_event: Optional[Callable[[dict], None]] = None) -> None:
         self._place = place
+        #: each hedge sent (its timing hops) or failed, for the order log;
+        #: called on the hedger's thread, its errors swallowed
+        self._on_event = on_event
         self.symbol_venue = symbol_venue
         self._to_units = to_units
         self.contract_size = float(contract_size)
         self.volume_step = float(volume_step)
         self.volume_min = float(volume_min)
         self.volume_max = float(volume_max or 0.0)    # one order's cap; 0 = none
+        #: HEDGE_ROUND_FRACTION: the share of a lot step a leftover must reach
+        #: to be hedged as a whole step (1.0 = round down; hedge_orders.hedge_lots)
+        self.round_fraction = float(round_fraction)
         self.threshold_units = float(threshold_units)
         self.live = bool(live)
         self.started_utc = started_utc
@@ -187,6 +246,16 @@ class EventHedger:
                          "residue_holds": 0, "failures": 0, "dry": 0,
                          "rebases": 0, "parity_sent": 0, "split_orders": 0,
                          "partial": 0, "credits_expired": 0}
+
+    def _event(self, event: dict) -> None:
+        """Hand one hedge event to ``on_event`` (the order log); a failing
+        log never touches the hedge."""
+        if self._on_event is None:
+            return
+        try:
+            self._on_event(event)
+        except Exception:                                   # noqa: BLE001
+            pass
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def start(self) -> None:
@@ -364,13 +433,14 @@ class EventHedger:
                       f"{self.credit_units:+.4f})")
         if len(fills) > 1:
             self.counters["coalesced"] += len(fills) - 1
-        lots = round_to_step(abs(delta) / self.contract_size, self.volume_step)
+        lots = hedge_lots(abs(delta) / self.contract_size, self.volume_step,
+                          self.volume_min, self.round_fraction)
         if abs(delta) < self.threshold_units or lots < self.volume_min:
             # the parity hedge would not send this either; carry it
             self.residue_units = delta
             self.counters["residue_holds"] += 1
             self._log(f"event hedge: {len(fills)} fill(s) net {-signed:+.4f} units "
-                      f"-- under one lot, carried (residue {delta:+.4f} units)")
+                      f"-- under the hedge threshold, carried (residue {delta:+.4f} units)")
             return
         side = OrderSide.BUY if delta > 0 else OrderSide.SELL
         sent_units = lots * self.contract_size * (1 if delta > 0 else -1)
@@ -406,9 +476,16 @@ class EventHedger:
                      f"{self.volume_max:g} lot" if len(res.chunks) > 1 else "")
             self._log(f"HEDGE (event) {side.value} {filled:g} lot (delta {delta:+.4f} units, "
                       f"{len(fills)} fill(s), order_send {latency_ms:.0f} ms{split})")
-            self._log(timing_line(fills[0], self._rx_t.pop(str(fills[0].trade_id or ""), None),
-                                  t0, t0 + latency_ms / 1000.0,
-                                  res.orders[0][1] if res.orders else None))
+            rx_t = self._rx_t.pop(str(fills[0].trade_id or ""), None)
+            first = res.orders[0][1] if res.orders else None
+            self._log(timing_line(fills[0], rx_t, t0, t0 + latency_ms / 1000.0, first))
+            self._event({"ev": "hedge", "mode": "event", "side": side.value,
+                         "lots": filled, "lots_asked": lots,
+                         "price": _order_price(first),
+                         "order_id": str(getattr(first, "order_id", "") or ""),
+                         "trade_id": str(fills[0].trade_id or ""), "fills": len(fills),
+                         "ms": round(latency_ms, 1), "result": "ok" if err is None else "partial",
+                         **timing_hops(fills[0], rx_t, t0, t0 + latency_ms / 1000.0, first)})
             if self._on_result is not None:
                 for got, order in res.orders:
                     self._on_result(side, got, order, delta, latency_ms, len(fills))
@@ -421,6 +498,11 @@ class EventHedger:
             self.counters["failures"] += 1
             if filled > 1e-9:
                 self.counters["partial"] += 1
+            else:
+                self._event({"ev": "hedge", "mode": "event", "side": side.value,
+                             "lots": 0.0, "lots_asked": lots, "ms": round(latency_ms, 1),
+                             "trade_id": str(fills[0].trade_id or ""), "fills": len(fills),
+                             "result": "failed", "msg": str(err)[:300]})
             self._log(f"ERROR: event hedge failed: {side.value} {lots:g} lot "
                       f"(delta {delta:+.4f} units"
                       + (f", {filled:g} lot filled before it stopped" if filled > 1e-9 else "")

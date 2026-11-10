@@ -255,6 +255,20 @@ class StubVenue:
             raise self._get_order_error
         return self._order
 
+    #: an order read's ``filled`` is the venue's own count (Venue's default);
+    #: a test of a derived one (Hyperliquid) sets it False and fills
+    #: ``trade_units`` / ``trade_error``
+    rest_filled_trade_backed = True
+    trade_units = 0.0
+    trade_error = None
+    trade_reads = 0
+
+    def order_trade_units(self, order_ids, since_s=0.0):
+        self.trade_reads += 1
+        if self.trade_error is not None:
+            raise self.trade_error
+        return self.trade_units
+
 
 #: the old name, kept so the existing tests read unchanged
 StubKraken = StubVenue
@@ -387,6 +401,97 @@ class ClassifyTest(unittest.TestCase):
                     "the venue: createOrder failed due to insufficientAvailableFunds",
                     "nonceBelowThreshold", "apiLimitExceeded", "wouldNotReducePosition"):
             self.assertEqual(_classify_order_error(Exception(msg)), "other", msg)
+
+
+class OrderLogTest(unittest.TestCase):
+    """report/orders.jsonl: every place, amend, cancel, fill and hedge with
+    its outcome and latency (ms); a refusal repeating every pass once."""
+
+    def setUp(self):
+        self._orig = (pb.LIVE_TRADING, pb.HEDGE_RATIO)
+        pb.LIVE_TRADING, pb.HEDGE_RATIO = True, 1.0
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb.HEDGE_RATIO = self._orig
+
+    def _bot(self, venue):
+        bot = make_bot([])
+        bot.xau_bid, bot.xau_ask, bot.xau_mid = 4450.0, 4450.2, 4450.1
+        bot.venue_ticker = types.SimpleNamespace(mid=4450.0, bid=4449.9, ask=4450.1)
+        bot.venue = venue
+        rows = []
+        bot.reporter = types.SimpleNamespace(record_order=rows.append,
+                                             record_fill=lambda r: True)
+        return bot, rows
+
+    def test_place_amend_fill_and_cancel_each_leave_a_row_with_ms(self):
+        bot, rows = self._bot(StubVenue(StubExchange()))
+        t = {"side": "sell", "purpose": "exit", "level_index": 1, "level": 0.5,
+             "price": 4450.0, "amount": 1.0}
+        bot._place("x-exit", t)
+        rec = bot.orders["x-exit"]
+        placed = rec.price                       # re-priced at the send (_fresh_target)
+        bot._amend(rec, {"price": 4450.3, "level": 0.6})
+        bot._settle("x-exit", cancel_first=True, reason="signal off")
+        evs = [r["ev"] for r in rows]
+        self.assertEqual(evs[:3], ["place", "amend", "cancel"])
+        place, amend, cancel = rows[:3]
+        self.assertEqual((place["key"], place["result"], place["price"]),
+                         ("x-exit", "ok", placed))
+        self.assertTrue(place["order_id"])
+        self.assertEqual((amend["from_price"], amend["price"], amend["result"]),
+                         (placed, 4450.3, "ok"))
+        self.assertEqual((cancel["result"], cancel["reason"]), ("ok", "signal off"))
+        for r in rows[:3]:
+            self.assertIsInstance(r["ms"], float)
+            self.assertTrue(r["live"])
+
+    def test_a_repeated_refusal_is_one_row_until_its_text_changes(self):
+        class Paused(StubVenue):
+            msg = "orders paused until 11:42:07 UTC"
+
+            def place_limit(self, *a, **k):
+                raise Exception(self.msg)
+        venue = Paused(StubExchange())
+        bot, rows = self._bot(venue)
+        t = {"side": "buy", "purpose": "entry", "level_index": 1, "level": -0.5,
+             "price": 4449.0, "amount": 1.0}
+        for _ in range(5):
+            bot._place("e", t)                           # every pass of the pause
+        self.assertEqual([(r["ev"], r["result"]) for r in rows], [("place", "paused")])
+        venue.msg = "orders paused until 11:42:19 UTC"   # a new pause: a new row
+        bot._place("e", t)
+        self.assertEqual(len(rows), 2)
+
+    def test_a_booked_fill_is_a_row_marked_inferred_without_a_trade(self):
+        bot, rows = self._bot(StubVenue(StubExchange(), order=StubOrder(filled=1.0)))
+        rec = resting(amount=1.0, booked=0.0)
+        bot.orders[rec.key] = rec
+        rec.rest_cum = 1.0
+        bot._book(rec, source="poll")
+        fill = [r for r in rows if r["ev"] == "fill"][0]
+        self.assertEqual((fill["key"], fill["source"], fill["inferred"]),
+                         (rec.key, "poll", True))
+        self.assertAlmostEqual(fill["amount"], 1.0)
+
+    def test_an_event_hedge_reports_its_hops_in_ms(self):
+        from atjte.engines.arb import hedger as H
+        from datetime import timezone as tz
+        tr = types.SimpleNamespace(timestamp=datetime(2026, 11, 9, 11, 12, 13, 362000,
+                                                      tzinfo=tz.utc),
+                                   trade_id="t1", raw={"gw_rx_ms": 1794222734646.0})
+        order = types.SimpleNamespace(raw={"gw_ms": {"in": 1794222734648.0,
+                                                     "out": 1794222734657.0},
+                                           "price": 4101.21}, order_id="1363381703")
+        h = H.timing_hops(tr, 1794222734.646, 1794222734.646, 1794222734.658, order)
+        self.assertEqual(h["fill_ts"], 1794222733.362)
+        self.assertAlmostEqual(h["venue_to_gateway_ms"], 1284.0, places=0)
+        self.assertAlmostEqual(h["terminal_broker_ms"], 9.0, places=0)
+        self.assertAlmostEqual(h["total_ms"], 12.0, places=0)
+        self.assertEqual(H._order_price(order), 4101.21)
+        self.assertIn("venue gateway +1284 ms", H.timing_line(tr, 1794222734.646,
+                                                               1794222734.646,
+                                                               1794222734.658, order))
 
 
 class AmendTest(unittest.TestCase):
@@ -913,6 +1018,76 @@ class BookAdvancesVenuePositionTest(unittest.TestCase):
         self.assertAlmostEqual(bot._venue_exposure_units(), -0.7)
 
 
+class RestateTest(unittest.TestCase):
+    """A standing block is said again while it holds — once and then
+    silence reads as an idle bot (2026-11-06, PAXG)."""
+
+    def _bot(self, logs):
+        bot = pb.ArbBot.__new__(pb.ArbBot)      # the two dicts are all it needs
+        bot._last_msgs, bot._restated_t = {}, {}
+        return bot
+
+    def test_it_speaks_once_then_again_on_the_interval(self):
+        logs = []
+        bot = self._bot(logs)
+        clock = {"t": 1000.0}
+        with mock.patch.object(pb, "_log", logs.append),              mock.patch.object(pb.time, "time", lambda: clock["t"]):
+            bot._log_restate("k", "blocked: short by 473")
+            self.assertEqual(len(logs), 1)
+            clock["t"] += pb.GATE_RESTATE_S - 1
+            bot._log_restate("k", "blocked: short by 473")
+            self.assertEqual(len(logs), 1, "restated before the interval was up")
+            clock["t"] += 2
+            bot._log_restate("k", "blocked: short by 473")
+        self.assertEqual(len(logs), 2, "a standing block went unsaid")
+        self.assertIn("(still)", logs[1])
+
+    def test_moving_figures_do_not_retrigger_it(self):
+        """The condition is the key, not the wording: the figures move with
+        every tick and re-saying it each time is the flood (2026-11-02)."""
+        logs = []
+        bot = self._bot(logs)
+        clock = {"t": 1000.0}
+        with mock.patch.object(pb, "_log", logs.append),              mock.patch.object(pb.time, "time", lambda: clock["t"]):
+            for n in (473, 2100, 88, 1500):
+                clock["t"] += 1
+                bot._log_restate("k", f"blocked: short by {n}")
+        self.assertEqual(len(logs), 1, "moving figures flooded the log")
+
+    def test_the_restatement_carries_the_figures_as_they_are_then(self):
+        logs = []
+        bot = self._bot(logs)
+        clock = {"t": 1000.0}
+        with mock.patch.object(pb, "_log", logs.append),              mock.patch.object(pb.time, "time", lambda: clock["t"]):
+            bot._log_restate("k", "blocked: short by 473")
+            clock["t"] += pb.GATE_RESTATE_S + 1
+            bot._log_restate("k", "blocked: short by 2100")
+        self.assertEqual(len(logs), 2)
+        self.assertIn("short by 2100", logs[1], "restated a stale figure")
+
+    def test_clearing_is_said_only_if_it_was_blocked(self):
+        logs = []
+        bot = self._bot(logs)
+        with mock.patch.object(pb, "_log", logs.append):
+            bot._log_cleared("k", "fits again")
+            self.assertEqual(logs, [], "said it cleared when it never blocked")
+            bot._log_restate("k", "blocked")
+            bot._log_cleared("k", "fits again")
+        self.assertEqual(logs, ["blocked", "fits again"])
+        self.assertNotIn("k", bot._last_msgs)
+        self.assertNotIn("k", bot._restated_t)
+
+    def test_zero_keeps_the_old_say_it_once(self):
+        logs = []
+        bot = self._bot(logs)
+        clock = {"t": 1000.0}
+        with mock.patch.object(pb, "_log", logs.append),              mock.patch.object(pb.time, "time", lambda: clock["t"]):
+            bot._log_restate("k", "blocked", every_s=0)
+            clock["t"] += 86_400
+            bot._log_restate("k", "blocked", every_s=0)
+        self.assertEqual(len(logs), 1)
+
+
 class PositionFaultGuardTest(unittest.TestCase):
     """The position-fault guard (2026-11-02, EXANTE demo): the gateway read
     every position as flat, so a second after each fill the bot took "flat",
@@ -938,6 +1113,67 @@ class PositionFaultGuardTest(unittest.TestCase):
         with mock.patch.object(pb.time, "time", lambda: state["now"]):
             bot._read_venue_position()
 
+    def _fill_at(self, bot, t, units=10.0, key="grid-entry-L1"):
+        with mock.patch.object(pb.time, "time", lambda: t):
+            self._fill(bot, units=units, key=key)
+
+    def test_a_fill_the_accepted_read_already_held_is_not_counted_twice(self):
+        """2026-11-06, XYZ-SP500: from a start where both figures agreed, ONE
+        1.2 fill left the venue reading -38 and the anchor at -36.8 — the
+        venue books a fill before its socket says so, a read served in
+        between already holds it, and _book added it on top."""
+        bot, state = self._bot()
+        bot.venue_pos_units = bot.pos_units = -39.2
+        # a read lands that ALREADY holds the fill the socket has not brought yet
+        state["read"], state["now"] = -38.0, 1000.0
+        self._read(bot, state)
+        self.assertAlmostEqual(bot.venue_pos_units, -38.0)      # accepted
+        # now our own socket fill for the very same 1.2 arrives
+        self._fill_at(bot, 1000.5, units=1.2, key="grid-exit-S3")
+        self.assertAlmostEqual(bot.pos_units, -38.0, places=6,
+                               msg="the position's own bookkeeping must still move")
+        self.assertAlmostEqual(bot.venue_pos_units, -38.0, places=6,
+                               msg="the anchor took the same fill twice")
+        self.assertTrue(bot._anchor_uncertain)
+        self.assertTrue(bot._bal_dirty, "no re-read was asked for")
+
+    def test_the_next_read_settles_an_uncertain_anchor_without_a_fault(self):
+        bot, state = self._bot()
+        bot.venue_pos_units = bot.pos_units = -39.2
+        state["read"], state["now"] = -38.0, 1000.0
+        self._read(bot, state)
+        self._fill_at(bot, 1000.5, units=1.2, key="grid-exit-S3")
+        state["now"] = 1002.0
+        self._read(bot, state)                       # the venue still says -38
+        self.assertIsNone(bot.pos_fault, "an uncertain anchor was blamed on the venue")
+        self.assertAlmostEqual(bot.venue_pos_units, -38.0)
+        self.assertFalse(bot._anchor_uncertain, "the doubt outlived the read that settled it")
+
+    def test_a_fill_well_clear_of_a_read_still_moves_the_anchor(self):
+        """The guard is a narrow window, not a change of model: an ordinary
+        fill must still carry the anchor with it."""
+        bot, state = self._bot()
+        state["read"], state["now"] = 0.0, 1000.0
+        self._read(bot, state)
+        self._fill_at(bot, 1000.0 + pb.POSITION_READ_SETTLE_S + 1, units=10.0)
+        self.assertAlmostEqual(bot.venue_pos_units, 10.0)
+        self.assertFalse(bot._anchor_uncertain)
+
+    def test_the_exante_read_is_still_caught_after_a_settled_fill(self):
+        """The race guard must not become a hole: a venue reading flat after
+        a fill well clear of any read is still held back and still faults."""
+        logs = []
+        bot, state = self._bot(logs)
+        state["read"], state["now"] = 0.0, 1000.0
+        self._read(bot, state)
+        self._fill_at(bot, 1000.0 + pb.POSITION_READ_SETTLE_S + 1, units=10.0)
+        state["now"] = 1010.0
+        self._read(bot, state)                       # EXANTE: still flat
+        self.assertAlmostEqual(bot._position_units(), 10.0)
+        state["now"] = 1010.0 + pb.POSITION_FAULT_GRACE_S + 1
+        self._read(bot, state)
+        self.assertIsNotNone(bot.pos_fault, "the EXANTE read stopped faulting")
+
     def test_the_exante_bug_cannot_walk_the_grid_past_its_fills(self):
         # fill, wrong read, fill, wrong read, fill: the anchor the grid and
         # its cap measure against follows the FILLS, never the broken read
@@ -961,6 +1197,96 @@ class PositionFaultGuardTest(unittest.TestCase):
         self.assertIsNone(bot._pos_suspect_since)
         self.assertIsNone(bot.pos_fault)
         self.assertEqual(bot._fills_since_read, 0.0)
+
+    def _to_fault(self, logs=None):
+        """A bot sitting in a declared position fault: fills say 10, the
+        venue says 0."""
+        bot, state = self._bot(logs if logs is not None else [])
+        self._fill(bot)
+        self._read(bot, state)
+        state["now"] += pb.POSITION_FAULT_GRACE_S + 1
+        self._read(bot, state)
+        assert bot.pos_fault is not None
+        return bot, state
+
+    def test_a_fault_whose_read_never_moves_takes_the_venues_figure(self):
+        """The fills are the wrong side of it, so no read will ever agree:
+        without this the bot sits frozen until someone restarts it
+        (2026-11-06, SP500, 48 minutes)."""
+        logs = []
+        bot, state = self._to_fault(logs)
+        state["now"] += pb.POSITION_FAULT_ADOPT_S + 1
+        self._read(bot, state)                       # still 0, unchanged throughout
+        self.assertIsNone(bot.pos_fault, "the fault outlived a steady disagreement")
+        self.assertAlmostEqual(bot.venue_pos_units, 0.0, msg="the read was not accepted")
+        self.assertTrue(any("POSITION FAULT resolved" in m for m in logs), logs)
+        self.assertFalse(any("position fault" in r for r in bot.close_only_reasons))
+
+    def test_a_read_that_moves_is_never_adopted(self):
+        """The case the guard exists for: EXANTE dropped every position and
+        the reads flapped. A moving read restarts the clock."""
+        bot, state = self._to_fault()
+        tol = bot._pos_fault_tolerance()
+        for step in (0.0, 40.0, 0.0, 40.0):          # well outside the tolerance
+            self.assertGreater(abs(step - 0.0) if step else 40.0, tol)
+            state["read"] = step
+            state["now"] += pb.POSITION_FAULT_ADOPT_S * 0.9
+            self._read(bot, state)
+        self.assertIsNotNone(bot.pos_fault, "a flapping read was adopted")
+
+    def test_a_read_that_wanders_inside_the_tolerance_is_the_same_figure(self):
+        """Stability is judged on the fault tolerance, not on equality: a
+        read jittering below it is not the venue changing its mind."""
+        bot, state = self._to_fault()
+        tol = bot._pos_fault_tolerance()
+        state["read"] = tol / 3.0
+        state["now"] += pb.POSITION_FAULT_ADOPT_S + 1
+        self._read(bot, state)
+        self.assertIsNone(bot.pos_fault, "jitter inside the tolerance blocked adoption")
+
+    def test_a_fill_of_ours_restarts_the_window(self):
+        """A fill moves the figure the venue is judged against, so the read
+        must hold still again before it is taken."""
+        bot, state = self._to_fault()
+        state["now"] += pb.POSITION_FAULT_ADOPT_S - 10
+        with mock.patch.object(pb.time, "time", lambda: state["now"]):
+            self._fill(bot)                          # our own fill moved the anchor
+        state["now"] += 20                           # past the original window
+        self._read(bot, state)
+        self.assertIsNotNone(bot.pos_fault, "the window was not restarted by a fill")
+        state["now"] += pb.POSITION_FAULT_ADOPT_S + 1
+        self._read(bot, state)                       # quiet since: now it is taken
+        self.assertIsNone(bot.pos_fault)
+
+    def test_adoption_can_be_switched_off(self):
+        bot, state = self._to_fault()
+        keep, pb.POSITION_FAULT_ADOPT_S = pb.POSITION_FAULT_ADOPT_S, None
+        try:
+            state["now"] += 86_400
+            self._read(bot, state)
+            self.assertIsNotNone(bot.pos_fault, "None did not keep the freeze")
+        finally:
+            pb.POSITION_FAULT_ADOPT_S = keep
+
+    def test_the_frozen_parity_line_is_logged_again_when_the_figures_move(self):
+        """Under one key it was said twice in 48 minutes while the
+        reconciler went on printing 'fixing hedge' every 60 s."""
+        logs = []
+        bot, state = self._to_fault(logs)
+        bot.mt5 = types.SimpleNamespace(place_order=lambda *a, **k: None,
+                                        get_positions=lambda sym: [])
+        live, pb.LIVE_TRADING = pb.LIVE_TRADING, True
+        try:
+            bot._hedge(source="reconcile")
+            bot._hedge(source="reconcile")           # same figures: said once
+            first = sum(1 for m in logs if "FROZEN by the position fault" in m)
+            self.assertEqual(first, 1)
+            bot.pos_fault.update(read=5.0)           # the picture changed
+            bot._hedge(source="reconcile")
+        finally:
+            pb.LIVE_TRADING = live
+        said = sum(1 for m in logs if "FROZEN by the position fault" in m)
+        self.assertEqual(said, 2, "the freeze went unsaid after the figures moved")
 
     def test_a_read_that_stays_wrong_is_a_fault_that_gates_and_freezes(self):
         logs = []
@@ -3370,6 +3696,35 @@ class SpreadSamplingTest(unittest.TestCase):
             self.assertEqual(len(bot2._samples), 2)
             self.assertAlmostEqual(bot2._samples[-1][1], -5.0)
 
+    def test_the_bid_and_ask_basis_ride_with_each_sample_and_survive_a_restart(self):
+        """The chart draws the bid / ask basis instead of the mid: each 1 s
+        sample stores the latest pair, when it is fresh, beside the mid."""
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with mock.patch.object(pb, "SAMPLES_FILE", tmp / "spread_1s.json"):
+            bot = self._bot()
+            bot._basis_1s = deque(maxlen=1000)
+            t0 = time.time()
+            bot._basis_now = (t0, 8.86, 9.07)               # what _push_basis keeps
+            bot._sample_spread(t0)
+            bot._basis_now = (t0 - 60.0, 1.0, 2.0)          # a stale pair
+            bot._sample_spread(t0 + 1.0)
+            self.assertEqual(list(bot._basis_1s), [(t0, 8.86, 9.07)])
+            self.assertEqual(len(bot._samples), 2)          # the mid always
+            bot._persist_samples()
+            data = json.loads((tmp / "spread_1s.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["basis"], [[round(t0, 2), 8.86, 9.07]])
+            self.assertEqual(data["basis_mode"], pb.BASIS_MODE)
+            bot2 = self._bot()
+            bot2._samples.clear()
+            bot2._load_samples()
+            self.assertEqual([(b, a) for _t, b, a in bot2._basis_1s], [(8.86, 9.07)])
+            with mock.patch.object(pb, "BASIS_MODE", "mid-mid"):   # another mode:
+                bot3 = self._bot()                                  # not reloaded
+                bot3._samples.clear()
+                bot3._load_samples()
+                self.assertEqual(list(bot3.__dict__.get("_basis_1s") or []), [])
+                self.assertEqual(len(bot3._samples), 2)
+
 
 class EntryCapacityTest(unittest.TestCase):
     """How much a NEW entry may be — the one calculation that differs
@@ -3830,6 +4185,58 @@ class GatewayHistoryTest(unittest.TestCase):
         bot.mt5 = types.SimpleNamespace(rates=lambda *a: [])
         self.assertEqual(bot.history_closes(0.0, 60.0), ({}, {}))
 
+    def test_an_empty_page_is_a_closed_market_not_the_end(self):
+        """A 24 h window that opens on a Sunday starts on a closed CME: the
+        first page is empty, and the read must page on to the session
+        (2026-11-09: it stopped, and the venue leg of the day stayed empty)."""
+        t0 = 1_800_000_000
+        page = 4
+        candles = [[(t0 + 60 * (2 * page + i)) * 1000, 0, 0, 0, 100.0 + i, 0]
+                   for i in range(3)]                   # nothing in the first 2 pages
+        ex = self._Exchange(candles=candles)
+        ex.fetch_ohlcv = lambda symbol, tf, since=None, limit=None: (
+            ex.asked.append((since, limit)) or
+            [c for c in candles if since <= c[0] < since + limit * 60_000])
+        bot = self._bot(ex)
+        bot._srv_offset_s = 0.0
+        bot.mt5 = types.SimpleNamespace(rates=lambda *a: [])
+        with mock.patch.object(pb, "HISTORY_PAGE", page):
+            venue, _ = bot.history_closes(t0, t0 + 60 * 4 * page)
+        self.assertEqual(sorted(venue), [t0 + 60 * (2 * page + i) for i in range(3)])
+        self.assertEqual([s for s, _ in ex.asked][:3],
+                         [t0 * 1000, (t0 + 60 * page) * 1000, (t0 + 120 * page) * 1000])
+
+    def test_the_history_read_never_blocks_the_housekeeping_pass(self):
+        """Databento-priced candles take 15-30 s: the read runs on a thread
+        of its own with a long reply timeout, and a later pass applies it."""
+        from atjte.gateways.fix import client as fc
+        bot = self._bot(self._Exchange())
+        bot._srv_offset_s, bot._history_backfilled = 0.0, False
+        applied, seen_timeout = [], []
+        bot.reporter = types.SimpleNamespace(
+            backfill_bars=lambda v, m, now: applied.append((v, m)) or 1)
+        gate = threading.Event()
+
+        def slow(since, now):
+            seen_timeout.append(getattr(fc._thread_timeout, "s", None))
+            gate.wait(5.0)
+            return {60: 1.0}, {60: 2.0}
+        bot.history_closes = slow
+        t = 1_800_000_000.0
+        t_call = time.time()
+        bot._backfill_report_bars(t)                    # starts the read, returns
+        self.assertLess(time.time() - t_call, 0.5)
+        bot._backfill_report_bars(t + 2)                # still reading: nothing yet
+        self.assertEqual(applied, [])
+        gate.set()
+        bot._history_job.done.wait(3.0)
+        bot._backfill_report_bars(t + 4)
+        self.assertEqual(applied, [({60: 1.0}, {60: 2.0})])
+        self.assertEqual(seen_timeout, [pb.HISTORY_READ_TIMEOUT_S])
+        self.assertTrue(bot._history_backfilled)
+        self.assertIsNone(getattr(fc._thread_timeout, "s", None))   # this thread's own
+
+    @mock.patch.object(pb, "HISTORY_IN_THREAD", False)
     def test_an_empty_leg_is_asked_again_and_the_retries_are_capped(self):
         """An MT5 terminal answers copy_rates_range with nothing while it is
         still downloading the symbol's M1 history: one empty read must not
@@ -5335,6 +5742,34 @@ class InferredFillThenVenueTradeTest(unittest.TestCase):
         bot, rows = self._incident(venue)
         self._assert_reported_once(bot, rows)
 
+    def test_every_venue_trade_gets_its_chart_mark_retired_order_or_not(self):
+        """2026-11-09, MGC: the amend found grid-entry-L1 gone, the bot
+        booked it by inference and retired the order; the venue's trade came
+        a second later. Its report row was written, but the inferred fill's
+        mark was dropped and none was made for the trade: no marker on the
+        chart. Each trade is marked once, as a ws mark, under its key."""
+        venue = StubVenue(StubExchange())
+        venue.cancel_final_result = StubOrder(0.275, status=OrderStatus.FILLED)
+        bot, rec, rows = self._bot(venue)
+        marks = []
+
+        def mark(side, amount, price, key, trade_id, order_id, source, **kw):
+            marks.append((trade_id, source, key, amount))
+            bot._pending_marks.append({"row": [None, source, trade_id, order_id]})
+        bot._mark_fill = mark
+        bot._pending_marks = []
+        bot._process_fill_events(self._trade("t1", 0.073, 4140.0))     # live order
+        bot._settle(rec.key, cancel_first=True, reason="signal off", defer_read=True)
+        bot._process_fill_events(self._trade("t2", 0.03, 4139.8))      # retired order
+        bot._process_fill_events(self._trade("t3", 0.172, 4139.8))
+        ws = [m for m in marks if m[1] == "ws"]
+        self.assertEqual([m[0] for m in ws], ["t1", "t2", "t3"])
+        self.assertEqual({m[2] for m in ws}, {"risk-flatten"})
+        self.assertAlmostEqual(sum(m[3] for m in ws), 0.275)
+        left = [m["row"] for m in bot._pending_marks]
+        self.assertEqual([r[2] for r in left if r[1] == "ws"], ["t1", "t2", "t3"])
+        self.assertFalse([r for r in left if r[1] != "ws"])   # the guess's mark gave way
+
     def test_a_late_part_on_a_parked_order_keeps_its_purpose(self):
         # the cancel took; the slow tick's read books the rest; ws then lands
         venue = StubVenue(StubExchange(), order=StubOrder(0.275, status=OrderStatus.FILLED))
@@ -5528,6 +5963,191 @@ class ReconcileHaltTest(unittest.TestCase):
         bot._hedge(source="startup")
         self.assertEqual(sent, [(pb.OrderSide.BUY, 0.03)])
         self.assertIsNone(bot.hedge_halt)
+
+
+class QueuedFillRaceTest(unittest.TestCase):
+    """2026-11-09, XYZ-JP225 (a member's report): the event hedger sent the
+    MT5 order at 16:30:03 and the fill was BOOKED at 16:30:09 — it sat in the
+    queue behind a busy loop. A position read accepted in between already held
+    it, and the 2 s window timed from the booking let _book add it again."""
+
+    def _bot(self):
+        bot = make_bot([])
+        bot.venue.amount_min = 0.0001
+        bot.venue_pos_units = bot.pos_units = -0.0515
+        state = {"read": -0.103}
+        bot.venue.read_position = lambda: setattr(bot.venue, "position_units", state["read"])
+        return bot, state
+
+    def _book_queued(self, bot, arrived, booked_at, units=0.0515):
+        rec = resting(key="sell-short-entry", side="sell", purpose="entry", amount=units)
+        rec.ws_cum = units
+        tr = types.SimpleNamespace(price=60530.0, rx_t=arrived)
+        with mock.patch.object(pb.time, "time", lambda: booked_at):
+            bot._book(rec, "ws", trade=tr)
+
+    def test_a_fill_queued_past_an_accepted_read_is_not_counted_twice(self):
+        bot, state = self._bot()
+        with mock.patch.object(pb.time, "time", lambda: 1003.5):
+            bot._read_venue_position()                  # holds the fill already
+        self.assertAlmostEqual(bot.venue_pos_units, -0.103)
+        self._book_queued(bot, arrived=1003.0, booked_at=1009.0)
+        self.assertAlmostEqual(bot.pos_units, -0.103, places=8)
+        self.assertAlmostEqual(bot.venue_pos_units, -0.103, places=8,
+                               msg="the anchor took the queued fill twice")
+        self.assertTrue(bot._anchor_uncertain)
+
+    def test_a_fill_arriving_well_after_the_read_still_moves_the_anchor(self):
+        bot, state = self._bot()
+        state["read"] = -0.0515
+        with mock.patch.object(pb.time, "time", lambda: 1000.0):
+            bot._read_venue_position()
+        self._book_queued(bot, arrived=1000.0 + pb.POSITION_READ_SETTLE_S + 1,
+                          booked_at=1000.0 + pb.POSITION_READ_SETTLE_S + 1.2)
+        self.assertAlmostEqual(bot.venue_pos_units, -0.103, places=8)
+        self.assertFalse(bot._anchor_uncertain)
+
+
+class DerivedRestFilledTest(unittest.TestCase):
+    """2026-11-09, XYZ-JP225: Hyperliquid's order reads carry no filled
+    amount (ccxt: origSz - sz), and Hyperliquid lowers sz with no trade when a
+    reduce-only exit is bigger than the position. Every phantom the bot booked
+    was the order's size less the position (0.1283 - 0.1030 = 0.0253), the
+    venue's position never moved, and the reconciler sold MT5 on it."""
+
+    def _parked(self, filled, trade_units=0.0, trade_error=None, amount=0.1283):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(),
+                              order=StubOrder(filled, status=OrderStatus.CANCELED))
+        bot.venue.rest_filled_trade_backed = False
+        bot.venue.trade_units, bot.venue.trade_error = trade_units, trade_error
+        bot._defer_inferred = lambda *a, **k: None
+        rec = resting(key="buy-short-exit", side="buy", purpose="exit", amount=amount)
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        return bot, rec
+
+    def test_a_resized_reduce_only_order_books_no_fill(self):
+        bot, rec = self._parked(filled=0.0253, trade_units=0.0)
+        bot._drain_settling(time.time())
+        self.assertAlmostEqual(bot.pos_units, 0.0)
+        self.assertAlmostEqual(rec.booked, 0.0)
+        self.assertEqual(bot.counters.get("rest_fill_unconfirmed"), 1)
+        self.assertIn("o1", bot._retired)
+
+    def test_only_the_traded_part_of_a_resized_order_is_booked(self):
+        """16:30:24: 0.00024 really traded and 0.0253 was the resize."""
+        bot, rec = self._parked(filled=0.02554, trade_units=0.00024)
+        bot._drain_settling(time.time())
+        self.assertAlmostEqual(bot.pos_units, 0.00024, places=8)
+
+    def test_a_failed_trade_read_books_nothing_and_a_late_trade_is_booked(self):
+        bot, rec = self._parked(filled=0.0253, trade_error=Exception("timeout"))
+        bot._drain_settling(time.time())
+        self.assertAlmostEqual(bot.pos_units, 0.0)
+        self.assertIn("o1", bot._retired)               # settled, nothing booked
+        bot.fill_q = queue.Queue()
+        bot.counters["fill_events"] = 0
+        bot._report_fill = lambda *a, **k: None
+        bot._hedge = lambda: None
+        bot.dump_state = lambda: None
+        tr = types.SimpleNamespace(symbol=None, order_id="o1", trade_id="t1", amount=0.01,
+                                   price=60500.0, timestamp=None,
+                                   side=types.SimpleNamespace(value="buy"))
+        bot._process_fill_events(tr)
+        self.assertAlmostEqual(bot.pos_units, 0.01, places=8,
+                               msg="a real trade on a retired order never moved the position")
+
+    def test_a_venue_with_counted_fills_is_not_second_guessed(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange(),
+                              order=StubOrder(0.4, status=OrderStatus.CANCELED))
+        rec = resting(side="sell", purpose="entry", amount=1.0)
+        bot.orders[rec.key] = rec
+        bot._settle(rec.key, cancel_first=True, reason="requote", defer_read=True)
+        bot._drain_settling(time.time())
+        self.assertAlmostEqual(bot.pos_units, -0.4)
+        self.assertEqual(bot.venue.trade_reads, 0)
+
+    def test_a_resting_resized_order_is_checked_once_not_every_poll(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange())
+        bot.venue.rest_filled_trade_backed = False
+        rec = resting(key="buy-short-exit", side="buy", purpose="exit", amount=0.07746)
+        o = StubOrder(0.04923, status=OrderStatus.OPEN)
+        for _ in range(3):
+            rec.rest_cum = max(rec.rest_cum, bot._rest_filled_units(rec, o, "poll"))
+            bot._book(rec, "poll")
+        self.assertEqual(bot.venue.trade_reads, 1)
+        self.assertAlmostEqual(bot.pos_units, 0.0)
+
+
+class PositionDisagreementGuardsTest(unittest.TestCase):
+    """What the bot does while a venue read disagrees with its fills."""
+
+    def setUp(self):
+        self._live = pb.LIVE_TRADING
+        pb.LIVE_TRADING = True
+
+    def tearDown(self):
+        pb.LIVE_TRADING = self._live
+
+    def test_no_parity_hedge_while_the_read_is_held_back(self):
+        """16:30:26: the reconciler sold 3 lots of MT5 on an anchor holding
+        phantom fills, 14 s before the fault froze parity."""
+        bot = make_bot([])
+        bot.venue_pos_units, bot._fills_since_read = 2.0, 5.0
+        bot.venue.read_position = lambda: setattr(bot.venue, "position_units", -3.0)
+        mt5_reads = []
+        bot._read_mt5_net_units = lambda: mt5_reads.append(1) or 0.0
+        bot._hedge(source="reconcile")
+        self.assertIsNotNone(bot._pos_suspect_since)
+        self.assertEqual(mt5_reads, [], "a parity hedge went on toward MT5")
+        self.assertAlmostEqual(bot.venue_pos_units, 2.0)
+
+    def test_a_parity_mode_fill_still_hedges_while_the_venue_lags(self):
+        """HEDGE_MODE 'parity' hedges each fill from _hedge('fill'); the read
+        right after a fill normally lags it, and that must not hold the hedge."""
+        bot = make_bot([])
+        bot.venue_pos_units, bot._fills_since_read = 2.0, 5.0
+        bot.venue.read_position = lambda: setattr(bot.venue, "position_units", -3.0)
+        mt5_reads = []
+        bot._read_mt5_net_units = lambda: mt5_reads.append(1) or -2.0
+        bot._hand_off_to_hedger = lambda *a, **k: None
+        bot._hedge(source="fill")
+        self.assertEqual(mt5_reads, [1], "the fill's own parity hedge was held")
+
+    def _exit(self, bot, side, amount):
+        return bot._clamp_exit_to_venue("k", {"side": side, "amount": amount,
+                                              "purpose": "exit", "price": 1.0})
+
+    def _read_bot(self, read, read_t=1000.0, last_fill_t=900.0):
+        bot = make_bot([])
+        bot._venue_read_units, bot._venue_read_t = read, read_t
+        bot._last_fill_t = last_fill_t
+        return bot
+
+    def test_an_exit_is_never_bigger_than_the_venue_position(self):
+        t = self._exit(self._read_bot(+0.103), "sell", 0.1283)
+        self.assertAlmostEqual(t["amount"], 0.103)
+
+    def test_an_exit_the_venue_read_contradicts_is_not_sent(self):
+        """17:06: tracked +0.021 long, the account -0.02823 short — a
+        sell-long-exit every second, every one refused."""
+        self.assertIsNone(self._exit(self._read_bot(-0.02823), "sell", 0.021))
+        self.assertIsNotNone(self._exit(self._read_bot(-0.02823), "buy", 0.02823))
+
+    def test_a_read_older_than_the_last_fill_does_not_judge_an_exit(self):
+        bot = self._read_bot(0.0, read_t=1000.0, last_fill_t=1001.0)
+        self.assertEqual(self._exit(bot, "sell", 0.0515)["amount"], 0.0515)
+
+    def test_a_fault_reports_the_venue_position_not_the_anchor(self):
+        bot = self._read_bot(-0.02823)
+        bot.venue_pos_units = 0.021
+        bot.pos_fault = {"read": -0.02823, "expected": 0.021}
+        self.assertAlmostEqual(bot._reported_position_units(), -0.02823)
+        bot.pos_fault = None
+        self.assertAlmostEqual(bot._reported_position_units(), 0.021)
 
 
 if __name__ == "__main__":

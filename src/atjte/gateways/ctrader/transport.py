@@ -132,7 +132,8 @@ class Transport:
         self.reason = "not connected"
 
     def _tls(self):
-        raw = socket.create_connection((self.host, self.port), timeout=self.timeout_s)
+        from atjte.net import no_delay
+        raw = no_delay(socket.create_connection((self.host, self.port), timeout=self.timeout_s))
         from atjte.tls import client_context    # the OS store + certifi's roots
         ctx = client_context()
         return ctx.wrap_socket(raw, server_hostname=self.host)

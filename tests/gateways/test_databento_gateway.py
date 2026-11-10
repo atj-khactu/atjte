@@ -235,6 +235,121 @@ def _mbp1(bid, ask, bsz=5, asz=7, iid=7):
               ts_event=NOW * NS_)
 
 
+def _mbp10(bids, asks, iid=7):
+    """An ``mbp-10`` record: ``bids`` / ``asks`` = [(px, size), ...] best
+    first; the levels past them unset (Databento's INT64_MAX sentinel)."""
+    rec = NS(rtype=U.RTYPE_MBP_10, instrument_id=iid, ts_event=NOW * NS_)
+    for i in range(10):
+        for side, rows in (("bid", bids), ("ask", asks)):
+            px, sz = rows[i] if i < len(rows) else (None, 0)
+            setattr(rec, f"pretty_{side}_px_{i:02d}", float("nan") if px is None else px)
+            setattr(rec, f"{side}_px_{i:02d}", 0)
+            setattr(rec, f"{side}_sz_{i:02d}", sz)
+    return rec
+
+
+class BookDepthTest(unittest.TestCase):
+    """``quote_schema`` mbp-10: the ticker also carries the 10-level book,
+    and a change below the top is streamed too (the order book card)."""
+
+    def _up(self):
+        lv = FakeLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: NOW,
+                                 quote_schema="mbp-10")
+        up.start()
+        got = []
+        up.set_quote_handler(lambda s, q: got.append(q))
+        up.subscribe_quotes("MGCZ6")
+        lv.cb(NS(stype_in_symbol="MGCZ6", instrument_id=7))
+        return up, lv, got
+
+    def test_mbp10_streams_the_book_with_its_ticker(self):
+        up, lv, got = self._up()
+        self.assertEqual(lv.subs, [("GLBX.MDP3", "mbp-10", ("MGCZ6",), "raw_symbol")])
+        bids = [(4124.1, 5), (4124.0, 7), (4123.9, 2)]
+        asks = [(4124.3, 4), (4124.4, 6)]
+        lv.cb(_mbp10(bids, asks))
+        q = got[-1]
+        self.assertEqual((q["bid"], q["ask"]), (4124.1, 4124.3))
+        self.assertEqual(q["info"]["book"], {"bids": [[p, float(s)] for p, s in bids],
+                                             "asks": [[p, float(s)] for p, s in asks]})
+        lv.cb(_mbp10(bids, asks))                       # nothing moved: not resent
+        self.assertEqual(len(got), 1)
+        lv.cb(_mbp10(bids[:2] + [(4123.9, 9)], asks))   # level 3 only: resent
+        self.assertEqual(len(got), 2)
+        self.assertEqual(got[-1]["info"]["book"]["bids"][2], [4123.9, 9.0])
+
+    def test_a_refused_mbp10_falls_back_to_top_of_book(self):
+        """2026-11-09: Databento answered "Not authorized for mbp-10 schema"
+        and the quotes, with every bot pricing off them, went silent."""
+        up, lv, got = self._up()
+        lv.cb(NS(err="Not authorized for mbp-10 schema"))         # Databento's ErrorMsg
+        self.assertTrue(wait_for(lambda: ("GLBX.MDP3", "mbp-1", ("MGCZ6",), "raw_symbol")
+                                 in lv.subs))
+        self.assertEqual(up.quote_schema, "mbp-1")
+        self.assertIn("mbp-10 refused", up.status()["quote_fallback"])
+        lv.cb(NS(err="Not authorized for mbp-10 schema"))         # once only
+        self.assertEqual(up.counters["quote_fallbacks"], 1)
+        lv.cb(_mbp1(4124.1, 4124.3))
+        self.assertEqual(got[-1]["bid"], 4124.1)                   # quotes flow again
+
+    def test_a_subscription_refused_at_once_is_retried_on_top_of_book(self):
+        class Strict(FakeLive):
+            def subscribe(self, dataset, schema, symbols, stype_in):
+                if schema == "mbp-10":
+                    raise ValueError("Not authorized for mbp-10 schema")
+                super().subscribe(dataset, schema, symbols, stype_in)
+        lv = Strict()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: NOW,
+                                 quote_schema="mbp-10")
+        up.start()
+        up.subscribe_quotes("MGCZ6")                               # no exception
+        self.assertEqual(lv.subs, [("GLBX.MDP3", "mbp-1", ("MGCZ6",), "raw_symbol")])
+        self.assertEqual(up.quote_schema, "mbp-1")
+
+    def test_cme_trade_prints_are_journaled_for_the_quoted_symbols(self):
+        """A fill on a broker routing to CME is timed against CME's own trade
+        print: the gateway journals every trade of a quoted symbol."""
+        import tempfile
+        from pathlib import Path
+        td = Path(tempfile.mkdtemp())
+        old = td / "MGCZ6_20000101.jsonl"
+        old.write_text("{}\n", encoding="utf-8")                     # past the keep
+        lv = FakeLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: NOW, prints_dir=td)
+        up.start()
+        up.subscribe_quotes("MGCZ6")
+        lv.cb(NS(stype_in_symbol="MGCZ6", instrument_id=7))
+        trade = _mbp1(4117.2, 4117.4)
+        trade.action, trade.pretty_price, trade.price = "T", 4117.3, 0
+        trade.size, trade.side = 1, "A"
+        lv.cb(trade)
+        lv.cb(_mbp1(4117.2, 4117.4))                                  # a quote: not a print
+        day = time.strftime("%Y%m%d", time.gmtime(NOW))
+        rows = [json.loads(l) for l in (td / f"MGCZ6_{day}.jsonl").read_text(
+            encoding="utf-8").splitlines()]
+        self.assertEqual(rows, [{"t": NOW * NS_, "px": 4117.3, "sz": 1.0, "side": "A"}])
+        self.assertFalse(old.exists())
+        self.assertEqual(up.counters["prints"], 1)
+
+    def test_mbp1_carries_no_book_and_the_setting_is_checked(self):
+        lv = FakeLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: NOW)
+        up.start()
+        got = []
+        up.set_quote_handler(lambda s, q: got.append(q))
+        up.subscribe_quotes("MGCZ6")
+        lv.cb(NS(stype_in_symbol="MGCZ6", instrument_id=7))
+        lv.cb(_mbp1(4124.1, 4124.3))
+        self.assertNotIn("book", got[-1]["info"])
+        from atjte.gateways.databento import config as DC
+        self.assertEqual(DC.QUOTE_SCHEMAS, ("mbp-1", "mbp-10"))
+
+
 class RefusingLive(FakeLive):
     def subscribe(self, dataset, schema, symbols, stype_in):
         if "BAD" in symbols:

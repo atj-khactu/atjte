@@ -540,6 +540,13 @@ class Ingestor:
         for s in sources:
             for table in ("fill_sources", "deal_sources", "funding_sources"):
                 self.db.execute(f"DELETE FROM {table} WHERE strategy = ?", (s.key,))
+            # _pnl UPSERTS the days it computes, so a day that no longer has
+            # any data survives a rebuild as a stale row: after dropping
+            # trades from a strategy's file (a hedge book that turned out to
+            # be another system's), its days kept their old numbers while the
+            # trades behind them were gone. Clear them and let _pnl(force)
+            # below write the authoritative set.
+            self.db.execute("DELETE FROM pnl_daily WHERE strategy = ?", (s.key,))
             self._sample_snapshot(s, result)
             self._ingest_trades(s, result, True, seen)
             self._ingest_bars(s, result, True)

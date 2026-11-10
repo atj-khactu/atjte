@@ -61,11 +61,13 @@ def wait_for(cond, timeout=2.0):
 
 
 class EventHedgerTest(unittest.TestCase):
-    def hedger(self, mt5, live=True, to_units=lambda c: c, volume_max=0.0, clock=time.time):
+    def hedger(self, mt5, live=True, to_units=lambda c: c, volume_max=0.0, clock=time.time,
+               round_fraction=1.0, threshold_units=1.0):
         results, failures, logs = [], [], []
         h = EventHedger(place=mt5.place, symbol_venue="XAUT/USD:USD", to_units=to_units,
                         contract_size=100.0, volume_step=0.01, volume_min=0.01,
-                        threshold_units=1.0, live=live, volume_max=volume_max, started_utc=NOW - timedelta(seconds=5),
+                        threshold_units=threshold_units, round_fraction=round_fraction,
+                        live=live, volume_max=volume_max, started_utc=NOW - timedelta(seconds=5),
                         on_result=lambda *a: results.append(a),
                         on_failure=failures.append, log=logs.append, clock=clock)
         h.start()
@@ -178,6 +180,28 @@ class EventHedgerTest(unittest.TestCase):
         h.submit(fill("t2", "buy", 0.7))        # 1.2 owed now: one lot goes, 0.2 stays
         self.assertTrue(wait_for(lambda: mt5.orders))
         self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.01)])
+        self.assertTrue(wait_for(lambda: abs(h.residue_units + 0.2) < 1e-9))
+
+    def test_round_up_from_three_quarters_and_back_only_after_half_a_lot(self):
+        """HEDGE_ROUND_FRACTION 0.75 (lot = 1 unit here; the derived
+        threshold follows it): 0.8 owed sends a whole lot and leaves 0.2
+        over-hedged; 0.6 is carried; the hedge reverses only once the gap
+        has moved half a lot back."""
+        mt5 = FakeMt5()
+        h, _r, _f, logs = self.hedger(mt5, round_fraction=0.75, threshold_units=0.75)
+        h.submit(fill("t1", "buy", 0.6))        # 0.6 lot: under 0.75, carried
+        self.assertTrue(wait_for(lambda: h.counters["residue_holds"] == 1))
+        self.assertEqual(mt5.orders, [])
+        h.submit(fill("t2", "buy", 0.2))        # 0.8 owed: one whole lot
+        self.assertTrue(wait_for(lambda: mt5.orders))
+        self.assertEqual(mt5.orders, [(OrderSide.SELL, 0.01)])
+        self.assertTrue(wait_for(lambda: abs(h.residue_units - 0.2) < 1e-9))  # over by 0.2
+        h.submit(fill("t3", "sell", 0.5))       # gap 0.2 -> 0.7 the other way: carried
+        self.assertTrue(wait_for(lambda: h.counters["residue_holds"] == 2))
+        self.assertEqual(len(mt5.orders), 1)
+        h.submit(fill("t4", "sell", 0.1))       # 0.8: the lot comes back
+        self.assertTrue(wait_for(lambda: len(mt5.orders) == 2))
+        self.assertEqual(mt5.orders[1], (OrderSide.BUY, 0.01))
         self.assertTrue(wait_for(lambda: abs(h.residue_units + 0.2) < 1e-9))
 
     def test_the_parity_path_keeps_the_residue_in_step(self):

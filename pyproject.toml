@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atjte"
-version = "0.2.21"
+version = "0.2.22"
 description = "ATJ trading engines: cross-venue arbitrage market making between crypto exchanges (CCXT) and CFD platforms (MetaTrader 5)"
 readme = "README.md"
 license = "MIT"
@@ -14,6 +14,7 @@ authors = [{ name = "ATJ Traders" }]
 keywords = ["trading", "arbitrage", "market-making", "ccxt", "kraken", "metatrader5", "fix", "ibkr"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Private :: Do Not Upload",
     "Intended Audience :: Financial and Insurance Industry",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",

@@ -174,17 +174,22 @@ class _Bucket:
         self._inflight = threading.BoundedSemaphore(inflight)
         self.waited_ms = 0.0
 
-    def take(self, n: int = 1, max_wait_s: float = 5.0) -> None:
+    def take(self, n: int = 1, max_wait_s: float = 5.0, keep: float = 0.0) -> None:
+        """``n`` tokens, waiting up to ``max_wait_s`` for them. ``keep``:
+        tokens that must be LEFT after this take — the share only cancels
+        may spend (a place or amend passes the gateway's cancel reserve), so
+        a quote can come down while new orders are held."""
+        keep = min(float(keep), max(0.0, self.cap - n))
         deadline = self._clock() + max_wait_s
         while True:
             with self._lock:
                 now = self._clock()
                 self.tokens = min(self.cap, self.tokens + (now - self.t) * self.rate)
                 self.t = now
-                if self.tokens >= n:
+                if self.tokens - n >= keep:
                     self.tokens -= n
                     return
-                wait = (n - self.tokens) / self.rate
+                wait = (n + keep - self.tokens) / self.rate
             if self._clock() + wait > deadline:
                 raise GatewayRefusal(f"the machine's {self.venue} message budget is "
                                      f"exhausted — retry shortly", "error")
@@ -208,6 +213,16 @@ class HlGateway:
     ACCOUNT_DMS_REARM_S = ACCOUNT_DMS_REARM_S
     #: what a ``read`` may ask for, and how long each answer is cached
     READ_WHAT = P.READ_WHAT
+    #: reads answered on a thread of their own, never on the client's
+    #: connection thread (:meth:`handle`) — only where the upstream may be
+    #: read from several threads at once (the EXANTE gateway's candles)
+    OFF_THREAD_READS: tuple = ()
+    #: budget tokens a place or amend must leave for cancels (the EXANTE
+    #: gateway's: a quote must come down while new orders wait)
+    CANCEL_RESERVE: float = 0.0
+    #: the venue counts each cancelled order as a request (EXANTE: one FIX
+    #: cancel each), not one batch message (Hyperliquid)
+    CANCEL_COST_PER_ORDER: bool = False
     READ_TTL_S = READ_TTL_S
 
     def __init__(self, upstream: Upstream, *, host: str = "127.0.0.1",
@@ -359,6 +374,8 @@ class HlGateway:
         while not self._stop.is_set():
             try:
                 sock, _addr = self._srv.accept()
+                from atjte.net import no_delay
+                no_delay(sock)
             except (socket.timeout, TimeoutError):
                 continue
             except OSError:
@@ -511,6 +528,17 @@ class HlGateway:
             self._send(c, P.error(f"unknown op {op!r}"))
             return
         req = int(msg.get("id") or 0)
+        if op == P.READ and str(msg.get("what") or "") in self.OFF_THREAD_READS:
+            # a slow read (candles: seconds to tens of seconds upstream) is
+            # answered on a thread of its own — the client's connection
+            # thread serves its messages one at a time, and its cancels,
+            # amends and pings must never queue behind a chart's history
+            threading.Thread(target=self._answer, args=(c, op, msg, req),
+                             name=f"{self.THREAD_PREFIX}-read", daemon=True).start()
+            return
+        self._answer(c, op, msg, req)
+
+    def _answer(self, c: _Client, op: str, msg: dict, req: int) -> None:
         try:
             if op == P.READ:
                 result = self._read(c, str(msg.get("what") or ""), msg.get("args") or {})
@@ -577,8 +605,10 @@ class HlGateway:
         if op == P.PLACE:
             self._quota_gate(c.account, exit_=bool(msg.get("reduce_only")))
             cid = self._ids.next(c.slot)
+            # the budget BEFORE the in-flight slot: an order waiting for
+            # budget must not hold a slot a cancel needs
+            self._bucket.take(keep=self.CANCEL_RESERVE)
             with self._bucket.inflight():
-                self._bucket.take()
                 o = self.up.place(c.account, c.symbol, str(msg["side"]),
                                   float(msg["amount"]), float(msg["price"]),
                                   post_only=bool(msg.get("post_only", True)),
@@ -603,8 +633,8 @@ class HlGateway:
                 raise GatewayRefusal(f"order {oid}: its size is unknown (adopted at "
                                      f"start) — send the amount with the amend",
                                      "invalid_order")
+            self._bucket.take(keep=self.CANCEL_RESERVE)
             with self._bucket.inflight():
-                self._bucket.take()
                 # the side is the order's own (the bot need not read it back)
                 o = self.up.amend(c.account, c.symbol, oid, str(msg.get("side") or owned.side),
                                   float(msg["price"]), amount, cloid=cid,
@@ -639,8 +669,16 @@ class HlGateway:
         raise GatewayRefusal(f"unknown order op {op!r}", "not_supported")
 
     def _cancel_ids(self, account: str, symbol: str, ids: list[str]) -> list[dict]:
+        """Cancels spend the whole budget, the reserve included. A venue that
+        counts each cancelled order (:data:`CANCEL_COST_PER_ORDER`) is sent
+        one at a time, each paying its own token."""
+        if self.CANCEL_COST_PER_ORDER and len(ids) > 1:
+            out = []
+            for oid in ids:
+                out += self._cancel_ids(account, symbol, [oid])
+            return out
+        self._bucket.take()
         with self._bucket.inflight():
-            self._bucket.take()
             out = self.up.cancel(account, symbol, ids)
         with self._lock:
             for oid in ids:

@@ -20,7 +20,8 @@ from __future__ import annotations
 import socket
 import threading
 import time
-from typing import Callable, Optional
+from contextlib import contextmanager
+from typing import Callable, Iterator, Optional
 
 from . import protocol as P
 
@@ -29,6 +30,23 @@ from . import protocol as P
 PING_DIVISOR = 3.0
 CONNECT_TIMEOUT_S = 5.0
 REQUEST_TIMEOUT_S = 10.0
+
+_thread_timeout = threading.local()
+
+
+@contextmanager
+def request_timeout(seconds: float) -> Iterator[None]:
+    """Every gateway request THIS thread makes inside the block waits up to
+    ``seconds`` (never less than the client's own ``request_timeout_s``).
+    For a slow read on a thread of its own (the report's history at bot
+    startup: Databento's historical API takes 15–30 s) — the order path on
+    the bot's other threads keeps its short timeout."""
+    prev = getattr(_thread_timeout, "s", None)
+    _thread_timeout.s = float(seconds)
+    try:
+        yield
+    finally:
+        _thread_timeout.s = prev
 
 
 class GatewayDown(RuntimeError):
@@ -134,7 +152,8 @@ class GatewayClient:
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def _tcp_connect(self, host: str, port: int, timeout_s: float):
-        s = socket.create_connection((host, int(port)), timeout=timeout_s)
+        from atjte.net import no_delay
+        s = no_delay(socket.create_connection((host, int(port)), timeout=timeout_s))
         s.settimeout(1.0)
         return s
 
@@ -342,11 +361,12 @@ class GatewayClient:
                 self._pending.pop(req, None)
             raise GatewayDown(str(e)) from e
         self.counters["requests"] += 1
-        if not pending.event.wait(self.request_timeout_s):
+        wait_s = max(self.request_timeout_s, getattr(_thread_timeout, "s", None) or 0.0)
+        if not pending.event.wait(wait_s):
             # Keep the entry: a late reply still settles it, and the order MAY
             # have reached the book — the engine's REST settle read decides.
             raise TimeoutError(
-                f"no gateway reply within {self.request_timeout_s:g}s (the order "
+                f"no gateway reply within {wait_s:g}s (the order "
                 f"may still have reached the book; the REST poll will reconcile)")
         if pending.error is not None:
             raise _as_exception(pending.error, pending.error_type)

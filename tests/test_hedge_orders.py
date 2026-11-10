@@ -36,6 +36,59 @@ class SplitLotsTest(unittest.TestCase):
                          ho.MAX_SPLIT_ORDERS)
 
 
+class HedgeLotsTest(unittest.TestCase):
+    """HEDGE_ROUND_FRACTION: how a leftover under one lot step is rounded."""
+
+    def test_one_point_zero_is_the_old_round_down(self):
+        from atjte.engines.common.grid_model import round_to_step
+        for gap in (0.0, 0.004, 0.0099999999, 0.01, 0.017, 0.99, 1.0, 1.8, 12.345678):
+            old = round_to_step(gap, 0.01)
+            want = 0.0 if old < 0.01 else round(old, 8)
+            self.assertAlmostEqual(ho.hedge_lots(gap, 0.01, 0.01, 1.0), want, msg=gap)
+        # JP225's 1-lot step: 0.8 and 1.8 leave 0.8 unhedged
+        self.assertEqual(ho.hedge_lots(0.8, 1.0, 1.0, 1.0), 0.0)
+        self.assertEqual(ho.hedge_lots(1.8, 1.0, 1.0, 1.0), 1.0)
+
+    def test_three_quarters_rounds_up_from_0_75(self):
+        self.assertEqual(ho.hedge_lots(0.8, 1.0, 1.0, 0.75), 1.0)
+        self.assertEqual(ho.hedge_lots(0.75, 1.0, 1.0, 0.75), 1.0)
+        self.assertEqual(ho.hedge_lots(0.7499, 1.0, 1.0, 0.75), 0.0)
+        self.assertEqual(ho.hedge_lots(1.8, 1.0, 1.0, 0.75), 2.0)
+        self.assertEqual(ho.hedge_lots(1.6, 1.0, 1.0, 0.75), 1.0)
+        self.assertEqual(ho.hedge_lots(0.0, 1.0, 1.0, 0.75), 0.0)
+        # a step finer than the minimum: the minimum at 0.75 of it, steps above
+        self.assertEqual(ho.hedge_lots(0.08, 0.01, 0.1, 0.75), 0.1)
+        self.assertEqual(ho.hedge_lots(0.07, 0.01, 0.1, 0.75), 0.0)
+        self.assertEqual(ho.hedge_lots(0.158, 0.01, 0.1, 0.75), 0.16)
+        self.assertEqual(ho.hedge_lots(0.157, 0.01, 0.1, 0.75), 0.15)
+
+    def test_the_slack_stops_a_lot_going_back_and_forth(self):
+        """Venue position x in lots, MT5 m lots, gap = x - m: walk x up and
+        down across the boundary; every hedge needs a 0.5-lot move back."""
+        def walk(path, fraction):
+            m, trades = 0.0, []
+            for x in path:
+                gap = round(x - m, 8)
+                lots = ho.hedge_lots(abs(gap), 1.0, 1.0, fraction)
+                if lots:
+                    m += lots if gap > 0 else -lots
+                    trades.append((x, m))
+            return trades
+        wobble = [0.74, 0.76, 0.74, 0.76, 0.5, 0.3, 0.26, 0.25, 0.3, 0.5]
+        self.assertEqual(walk(wobble, 0.75), [(0.76, 1.0), (0.25, 0.0)])
+        self.assertEqual(walk(wobble, 1.0), [])
+        # an FX re-size moving the gap a hair either side of 0.75: one trade
+        self.assertEqual(len(walk([0.7499, 0.7501, 0.7499, 0.7501] * 5, 0.75)), 1)
+
+    def test_the_fraction_must_be_above_one_half(self):
+        self.assertEqual(ho.valid_round_fraction(None), 1.0)
+        self.assertEqual(ho.valid_round_fraction(0.75), 0.75)
+        self.assertEqual(ho.valid_round_fraction(1), 1.0)
+        for bad in (0.5, 0.3, 0.0, 1.01, -1, "x"):
+            with self.assertRaises(ValueError, msg=bad):
+                ho.valid_round_fraction(bad)
+
+
 class SendSplitTest(unittest.TestCase):
     def _place(self, refuse_at=None, short_at=None, err="order rejected: retcode=10014 "
                                                        "'Invalid volume'"):

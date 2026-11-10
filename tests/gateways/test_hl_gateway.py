@@ -219,6 +219,16 @@ class AttributionTest(GatewayCase):
 
 
 class LeaseTest(GatewayCase):
+    def test_both_ends_of_a_lease_send_without_nagle(self):
+        """TCP_NODELAY on the bot's socket and the gateway's accepted one: a
+        small request is never held for the previous segment's ACK (Windows
+        delays those up to 200 ms)."""
+        from atjte.net import is_no_delay
+        c = self.client()
+        self.assertTrue(is_no_delay(c._sock))
+        with self.gw._lock:
+            self.assertTrue(is_no_delay(self.gw._clients["xyz_eur_grid"].sock))
+
     def test_a_silent_client_is_reaped_and_its_orders_cancelled(self):
         c = self.client(dms_s=60.0)
         o = c.place("sell", 1000.0, 1.1406)
@@ -398,6 +408,78 @@ class ReadCacheTest(GatewayCase):
         self.assertEqual(self.client().read("fetch_open_orders", symbol=EUR), [])
 
 
+class SlowCandlesUpstream(FakeUpstream):
+    """``fetch_ohlcv`` answers only once ``release`` is set (Databento's
+    historical API: 18–25 s on 2026-11-09)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.release = threading.Event()
+
+    def read(self, account, what, args):
+        if what == "fetch_ohlcv":
+            self.release.wait(5.0)
+            return [[1_800_000_000_000, 1.0, 1.0, 1.0, 1.0, 0.0]]
+        return super().read(account, what, args)
+
+
+class SlowReadTest(GatewayCase):
+    """A candle read must not hold the client's connection: the gateway
+    serves one client's messages in order, and an order (a cancel above
+    all) queued behind a 20 s chart history is a quote that cannot come
+    down."""
+
+    def make_upstream(self):
+        return SlowCandlesUpstream()
+
+    def _ohlcv(self, c, out, timeout_s=None):
+        from atjte.gateways.fix.client import request_timeout
+
+        def run():
+            try:
+                if timeout_s is None:
+                    out.append(c.read("fetch_ohlcv", symbol=EUR, timeframe="1m"))
+                else:
+                    with request_timeout(timeout_s):
+                        out.append(c.read("fetch_ohlcv", symbol=EUR, timeframe="1m"))
+            except Exception as e:                          # noqa: BLE001
+                out.append(e)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    def test_orders_are_answered_while_an_off_thread_read_is_in_flight(self):
+        self.gw.OFF_THREAD_READS = ("fetch_ohlcv",)
+        c = self.client()
+        c.request_timeout_s = 1.0
+        out = []
+        t = self._ohlcv(c, out, timeout_s=5.0)
+        time.sleep(0.1)                                     # the read is in flight
+        t0 = time.time()
+        o = c.place("sell", 1000.0, 1.1406, post_only=True)
+        self.assertEqual(o["status"], "open")
+        self.assertLess(time.time() - t0, 0.5)              # not behind the read
+        self.assertEqual(out, [])
+        time.sleep(1.2)                                     # past the client's 1 s
+        self.up.release.set()
+        t.join(3.0)
+        self.assertEqual(out[0][0][0], 1_800_000_000_000)   # the thread's own 5 s held
+
+    def test_without_the_override_a_read_keeps_the_client_s_timeout(self):
+        self.gw.OFF_THREAD_READS = ("fetch_ohlcv",)
+        c = self.client()
+        c.request_timeout_s = 0.3
+        out = []
+        self._ohlcv(c, out).join(3.0)
+        self.up.release.set()
+        self.assertIsInstance(out[0], TimeoutError)
+
+    def test_the_default_gateway_keeps_reads_on_the_connection_thread(self):
+        self.assertEqual(G.HlGateway.OFF_THREAD_READS, ())
+        from atjte.gateways.exante.gateway import ExanteGateway
+        self.assertIn("fetch_ohlcv", ExanteGateway.OFF_THREAD_READS)
+
+
 class AdoptionTest(GatewayCase):
     def make_upstream(self):
         # an order placed by slot 1 before the restart, and one placed by hand
@@ -437,6 +519,48 @@ class BudgetTest(GatewayCase):
                                side_effect=G.GatewayRefusal("budget exhausted", "error")):
             with self.assertRaises(ccxt.ExchangeError):
                 c.place("sell", 1000.0, 1.1407)
+
+
+class _Clock:
+    def __init__(self, t=1_800_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class BucketTest(unittest.TestCase):
+    def test_a_reserve_is_left_for_cancels(self):
+        clk = _Clock()
+        b = G._Bucket(per_min=120.0, burst=5.0, inflight=10, clock=clk)
+        for _ in range(3):
+            b.take(keep=2.0, max_wait_s=0.0)                    # orders: 3 of 5
+        with self.assertRaises(G.GatewayRefusal):
+            b.take(keep=2.0, max_wait_s=0.0)                    # the rest is the cancels'
+        b.take(max_wait_s=0.0)
+        b.take(max_wait_s=0.0)                                  # two cancels go
+        with self.assertRaises(G.GatewayRefusal):
+            b.take(max_wait_s=0.0)
+
+    def test_a_reserve_never_starves_orders_of_a_one_token_bucket(self):
+        b = G._Bucket(per_min=60.0, burst=1.0, inflight=10, clock=_Clock())
+        b.take(keep=2.0, max_wait_s=0.0)                        # capped at cap - n
+
+
+class PerOrderCancelTest(GatewayCase):
+    def test_a_cancel_all_pays_one_token_per_order_where_the_venue_counts_them(self):
+        c = self.client()
+        for px in (1.14, 1.15, 1.16):
+            c.place("sell", 1000.0, px)
+        self.gw.CANCEL_COST_PER_ORDER = True
+        taken = []
+        real = self.gw._bucket.take
+        self.gw._bucket.take = lambda *a, **k: (taken.append(k.get("keep", 0.0)),
+                                                real(*a, **k))[1]
+        self.assertEqual(c.cancel_all()["cancelled"], 3)
+        cancels = [x for x in self.up.calls if x[0] == "cancel"]
+        self.assertEqual([len(x[3]) for x in cancels], [1, 1, 1])
+        self.assertEqual(taken, [0.0, 0.0, 0.0])                # the reserve is theirs
 
 
 class NetworkTest(GatewayCase):

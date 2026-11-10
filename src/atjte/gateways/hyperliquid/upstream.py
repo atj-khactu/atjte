@@ -517,6 +517,8 @@ class HyperliquidUpstream:
                       a.get("limit"), {})
         elif what == "fetch_funding_history":   # this account's payments
             coro = fn(a.get("symbol"), a.get("since"), a.get("limit"), params)
+        elif what == "fetch_ledger":            # deposits, withdrawals, transfers
+            coro = fn(a.get("code"), a.get("since"), a.get("limit"), params)
         else:
             raise ValueError(f"unknown read {what!r}")
         return _jsonable(self._call(coro, READ_TIMEOUT_S))

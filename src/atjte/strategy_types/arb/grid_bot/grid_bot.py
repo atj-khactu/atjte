@@ -73,7 +73,7 @@ from atjte.engines.common.grid_model import (                             # noqa
     DesiredOrder, dynamic_level_units, grid_two_sided, held_level_units, level_fills,
 )
 from atjte.engines.arb.arb_bot import (                                  # noqa: E402
-    POS_EPS, UNIT_LABEL, ArbBot, _day, _dyn_alloc_on, _log,
+    POS_EPS, SYMBOL_MT5, UNIT_LABEL, ArbBot, _day, _dyn_alloc_on, _log,
 )
 import strategy_settings as _S                                            # noqa: E402
 from strategy_settings import (                                           # noqa: E402
@@ -119,6 +119,15 @@ GRID_LEVEL_DAILY = bool(getattr(_S, "GRID_LEVEL_DAILY", True))
 #: a cap/levels share this % below the held size shrinks the level the same
 #: day (a falling account must still shrink the grid); it never grows intraday
 GRID_LEVEL_SHRINK_PCT = 10.0
+#: the level size as a count of the MT5 symbol's MINIMUM lot (an int >= 1),
+#: converted to venue units once the MT5 specs are read (_mt5_ready) — the
+#: same file then fits any symbol, and every fill is hedgeable. None =
+#: GRID_LEVEL_UNITS as written (the default). Dynamic allocation, when on,
+#: sizes the levels instead.
+GRID_LEVEL_LOTS = getattr(_S, "GRID_LEVEL_LOTS", None)
+#: NEW entries only while GRID_STEP is at least this many hedge spreads
+#: (k x (MT5 ask - bid), in spread terms); exits always quote. None = off.
+MIN_STEP_SPREADS = getattr(_S, "MIN_STEP_SPREADS", None)
 
 
 def _direction_allows(o) -> bool:
@@ -163,6 +172,14 @@ def _check_settings() -> None:
                                                  and GRID_TAKE_PROFIT > 0):
         raise RuntimeError("GRID_TAKE_PROFIT must be None (= GRID_STEP) "
                            f"or a number > 0 — got {GRID_TAKE_PROFIT!r}")
+    if GRID_LEVEL_LOTS is not None and not (isinstance(GRID_LEVEL_LOTS, int)
+                                            and not isinstance(GRID_LEVEL_LOTS, bool)
+                                            and GRID_LEVEL_LOTS >= 1):
+        raise RuntimeError("GRID_LEVEL_LOTS must be None (= GRID_LEVEL_UNITS) or an int "
+                           f">= 1 (MT5 minimum lots per level) — got {GRID_LEVEL_LOTS!r}")
+    if MIN_STEP_SPREADS is not None and not (num(MIN_STEP_SPREADS) and MIN_STEP_SPREADS >= 0):
+        raise RuntimeError("MIN_STEP_SPREADS must be None (off) or a number >= 0 — got "
+                           f"{MIN_STEP_SPREADS!r}")
     if GRID_FIRST_OFFSET is not None and not (num(GRID_FIRST_OFFSET)
                                               and GRID_FIRST_OFFSET > 0):
         raise RuntimeError("GRID_FIRST_OFFSET must be None (= GRID_STEP) or a number "
@@ -171,6 +188,39 @@ def _check_settings() -> None:
 
 
 _check_settings()
+
+
+def lot_level_units(lots: int, volume_min: float, contract_size: float,
+                    amount_step: float = 0.0, amount_min: float = 0.0
+                    ) -> tuple[Optional[float], Optional[str]]:
+    """``lots`` MT5 minimum lots in venue units -> ``(units, None)``, or
+    ``(None, why)`` when the venue cannot trade exactly that: below its
+    minimum order, or not a whole number of its size steps (one leg would
+    always be off the other by the remainder)."""
+    units = round(float(lots) * float(volume_min) * float(contract_size), 10)
+    if units <= 0:
+        return None, (f"{lots} x min lot {volume_min:g} x {contract_size:g} {UNIT_LABEL}/lot "
+                      f"is not a size")
+    step = float(amount_step or 0.0)
+    if step > 0 and abs(units / step - round(units / step)) > 1e-6:
+        return None, (f"{lots} MT5 min lot(s) = {units:g} {UNIT_LABEL}, not a whole number of "
+                      f"the quote leg's size step {step:g} — the legs could never match; "
+                      f"pick another GRID_LEVEL_LOTS, or GRID_LEVEL_LOTS = None and "
+                      f"GRID_LEVEL_UNITS")
+    if amount_min and units < float(amount_min) - 1e-12:
+        return None, (f"{lots} MT5 min lot(s) = {units:g} {UNIT_LABEL} is below the quote "
+                      f"leg's minimum order {float(amount_min):g} — raise GRID_LEVEL_LOTS")
+    return units, None
+
+
+def step_covers_spread(step: float, bid: Optional[float], ask: Optional[float],
+                       min_spreads: Optional[float]) -> Optional[bool]:
+    """True when ``step`` (spread points) is at least ``min_spreads`` times
+    the hedge's spread ``ask − bid`` (in spread terms); None when the check
+    is off or there is no quote to judge by."""
+    if not min_spreads or bid is None or ask is None or ask < bid:
+        return None
+    return float(step) + 1e-12 >= float(min_spreads) * (float(ask) - float(bid))
 
 
 def _shift() -> float:
@@ -223,6 +273,48 @@ class GridBot(ArbBot):
     _dyn_level_last: Optional[float] = None
     #: the risk day the held level size belongs to (GRID_LEVEL_DAILY)
     _dyn_level_day: Optional[str] = None
+    #: the level size GRID_LEVEL_LOTS set at connect (None = not used)
+    _lot_units: Optional[float] = None
+    #: MIN_STEP_SPREADS' last verdict (None = off / no quote yet)
+    _step_ok: Optional[bool] = None
+
+    # ── sizing from the MT5 lot (GRID_LEVEL_LOTS) ────────────────────────────
+    def _mt5_ready(self) -> None:
+        global GRID_LEVEL_UNITS
+        super()._mt5_ready()
+        if GRID_LEVEL_LOTS is None:
+            return
+        units, why = lot_level_units(GRID_LEVEL_LOTS, self.volume_min, self.contract_size,
+                                     getattr(self.venue, "amount_step", 0.0),
+                                     getattr(self.venue, "amount_min", 0.0))
+        if units is None:
+            raise RuntimeError(f"GRID_LEVEL_LOTS: {why} — refusing to start")
+        GRID_LEVEL_UNITS = units
+        self._sizes_derived()
+        self._lot_units = units
+        _log(f"grid level size: {GRID_LEVEL_LOTS} x {SYMBOL_MT5} min lot {self.volume_min:g} = "
+             f"{units:g} {UNIT_LABEL} per level (GRID_LEVEL_LOTS); grid depth "
+             f"{GRID_LEVELS * units:g} {UNIT_LABEL} per side"
+             + ("; NOT used while dynamic allocation is on" if _dyn_alloc_on() else ""))
+
+    def _step_gate(self, orders: list[DesiredOrder]) -> list[DesiredOrder]:
+        """MIN_STEP_SPREADS: entries dropped while the step does not cover
+        that many hedge spreads; exits kept. Logged when the verdict flips."""
+        ok = step_covers_spread(self.grid_step(), self.ref_bid, self.ref_ask,
+                                MIN_STEP_SPREADS)
+        if ok is False:
+            orders = [o for o in orders if o.purpose == "exit"]
+        if ok is not None and ok != self._step_ok:
+            spread = (self.ref_ask or 0.0) - (self.ref_bid or 0.0)
+            self._log_once("grid_step_spread",
+                           f"grid: GRID_STEP {self.grid_step():.6g} "
+                           + ("covers" if ok else "is BELOW")
+                           + f" {MIN_STEP_SPREADS:g} x the hedge spread {spread:.6g} "
+                           + ("— entries on" if ok else
+                              "— entries held, exits keep quoting (MIN_STEP_SPREADS)"))
+        if ok is not None:
+            self._step_ok = ok
+        return orders
 
     # ── level size ───────────────────────────────────────────────────────────
     def _level_units(self) -> Optional[float]:
@@ -311,7 +403,8 @@ class GridBot(ArbBot):
         # sized to what the level still lacks (the caps above already bound
         # the whole set, so the cut can only shrink an order)
         ov = self._order_volume(geom)
-        return [replace(o, size=min(o.size, ov)) for o in orders if _direction_allows(o)]
+        orders = [replace(o, size=min(o.size, ov)) for o in orders if _direction_allows(o)]
+        return self._step_gate(orders) if MIN_STEP_SPREADS else orders
 
     # ── startup ──────────────────────────────────────────────────────────────
     def _banner(self) -> None:
@@ -349,6 +442,13 @@ class GridBot(ArbBot):
                  + (f" — a {GRID_LEVEL_UNITS:g} {u} level fills in several orders"
                     if ORDER_VOLUME_EFFECTIVE < GRID_LEVEL_UNITS
                     else " (>= the level size: one level = one order)"))
+        if GRID_LEVEL_LOTS is not None:
+            _log(f"grid level size: {GRID_LEVEL_LOTS} x the {SYMBOL_MT5} minimum lot, set "
+                 f"once the MT5 specs are read (GRID_LEVEL_LOTS; the "
+                 f"{GRID_LEVEL_UNITS:g} {u} above is replaced)")
+        if MIN_STEP_SPREADS:
+            _log(f"grid: new entries only while GRID_STEP >= {MIN_STEP_SPREADS:g} x the hedge "
+                 f"spread (MIN_STEP_SPREADS); exits always quote")
         if GRID_DIRECTION != "both":
             _log(f"direction: {GRID_DIRECTION.upper()} — "
                  + ("buy" if GRID_DIRECTION == "short only" else "sell")
@@ -395,6 +495,9 @@ class GridBot(ArbBot):
             "long_exits": [_tp_lvl(k, -1) for k in ks] if _long_on() else [],
             "short_entries": [_lvl(k, 1) for k in ks] if _short_on() else [],
             "short_exits": [_tp_lvl(k, 1) for k in ks] if _short_on() else [],
+            "level_lots": GRID_LEVEL_LOTS,
+            "min_step_spreads": MIN_STEP_SPREADS,
+            "entries_held_by_spread": self._step_ok is False,
         }}
 
 

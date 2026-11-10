@@ -287,6 +287,26 @@ class RebuildTest(Case):
         self.assertEqual(self.db.scalar("SELECT missing_from_source FROM fills "
                                         "WHERE trade_id = 't2'"), 0)
 
+    def test_a_rebuild_drops_a_day_whose_trades_are_gone(self):
+        """_pnl UPSERTS its days, so a day the files no longer hold would
+        keep its old numbers for ever. Dropping a strategy's trades (a hedge
+        book that turned out to be another system's) must take its days with
+        them, not leave them behind with the trades removed."""
+        older = NOW - 86_400
+        self.write_trades([fill(1, ts=older), deal(501, ts=older),
+                           fill(2), deal(502)])
+        self.ing.run_pass()
+        days = {r["day"] for r in self.db.query(
+            "SELECT day FROM pnl_daily WHERE strategy = ?", (KEY,))}
+        self.assertEqual(len(days), 2, f"expected both days on file, got {days}")
+        # the older day's trades turn out not to be this strategy's
+        self.write_trades([fill(2), deal(502)], mode="w")
+        self.ing.rebuild(KEY)
+        left = {r["day"] for r in self.db.query(
+            "SELECT day FROM pnl_daily WHERE strategy = ?", (KEY,))}
+        self.assertEqual(len(left), 1, f"the emptied day survived the rebuild: {left}")
+        self.assertTrue(left < days)
+
     def test_an_unknown_strategy_is_refused(self):
         with self.assertRaises(ValueError):
             self.ing.rebuild("nope/strategies/x")

@@ -87,6 +87,7 @@ class ReportHooksTest(unittest.TestCase):
         bot.dump_state = lambda: None
         bot.fill_q = queue.Queue()
         bot.counters.setdefault("fill_events", 0)
+        bot.counters.setdefault("fills_untracked", 0)
         bot.venue = types.SimpleNamespace(to_units=lambda a: a)
         bot._started_utc = datetime(2026, 1, 1, tzinfo=timezone.utc)
         bot._process_fill_events(Trade(
@@ -118,6 +119,49 @@ class ReportHooksTest(unittest.TestCase):
         self.assertAlmostEqual(rows[1]["amount"], 0.6)
         self.assertEqual(rows[1]["id"], "o1:poll:1.00000000")
 
+    def test_a_fill_on_an_order_we_never_placed_is_still_reported(self):
+        """A trade placed by hand on the same symbol. The hedger was handed
+        it before the lookup, so the hedge is already out: reporting only the
+        hedge leg would book its profit without the position's loss."""
+        bot = bot_with_reporter(self.tmp)
+        self.assertEqual(bot.orders, {})            # nothing of ours is resting
+        self._ws(bot, "hand-1", 3.0)
+        rows = R.read_jsonl(bot.reporter.trades_file)
+        self.assertEqual(len(rows), 1, "the venue leg of a hand-placed fill was dropped")
+        self.assertEqual(rows[0]["id"], "hand-1")
+        self.assertEqual(rows[0]["amount"], 3.0)
+        self.assertEqual(rows[0]["side"], "sell")   # the trade's own side, no record
+        self.assertEqual(rows[0]["order"], "o1")
+        self.assertEqual(rows[0]["key"], "", "a hand-placed fill was given one of our keys")
+        self.assertEqual(bot.counters["fills_untracked"], 1)
+
+    def test_an_untracked_fill_does_not_move_the_position(self):
+        """The parity check reads the venue and is the authority on a fill
+        nobody here placed; moving pos_units too would double count it."""
+        bot = bot_with_reporter(self.tmp)
+        before = bot.pos_units
+        self._ws(bot, "hand-2", 3.0)
+        self.assertEqual(bot.pos_units, before)
+
+    def test_a_fill_from_before_the_start_is_still_ignored(self):
+        """The ws replays recent fills on every (re)connect — those predate
+        this process and are already on file."""
+        bot = bot_with_reporter(self.tmp)
+        bot._hedge = lambda: None
+        bot.dump_state = lambda: None
+        bot.fill_q = queue.Queue()
+        bot.venue = types.SimpleNamespace(to_units=lambda a: a)
+        bot.counters.setdefault("fill_events", 0)
+        bot.counters.setdefault("fills_untracked", 0)
+        bot._started_utc = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        bot._process_fill_events(Trade(
+            exchange=pb.EXCHANGE_ID, trade_id="old-1", symbol=pb.SYMBOL_VENUE,
+            side=OrderSide.SELL, amount=3.0, price=4450.0, order_id="o9", fee=0.1,
+            fee_currency="USD", realized_pnl=0.0,
+            timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc)))
+        self.assertEqual(R.read_jsonl(bot.reporter.trades_file), [])
+        self.assertEqual(bot.counters["fills_untracked"], 0)
+
     def _ib_bot(self):
         """A bot on a venue whose fee follows the fill (IBKR via its gateway)."""
         bot = bot_with_reporter(self.tmp)
@@ -132,6 +176,7 @@ class ReportHooksTest(unittest.TestCase):
         bot.dump_state = lambda: None
         bot.fill_q = queue.Queue()
         bot.counters.setdefault("fill_events", 0)
+        bot.counters.setdefault("fills_untracked", 0)
         bot.venue = bot._venue_ib
         bot._started_utc = datetime(2026, 1, 1, tzinfo=timezone.utc)
         bot._process_fill_events(Trade(
@@ -251,7 +296,7 @@ class ReportHooksTest(unittest.TestCase):
         bot._report(now + 3, final=True)
         self.assertFalse(json.loads(rep.snapshot_file.read_text())["alive"])
 
-    def _catch_up(self, trades, seed_ts=1_800_000_000.0, live=True):
+    def _catch_up(self, trades, seed_ts=1_800_000_000.0, live=True, contract_size=None):
         """The start-up catch-up against a venue whose history is ``trades``
         (CCXT dicts), with the report's seed at ``seed_ts``."""
         bot = bot_with_reporter(self.tmp)
@@ -268,6 +313,8 @@ class ReportHooksTest(unittest.TestCase):
         bot.venue = types.SimpleNamespace(
             exchange=types.SimpleNamespace(fetch_my_trades=fetch_my_trades),
             base="BTC", quote="USDT")
+        if contract_size is not None:
+            bot.venue.contract_size = contract_size
         orig = (pb.STRATEGY_DIR, pb.LIVE_TRADING)
         pb.STRATEGY_DIR, pb.LIVE_TRADING = self.tmp, live
         try:
@@ -296,6 +343,14 @@ class ReportHooksTest(unittest.TestCase):
                                        self._t("down-3", seed + 9000)], seed)
         self.assertEqual(calls[0], int((seed + 7200 - pb.ArbBot.FILL_CATCHUP_OVERLAP_S) * 1000))
         self.assertEqual([f["id"] for f in fills], ["down-1", "down-2", "down-3"])
+
+    def test_a_caught_up_contract_is_booked_in_base_units(self):
+        """EXANTE MGC 2026-11-09: a manual sell of 1 contract (10 oz) was
+        caught up as 1 oz; the live path books base units, so must this."""
+        seed = 1_800_000_000.0
+        _calls, fills = self._catch_up([self._t("manual", seed + 60, "sell")], seed,
+                                       contract_size=10.0)
+        self.assertEqual([(f["id"], f["amount"]) for f in fills], [("manual", 10.0)])
 
     def test_no_catch_up_without_a_seed_or_in_a_dry_run(self):
         calls, fills = self._catch_up([self._t("x", 1_800_000_100.0)], seed_ts=None)

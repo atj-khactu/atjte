@@ -59,7 +59,7 @@ class TestTypes(unittest.TestCase):
     def test_listing(self):
         types = T.strategy_types()
         self.assertEqual(set(types), {"grid", "grid_futures", "bollinger", "fixed",
-                                      "fixed_entry_exit"})
+                                      "fixed_entry_exit", "grid_stock"})
         self.assertEqual(types["grid_futures"]["kind"], "grid_futures")
         self.assertIn("Grid-futures", types["grid_futures"]["label"])
         self.assertEqual(types["fixed"]["engine"], "arb")
@@ -89,6 +89,21 @@ class TestTypes(unittest.TestCase):
 
 
 class TestCopy(unittest.TestCase):
+    def test_a_preset_is_copied_as_the_folders_template(self):
+        types = T.strategy_types()
+        self.assertEqual(types["grid_stock"]["preset"], "stock")
+        self.assertEqual(types["grid_stock"]["kind"], "grid")
+        self.assertIn("stocks", types["grid_stock"]["label"])
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / "proj" / "strategies" / "grid_bot"
+            T.copy_strategy_type("arb", "grid_bot", dest, preset="stock")
+            self.assertEqual(sorted(p.name for p in dest.iterdir()),
+                             ["grid_bot.py", "strategy_settings_template.py"])
+            self.assertIn("GRID_STEP = '10bps'", (dest / "strategy_settings_template.py")
+                          .read_text(encoding="utf-8"))
+            with self.assertRaises(LookupError):
+                T.copy_strategy_type("arb", "grid_bot", Path(td) / "x", preset="nope")
+
     def test_shim_and_template_only(self):
         with tempfile.TemporaryDirectory() as td:
             dest = Path(td) / "proj" / "strategies" / "grid_bot"

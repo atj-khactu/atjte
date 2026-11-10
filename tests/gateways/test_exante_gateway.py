@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -384,7 +385,11 @@ class UpstreamTest(unittest.TestCase):
         self.assertAlmostEqual(trade["info"]["gw_rx_ms"] / 1000, time.time(), delta=5)
         from atjte.engines.arb.venue_feed import trade_from_ccxt
         tr = trade_from_ccxt("exante", XAU, trade)
-        self.assertEqual(tr.raw, {"gw_rx_ms": trade["info"]["gw_rx_ms"]})   # carried to the bot
+        # the timing stamps are carried to the bot: the receipt, and the
+        # latency split (the order leaving, EXANTE's TransactTime)
+        self.assertEqual(tr.raw["gw_rx_ms"], trade["info"]["gw_rx_ms"])
+        for k in ("order_sent_ms", "venue_transact_ms"):
+            self.assertEqual(tr.raw[k], trade["info"][k])
         self.up.cancel("main", XAU, ["ord-1"])
         self.assertTrue(wait_for(lambda: self.up._orders["ord-1"].status == "canceled"))
         with self.assertRaises(ccxt.OrderNotFound):
@@ -623,11 +628,16 @@ class GatewayEndToEndTest(unittest.TestCase):
             sent = self._orders_sent()
             with self.assertRaises(ccxt.ExchangeError) as cm:   # paused: never sent
                 c.place("buy", 1, 4007.0, post_only=True)
-            self.assertIn("paused", str(cm.exception))
+            first = str(cm.exception)
+            self.assertIn("paused until", first)               # the bot's log-once wording
+            time.sleep(0.15)
+            with self.assertRaises(ccxt.ExchangeError) as cm:  # the same text all pause long:
+                c.place("buy", 1, 4007.0, post_only=True)      # logged once, not per pass
+            self.assertEqual(str(cm.exception), first)
             self.assertEqual(self._orders_sent(), sent)
             c.cancel(o["id"])                                  # a cancel always goes
             self.assertEqual((self.gw.counters["rate_limited"],
-                              self.gw.counters["held_rate_limit"]), (1, 1))
+                              self.gw.counters["held_rate_limit"]), (1, 2))
             self.assertGreater(self.gw.status()["rate_limit_pause_s"], 0)
             time.sleep(0.6)
             c.place("buy", 1, 4007.0, post_only=True)          # the pause is over
@@ -712,6 +722,64 @@ class ConfigTest(unittest.TestCase):
         (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
         with self.assertRaises(CFG.ConfigError):
             CFG.load("exante_demo")
+
+
+class OrderBudgetTest(unittest.TestCase):
+    """EXANTE: 25 order requests in any 10 s, amends and cancels included.
+    Until 2026-11-09 the default (138 / min, burst 20) let 43 through."""
+
+    def _max_in_any_window(self, per_min, burst, seconds=120.0, step=0.01):
+        from atjte.gateways.exante import gateway as EG
+        from atjte.gateways.hyperliquid import gateway as HG
+
+        class Clock:
+            t = 1_800_000_000.0
+
+            def __call__(self):
+                return self.t
+        clk = Clock()
+        b = HG._Bucket(per_min=per_min, burst=burst, inflight=10, clock=clk)
+        sent, t_end = [], clk.t + seconds
+        while clk.t < t_end:                                # a bot sending flat out
+            try:
+                b.take(max_wait_s=0.0)
+                sent.append(clk.t)
+                continue
+            except HG.GatewayRefusal:
+                clk.t += step
+        best, j = 0, 0
+        for i, t in enumerate(sent):
+            while sent[j] <= t - EG.WINDOW_S:
+                j += 1
+            best = max(best, i - j + 1)
+        return best
+
+    def test_the_default_budget_never_exceeds_25_in_10_s(self):
+        from atjte.gateways.exante import gateway as EG
+        self.assertEqual(EG.burst_for(EG.MSGS_PER_MIN), 5.0)
+        self.assertLessEqual(self._max_in_any_window(EG.MSGS_PER_MIN,
+                                                     EG.burst_for(EG.MSGS_PER_MIN)), 25)
+        self.assertGreater(self._max_in_any_window(138.0, 20.0), 25)   # the old one did
+
+    def test_any_rate_within_the_limit_gets_a_burst_that_fits(self):
+        from atjte.gateways.exante import gateway as EG
+        for per_min in (60.0, 120.0, 138.0, 150.0):
+            self.assertLessEqual(self._max_in_any_window(per_min, EG.burst_for(per_min),
+                                                         seconds=40.0), 25, per_min)
+        self.assertEqual(EG.burst_for(1200.0), EG.BURST_TEST)   # a test of the account
+
+    def test_the_gateway_keeps_a_cancel_reserve_and_pays_cancels_per_order(self):
+        gw = ExanteGateway(types.SimpleNamespace(set_handlers=lambda **h: None,
+                                                 accounts=lambda: ["main"]),
+                           port=0, token=TOKEN,
+                           slots=CL.SlotRegistry(Path(tempfile.mkdtemp()) / "slots.json"))
+        self.assertEqual((gw._bucket.cap, gw.CANCEL_RESERVE), (5.0, 2.0))
+        self.assertTrue(gw.CANCEL_COST_PER_ORDER)
+        tight = ExanteGateway(types.SimpleNamespace(set_handlers=lambda **h: None,
+                                                    accounts=lambda: ["main"]),
+                              port=0, token=TOKEN, msgs_per_min=150.0,
+                              slots=CL.SlotRegistry(Path(tempfile.mkdtemp()) / "s.json"))
+        self.assertEqual((tight._bucket.cap, tight.CANCEL_RESERVE), (1.0, 0.0))
 
 
 class RestTest(unittest.TestCase):
@@ -977,6 +1045,33 @@ class OnDemandInstrumentTest(unittest.TestCase):
         self.assertEqual(self.up.rest.groups_asked, ["GC.COMEX"])
         self.assertIn(GC_ID, self.up.symbols)
 
+    def test_a_future_filed_under_a_bare_ticker_group_resolves(self):
+        """EXANTE live (2026-11-09) files 1-Ounce Gold under group ``1OZ``,
+        not ``1OZ.COMEX`` (a 404), while the contracts are
+        ``1OZ.COMEX.Z2026``: the bare ticker is tried after every exchange."""
+        oz_id, oz = "1OZ.COMEX.Z2026", "1OZ/USD:USD-261125"
+        row = dict(GC_SYMBOL, ticker="1OZ", symbolId=oz_id, name="1-Ounce Gold",
+                   expiration="2026-11-25T00:00:00Z", minPriceIncrement="0.25")
+        rest = self.up.rest
+        plain_group, plain_symbol, plain_spec = rest.group, rest.symbol, rest.specification
+
+        def group(g):
+            if g == "1OZ":
+                rest.groups_asked.append(g)
+                return [dict(row, symbolId="1OZ.COMEX.G2027",
+                             expiration="2027-01-27T00:00:00Z"), dict(row)]
+            return plain_group(g)
+        rest.group = group
+        rest.symbol = lambda sid: dict(row) if sid == oz_id else plain_symbol(sid)
+        rest.specification = lambda sid: (dict(GC_SPEC, contractMultiplier="1.0")
+                                          if sid == oz_id else plain_spec(sid))
+        self.assertTrue(self.up.ensure_symbol(oz))
+        self.assertEqual(self.up._exante_id(oz), oz_id)
+        self.assertEqual(rest.groups_asked[-1], "1OZ")
+        self.assertEqual(rest.groups_asked[:len(U.RESOLVE_EXCHANGES)],
+                         [f"1OZ.{ex}" for ex in U.RESOLVE_EXCHANGES])
+        self.assertEqual(self.quotes.subscribed, ["1OZZ6"])  # Databento's 1OZ Dec-26
+
     def test_what_cannot_be_resolved_is_refused_with_what_to_do(self):
         with self.assertRaises(ccxt.BadSymbol) as cm:
             self.up.ensure_symbol("GC/USD:USD-270331")     # no such expiry
@@ -1059,6 +1154,22 @@ class DatabentoPricedTest(unittest.TestCase):
         up.start()
         self.addCleanup(up.stop)
         return up
+
+    def test_a_databento_book_is_forwarded_with_all_its_levels(self):
+        """Databento streaming mbp-10: the ticker's ``info["book"]`` becomes
+        the gateway's book push, every level, not just the top."""
+        up = self.start([GC_ID])
+        up.subscribe_ticker(GC)
+        book = {"bids": [[3973.5, 3.0], [3973.4, 6.0], [3973.3, 1.0]],
+                "asks": [[3973.7, 4.0], [3973.8, 2.0]]}
+        self.quotes.handler("GCZ6", {"symbol": "GCZ6", "bid": 3973.5, "ask": 3973.7,
+                                     "bidVolume": 3.0, "askVolume": 4.0,
+                                     "info": {"ts_event": 1, "book": book}})
+        _sym, b = self.events["book"][-1]
+        self.assertEqual((b["bids"], b["asks"]), (book["bids"], book["asks"]))
+        self.quotes.push("GCZ6", 3973.6, 3973.8)        # mbp-1: just the top
+        _sym, b = self.events["book"][-1]
+        self.assertEqual((b["bids"], b["asks"]), ([[3973.6, 3.0]], [[3973.8, 4.0]]))
 
     def test_cme_futures_stream_from_databento_and_fx_from_the_feed(self):
         up = self.start([XAU_ID, GC_ID])

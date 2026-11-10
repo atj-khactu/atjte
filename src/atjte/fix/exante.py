@@ -256,6 +256,10 @@ def parse_exec_report(msg) -> dict:
         "qty": f(38), "leaves": f(151), "cum": f(14), "avg": f(6),
         "last_qty": f(32), "last_px": f(31), "price": f(44),
         "tif": msg.get(59) or "", "time": msg.get(60) or msg.get(52) or "",
+        # the latency split (2026-11-09): EXANTE's TransactTime and
+        # SendingTime apart, and when this side read the report off the socket
+        "transact_time": msg.get(60) or "", "sending_time": msg.get(52) or "",
+        "rx_ts": getattr(msg, "rx_ts", None),
         "reject_reason": msg.get(103) or "", "text": msg.get(58) or "",
         "mass_status_id": msg.get(584) or "", "last_report": (msg.get(912) or "") == "Y",
         "order_pos": msg.get_int(20100),

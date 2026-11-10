@@ -14,6 +14,8 @@
      "dataset": "GLBX.MDP3",              # CME Globex
      "symbols": ["GCZ6", "GC.c.0"],       # bars: raw symbols, or continuous (ROOT.c.N)
      "live": true,                        # stream 1 m bars for the live chart
+     "quote_schema": "mbp-1",             # live quotes: "mbp-1" (top of book) or
+                                          # "mbp-10" (10 levels: the order book too)
      "clients": []}                       # allowlist; empty = any client with the token
 
 A DATA-ONLY gateway: it serves historical bars (``fetch_ohlcv``), the cost of
@@ -58,7 +60,11 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 #: a continuous-contract symbol: ROOT.c.N (calendar), .n.N (open interest),
 #: .v.N (volume) — Databento's ``continuous`` symbology
 _CONTINUOUS_RE = re.compile(r"^[A-Z0-9]+\.[cnv]\.\d+$", re.IGNORECASE)
-_KNOWN = {"name", "venue", "listen_port", "dataset", "symbols", "live", "clients", "_comment"}
+_KNOWN = {"name", "venue", "listen_port", "dataset", "symbols", "live", "quote_schema",
+          "clients", "_comment"}
+#: the live quote schemas: top of book, or the 10-level book (a ticker that
+#: also carries the book, ``info["book"]``)
+QUOTE_SCHEMAS = ("mbp-1", "mbp-10")
 
 
 class ConfigError(ValueError):
@@ -79,6 +85,7 @@ class GatewayConfig:
     dataset: str = DEFAULT_DATASET
     symbols: list = field(default_factory=list)
     live: bool = True
+    quote_schema: str = "mbp-1"
     clients: list = field(default_factory=list)
     api_key: str = ""
     token: str = ""
@@ -98,6 +105,7 @@ class GatewayConfig:
         """Names and flags only — never the key or the token."""
         return {"name": self.name, "venue": "databento", "listen_port": self.listen_port,
                 "dataset": self.dataset, "symbols": list(self.symbols), "live": self.live,
+                "quote_schema": self.quote_schema,
                 "complete": self.complete, "missing": self.missing,
                 "token_set": bool(self.token), "clients_allowed": list(self.clients)}
 
@@ -175,11 +183,15 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         port = int(raw.get("listen_port") or DEFAULT_LISTEN_PORT)
     except (TypeError, ValueError):
         raise ConfigError(f"{CONFIG_NAME}: listen_port is a number") from None
+    schema = str(raw.get("quote_schema") or "mbp-1").strip().lower()
+    if schema not in QUOTE_SCHEMAS:
+        raise ConfigError(f"{CONFIG_NAME}: quote_schema is one of {', '.join(QUOTE_SCHEMAS)}")
     cfg = GatewayConfig(
         name=str(raw.get("name") or d.name), dir=d, listen_port=port,
         dataset=str(raw.get("dataset") or DEFAULT_DATASET).strip(),
         symbols=parse_symbols(raw.get("symbols")),
         live=raw.get("live", True) is not False,
+        quote_schema=schema,
         clients=[str(c) for c in (raw.get("clients") or [])])
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:

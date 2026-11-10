@@ -484,6 +484,13 @@ MT5_COMMENT_MAX = _HO_COMMENT_MAX
 #: was 32 characters)
 COMMENT_KEYS = {"fixed_entry_exit": "fee", "grid_futures": "gridf", "bollinger": "boll"}
 HEDGE_THRESHOLD_UNITS = _cfg("HEDGE_THRESHOLD_UNITS")
+from ..common.hedge_orders import hedge_lots as _hedge_lots  # noqa: E402
+from ..common.hedge_orders import valid_round_fraction as _valid_round_fraction  # noqa: E402
+
+#: the share of an MT5 lot step a hedge's leftover must reach to be sent as a
+#: whole step (1.0 = round down, as before; 0.75 = up from three quarters).
+#: Above 0.5 only: hedge_orders.valid_round_fraction
+HEDGE_ROUND_FRACTION = _valid_round_fraction(_cfg("HEDGE_ROUND_FRACTION"))
 # 'event' (a dedicated thread hedges each fill from its size the moment the
 # socket delivers it; the parity hedge becomes the safety net) | 'parity'
 # (the loop re-reads both legs on every fill, then hedges). See hedger.py.
@@ -513,6 +520,30 @@ PAIR_POSITION_SETTLE_S = 3.0
 #: stop, parity hedges freeze, the heartbeat says so — until a read agrees.
 #: A read the venue just had not caught up on clears well inside it.
 POSITION_FAULT_GRACE_S = 10.0
+#: how long after a read was ACCEPTED one of our own fills may still have
+#: been inside it. The venue books a fill before its socket tells us: a read
+#: served in between already holds it, and _book adding it to the anchor on
+#: top moved that anchor TWICE (2026-11-06: XYZ-SP500 read -38 with the
+#: anchor at -36.8 after a single 1.2 fill, from a start where both agreed —
+#: a 1.2 phantom drift, a frozen hedge and a false UNHEDGED alarm; the same
+#: race hit four strategies on four days). Inside this window the anchor is
+#: left alone and the next read re-establishes it.
+POSITION_READ_SETTLE_S = 2.0
+#: a fault clears when a read AGREES - which never happens when the fills
+#: are the wrong side of it, and the bot then sits frozen until someone
+#: restarts it (2026-11-06: SP500 froze for 48 min on an inferred fill that
+#: over-counted by 0.289 units, while the venue read -18.711 unchanged
+#: throughout and the real exposure was 0.089, inside one min lot). So a
+#: fault whose read has not MOVED for this long is taken the other way: the
+#: venue is right, pos_units is resynced to it, entries and parity resume -
+#: what a restart does. A read that moves (the EXANTE gateway dropping every
+#: position, 2026-11-02) restarts the clock and is never adopted. None keeps
+#: the freeze until a read agrees or the bot is restarted.
+POSITION_FAULT_ADOPT_S = 180.0
+#: a condition that is STILL blocking is said again this often
+#: (:meth:`ArbBot._log_restate`). Saying it once and then nothing reads as
+#: an idle bot; a line per pass floods the log. 0 = say it once.
+GATE_RESTATE_S = 300.0
 #: the same order key is not fired twice within this long
 PAIR_REFIRE_S = 2.0
 #: a level whose quote leg the venue REFUSED is not fired again for this
@@ -652,13 +683,50 @@ REPORT_DEALS_S = float(_cfg("REPORT_DEALS_S"))
 #: at startup — the control panel's chart window
 REPORT_HISTORY_S = 24 * 3600.0
 #: candles per venue request, and the most requests one history read makes
+#: (an EMPTY page — a closed market, a weekend — is skipped, not the end, so
+#: a 24 h window can take a few more than its two full pages)
 HISTORY_PAGE = 720
-HISTORY_PAGES = 4
+HISTORY_PAGES = 8
 #: a leg whose history came back EMPTY is asked again this long after, up
 #: to HISTORY_RETRIES times: an MT5 terminal answers copy_rates_range with
 #: nothing while it is still downloading the symbol's M1 history
 HISTORY_RETRY_S = 120.0
 HISTORY_RETRIES = 3
+#: how long the history read (on a thread of its own) waits for each gateway
+#: reply: a Databento-priced leg's candles took 18–25 s on 2026-11-09, past
+#: the 10 s an order waits
+HISTORY_READ_TIMEOUT_S = 120.0
+#: the history read runs on its own thread so the housekeeping pass never
+#: blocks on it (False: inline, for the tests)
+HISTORY_IN_THREAD = True
+
+
+class _HistoryRead:
+    """One read of the report's history (:meth:`ArbBot.history_closes`),
+    every gateway request in it allowed :data:`HISTORY_READ_TIMEOUT_S`;
+    ``done`` set when it has a ``result`` or an ``error``."""
+
+    def __init__(self, fn) -> None:
+        self.fn = fn
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        from atjte.gateways.fix.client import request_timeout
+        try:
+            with request_timeout(HISTORY_READ_TIMEOUT_S):
+                self.result = self.fn()
+        except Exception as e:                              # noqa: BLE001
+            self.error = e
+        finally:
+            self.done.set()
+
+    def start(self, threaded: bool = True) -> None:
+        if threaded:
+            threading.Thread(target=self.run, name="report-history", daemon=True).start()
+        else:
+            self.run()
 #: the broker server's usual UTC offset, when no advancing tick can tell it
 DEFAULT_SRV_OFFSET_S = 3 * 3600.0
 #: how far a live tick's stamp may sit from a half-hour offset and still set it
@@ -953,6 +1021,10 @@ INFERRED_FILL_WAIT_S = 30.0
 # startup). The dashboard draws the bot's exact spread series from it and
 # the Bollinger strategy computes its bands from the same samples.
 SAMPLE_INTERVAL_S = 1.0
+#: a 1 s sample carries the bid / ask basis only when the last one is this
+#: fresh (the basis is pushed on every pass with both books; a stale pair
+#: is left out rather than drawn as now)
+BASIS_SAMPLE_FRESH_S = 5.0
 # how often the 1 s samples are written for the dashboard (base_settings;
 # every second by default -- the chart is only as live as this file)
 SAMPLES_PERSIST_S = float(_cfg("SAMPLES_PERSIST_S") or 1.0)
@@ -1187,6 +1259,13 @@ class OrderRec:
     inferred: float = 0.0    # booked with no venue trade yet, not yet reported
     inferred_t: float = 0.0  # ... when the last of it was booked
     inferred_src: str = ""   # ... and by what (poll, a settle reason)
+    #: a REST ``filled`` that no venue trade stood behind, checked against the
+    #: account's trades (:meth:`ArbBot._rest_filled_units`): the figure checked,
+    #: what the trades confirmed of it, and when — so a resting order the
+    #: venue resized is not re-checked on every poll
+    trades_checked_f: float = -1.0
+    trades_checked_units: float = 0.0
+    trades_checked_t: float = 0.0
 
     @property
     def remaining(self) -> float:
@@ -1243,6 +1322,15 @@ class ArbBot:
     _ref_seen = 0
     #: when the last fill was booked (MIN_ORDER_INTERVAL_S); 0 = none yet
     _last_fill_t = 0.0
+    #: when a venue position read was last ACCEPTED as the anchor
+    _read_ok_t = 0.0
+    #: the venue's latest position read, ACCEPTED OR HELD BACK, and when
+    _venue_read_units: Optional[float] = None
+    _venue_read_t = 0.0
+    #: a fill landed so soon after an accepted read that the read may
+    #: already have held it: the anchor is not to be trusted until the next
+    #: read re-establishes it (:data:`POSITION_READ_SETTLE_S`)
+    _anchor_uncertain = False
     #: EXECUTION_MODE 'market': when the last pair fired, per key and overall
     _last_fire_t = 0.0
     #: the end-of-day close: the round awaiting its check ({"t", "expected"}),
@@ -1455,6 +1543,12 @@ class ArbBot:
         # pass, persisted to SAMPLES_FILE, reloaded at startup
         self._samples: deque[tuple[float, float]] = deque(
             maxlen=int(self.SAMPLES_KEEP_S / SAMPLE_INTERVAL_S) + 300)
+        # ... and the bid / ask basis at the same moments (ts, bid, ask): the
+        # chart draws them instead of the mid; a separate series so every
+        # reader of the (ts, spread) pairs above stays as it is
+        self._basis_1s: deque[tuple[float, float, float]] = deque(
+            maxlen=int(self.SAMPLES_KEEP_S / SAMPLE_INTERVAL_S) + 300)
+        self._basis_now: Optional[tuple[float, float, float]] = None   # (ts, bid, ask)
         self._sample_t = 0.0           # last 1 s sample time
         self._samples_persist_t = 0.0  # last spread_1s.json write
         # basis trigger (BASIS_TRIGGER): rolling window of side-aware basis
@@ -1583,6 +1677,7 @@ class ArbBot:
         self._ops_tokens = float(ORDER_OPS_BURST)
         self._ops_refill_t = time.time()
         self.counters = {"fill_events": 0, "fills_booked_units": 0.0, "hedges": 0,
+                         "fills_untracked": 0,
                          "close_bys": 0,
                          "quotes_placed": 0, "quotes_amended": 0,
                          "quotes_cancelled": 0,
@@ -1609,11 +1704,75 @@ class ArbBot:
         self._report_deals_t = 0.0
         self._report_deals_dirty = True
         self._last_msgs: dict[str, str] = {}
+        #: when each standing condition was last restated (:meth:`_log_restate`)
+        self._restated_t: dict[str, float] = {}
 
     # ── logging helper: only log when the message for `key` changes ─────────
     def _log_once(self, key: str, msg: str) -> None:
         if self._last_msgs.get(key) != msg:
             self._last_msgs[key] = msg
+            _log(msg)
+
+    def _order_event(self, ev: str, **fields) -> None:
+        """One row of the order log (``report/orders.jsonl``, the control
+        panel's Order log): every place, amend, cancel, fill and hedge with
+        its outcome and how long it took, the time to the millisecond. A
+        dry run's rows say so. Never raises — safe from any thread."""
+        rep = getattr(self, "reporter", None)
+        if rep is None:
+            return
+        try:
+            rep.record_order({"ev": ev, "live": bool(LIVE_TRADING), **fields})
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _order_event_once(self, _dedupe: str, _ev: str, **fields) -> None:
+        """:meth:`_order_event` for a refusal that repeats every pass (a
+        pause, a post-only cross): one row each time its text changes, like
+        :meth:`_log_once` — never a row per pass."""
+        seen = self.__dict__.setdefault("_order_event_last", {})
+        sig = (fields.get("result"), fields.get("msg"))
+        if seen.get(_dedupe) == sig:
+            return
+        seen[_dedupe] = sig
+        self._order_event(_ev, **fields)
+
+    def _order_event_clear(self, _dedupe: str) -> None:
+        self.__dict__.setdefault("_order_event_last", {}).pop(_dedupe, None)
+
+    @staticmethod
+    def _ms_since(t0: float) -> float:
+        return round((time.perf_counter() - t0) * 1000.0, 1)
+
+    def _log_restate(self, key: str, msg: str, every_s: float = None) -> None:
+        """Say a STANDING condition: once when it starts, then again every
+        ``every_s`` for as long as it holds, carrying the figures as they
+        are then.
+
+        The condition is the KEY, never the wording: the figures move with
+        every tick, and re-saying it whenever they do is the flood this is
+        meant to avoid (2026-11-02). Saying it once and then nothing is the
+        other end, and reads as an idle bot (2026-11-06: PAXG said "skipped
+        until it fits" and was silent for the next hour, starved of margin
+        the whole time). ``every_s`` 0 keeps the old say-it-once."""
+        every_s = GATE_RESTATE_S if every_s is None else every_s
+        now = time.time()
+        # per instance on first use: a bot built for a test holds only the
+        # attributes the method under test needs
+        seen = self.__dict__.setdefault("_restated_t", {})
+        if key not in self._last_msgs:
+            self._last_msgs[key] = msg
+            seen[key] = now
+            _log(msg)
+        elif every_s and now - seen.get(key, 0.0) >= every_s:
+            self._last_msgs[key] = msg
+            seen[key] = now
+            _log(f"{msg} (still)")
+
+    def _log_cleared(self, key: str, msg: str) -> None:
+        """A standing condition has lifted: say so, once, if it was said."""
+        if self._last_msgs.pop(key, None) is not None:
+            self.__dict__.setdefault("_restated_t", {}).pop(key, None)
             _log(msg)
 
     # ── crypto-market facts (owned by atjte.engines.arb.venue, read here) ────────────
@@ -1765,6 +1924,11 @@ class ArbBot:
     def _sizes_derived(self) -> None:
         """Hook: re-derive what a type computed from its sizes at import."""
 
+    def _mt5_ready(self) -> None:
+        """Hook: the MT5 symbol's lot specs are read (``volume_min``,
+        ``volume_step``, ``contract_size`` in venue units), nothing hedges or
+        quotes yet. A type that sizes in MT5 lots sets its sizes here."""
+
     def startup(self) -> None:
         self._banner()
         self._spread_window_banner()
@@ -1880,6 +2044,7 @@ class ArbBot:
             _log(f"MT5 account mode unread ({type(e).__name__}: {e}) — the volume "
                  f"limit is counted per direction")
         self._refresh_mt5_foreign(time.time(), force=True)
+        self._mt5_ready()                    # sizes from the MT5 lot (stock grid)
         self._resolve_hedge_threshold()      # before the hedger starts
         # a hedge gate worth many MT5 lots leaves that much unhedged, with no
         # error anywhere: warn about it before the hedger thread starts
@@ -2020,7 +2185,8 @@ class ArbBot:
             except _bf.Partial as p:
                 trades, note = p.trades, f" (history incomplete: {p})"
             records = [{**r, "source": "catchup"} for r in _bf.to_fill_records(
-                trades, EXCHANGE_ID, SYMBOL_VENUE, self.venue.base, self.venue.quote)
+                trades, EXCHANGE_ID, SYMBOL_VENUE, self.venue.base, self.venue.quote,
+                getattr(self.venue, "contract_size", 1.0) or 1.0)
                 if float(r["ts"]) >= seed_ts]
             new = sum(1 for r in records if self.reporter.record_fill(r))
             say(f"{len(records)} fill(s) since "
@@ -2088,9 +2254,18 @@ class ArbBot:
         for o in strays:
             _log(f"cancelling stray {SYMBOL_VENUE} order {o.order_id} "
                  f"({o.side.value} {o.remaining}@{o.price})")
+            t0 = time.perf_counter()
             try:
                 self.venue.cancel(o.order_id)
+                self._order_event("cancel", key="stray", side=o.side.value,
+                                  order_id=str(o.order_id), price=o.price,
+                                  ms=self._ms_since(t0), result="ok",
+                                  reason="stray order at startup")
             except Exception as e:
+                self._order_event("cancel", key="stray", side=o.side.value,
+                                  order_id=str(o.order_id), price=o.price,
+                                  ms=self._ms_since(t0), result="failed",
+                                  reason="stray order at startup", msg=str(e)[:300])
                 _log(f"WARNING: cancel {o.order_id} failed: {e}")
 
     # ── persistence ──────────────────────────────────────────────────────────
@@ -2136,8 +2311,30 @@ class ArbBot:
         signed = delta if rec.side == "buy" else -delta
         self.pos_units = round(self.pos_units + signed, 8)
         if self.venue_pos_units is not None:   # keep the quoting anchor current
-            self.venue_pos_units = round(self.venue_pos_units + signed, 8)
+            # when the fill reached us: a ws trade carries its arrival
+            # (_on_ws_fill), anything else is learnt now
+            arrived = float(getattr(trade, "rx_t", 0.0) or 0.0) or self._last_fill_t
+            if arrived - self._read_ok_t < POSITION_READ_SETTLE_S:
+                # a read was accepted moments after this fill arrived — or
+                # AFTER it, while it waited in the queue — and may ALREADY
+                # hold it (the venue books it before its socket says so):
+                # adding it would move the anchor twice. Leave it, and let
+                # the next read say what the position really is. Timed from
+                # the ARRIVAL: from the booking, a fill queued 6 s behind a
+                # busy loop (2026-11-09, XYZ-JP225) was outside the window
+                # and counted twice.
+                self._anchor_uncertain = True
+                self._bal_dirty = True
+            else:
+                self.venue_pos_units = round(self.venue_pos_units + signed, 8)
         self._fills_since_read = round(self._fills_since_read + delta, 8)
+        if self.pos_fault is not None:
+            # a fill of ours moves the figure the venue is being judged
+            # against, so the read has to hold still again before it is
+            # adopted (_venue_read_contradicts). _fills_since_read cannot
+            # say this: it only resets when a read is ACCEPTED, which is
+            # the one thing a fault prevents
+            self.pos_fault["stable_since"] = self._last_fill_t
         self.counters["fills_booked_units"] = round(
             self.counters["fills_booked_units"] + delta, 8)
         # the day's risk book: this leg's realized PnL and traded notional
@@ -2151,6 +2348,15 @@ class ArbBot:
         _log(f"FILL {rec.key} {rec.side} {delta:g} units @ "
              f"{'' if trade is not None else '~'}{price} [{source}] "
              f"-> pos {self.pos_units:+.4f} units")
+        venue_ts = getattr(trade, "timestamp", None) if trade is not None else None
+        self._order_event("fill", key=rec.key, side=rec.side, purpose=rec.purpose,
+                          order_id=rec.order_id, amount=delta, price=price,
+                          order_price=rec.price, level=rec.level, source=source,
+                          inferred=trade is None,
+                          trade_id=str(getattr(trade, "trade_id", "") or "") or None,
+                          venue_ts=(round(venue_ts.timestamp(), 3)
+                                    if venue_ts is not None else None),
+                          pos_units=self.pos_units)
         self._persist_position()
         if trade is None:           # a venue trade is reported by the ws handler,
             self._defer_inferred(rec, delta, source)   # at its OWN size, not this delta
@@ -2207,6 +2413,10 @@ class ArbBot:
         _log(f"FILL {rec.key} {rec.side} {covered:g} units @ {price} [ws] — the venue's "
              f"trade for what {rec.inferred_src or 'a read'} booked at ~{rec.price}; "
              f"the position already had it")
+        self._order_event("fill", key=rec.key, side=rec.side, purpose=rec.purpose,
+                          order_id=rec.order_id, amount=covered, price=price,
+                          order_price=rec.price, level=rec.level, source="ws",
+                          confirms=rec.inferred_src or "a read", pos_units=self.pos_units)
 
     def _flush_inferred(self, now: float, final: bool = False) -> None:
         """Report what was booked by inference and never covered by a venue
@@ -2309,7 +2519,16 @@ class ArbBot:
     def _on_ws_fill(self, tr: Trade) -> None:
         """Feed-thread callback: hand the fill to the event hedger FIRST
         (its thread sends the MT5 order while this loop is still waking),
-        then queue it for booking and wake the loop."""
+        then queue it for booking and wake the loop.
+
+        The fill is stamped with the moment it ARRIVED (``rx_t``): it can wait
+        in the queue for seconds while the loop is busy (6 s on 2026-11-09,
+        XYZ-JP225), and a position read served in that time already holds it
+        — :meth:`_book` judges that race from the arrival, not the booking."""
+        try:
+            tr.rx_t = time.time()
+        except Exception:                                       # noqa: BLE001
+            pass
         if self.hedger is not None:
             self.hedger.submit(tr)
         self.fill_q.put(tr)
@@ -2351,11 +2570,43 @@ class ArbBot:
                     self._report_fill(old, units, "ws", tr)
                     if old is not None:
                         old.ws_cum = min(old.amount, old.ws_cum + units)
-                        self._cover_inferred(old, units, float(tr.price or old.price))
+                        # what the settle did NOT already book: a trade it
+                        # could not see (a REST `filled` the account's trades
+                        # did not confirm is never booked — Hyperliquid shrinks
+                        # a reduce-only order, 2026-11-09 — and the venue's
+                        # real trade lands here instead). Until now such a
+                        # trade was reported but never moved the position.
+                        booked = self._book(old, source="ws", trade=tr)
+                        self._cover_inferred(old, units - booked,
+                                             float(tr.price or old.price))
+                        # the trade's own fill mark, as for a live order:
+                        # _cover_inferred dropped the guess's, and without
+                        # this the chart had no mark for the fill at all
+                        # (2026-11-09: MGC grid-entry-L1, amend found it gone)
+                        self._mark_fill(old.side, units, tr.price, old.key, tr.trade_id,
+                                        tr.order_id, "ws", purpose=old.purpose,
+                                        level=old.level)
                 elif tr.timestamp is not None and tr.timestamp >= self._started_utc:
+                    # Not an order of ours — a trade placed by hand on the
+                    # same symbol, most often. It is still REPORTED, because
+                    # _on_ws_fill handed it to the hedger before this lookup
+                    # and the hedge is already on its way: dropping the venue
+                    # leg books half a round trip, the hedge's profit without
+                    # the position's loss. (2026-11-05: 57 hand-placed closes
+                    # on XYZ-JPY booked +1,422 of MT5 hedge against none of
+                    # -1,275 of venue realized, and the day read +1,282
+                    # instead of +7.) The start-up catch-up books these too,
+                    # so the live path must agree with it. The position is
+                    # left to the parity check, which reads the venue: it is
+                    # the authority on a fill nobody here placed, and moving
+                    # pos_units from under it would double count.
+                    self.counters["fills_untracked"] += 1
                     self._log_once(f"untracked_{tr.order_id}",
                                    f"note: ws fill for untracked order {tr.order_id} "
-                                   f"({tr.side.value} {tr.amount:g}) — ignored")
+                                   f"({tr.side.value} {tr.amount:g}) — not this bot's "
+                                   f"order: hedged and reported, position follows "
+                                   f"the parity check")
+                    self._report_fill(None, self.venue.to_units(tr.amount), "ws", tr)
                 continue
             if tr.trade_id in rec.ws_trade_ids:
                 continue  # ws replay/snapshot duplicate
@@ -2408,6 +2659,62 @@ class ArbBot:
         if getattr(self, "_settling", {}).pop(rec.order_id, None) is not None:
             self._note_retired(rec)
 
+    #: how long a REST ``filled`` checked against the account's trades is
+    #: trusted before the same figure is checked again (a resting order the
+    #: venue resized keeps showing it on every order poll)
+    REST_FILL_RECHECK_S = 30.0
+
+    def _rest_filled_units(self, rec: OrderRec, o, source: str) -> float:
+        """The units of ``rec`` a REST order read (``o``) says are filled,
+        for ``rest_cum`` — on a venue whose ``filled`` is DERIVED rather
+        than counted, only as much of it as the account's own trades show.
+
+        Hyperliquid's order reads carry no filled amount: ccxt computes it
+        as ``origSz - sz``. Hyperliquid also lowers ``sz`` itself, with no
+        trade, when a reduce-only order is bigger than the position it can
+        close, so that difference was booked as a fill that never happened
+        (2026-11-09, XYZ-JP225: every phantom equalled the order's size less
+        the position, the venue's position never moved, and the parity
+        reconciler sold 3 lots of MT5 on it). There, a ``filled`` beyond what
+        the ws trades already gave is checked against ``fetch_my_trades`` and
+        capped at it. A failed check books nothing new: a real trade still
+        arrives on the ws and is booked then, retired or not, and a trade
+        nobody saw moves the venue's position, which the parity check reads."""
+        f = self.venue.to_units(o.filled or 0.0) if o is not None else 0.0
+        known = max(rec.ws_cum, rec.rest_cum)
+        if f <= known + POS_EPS or self.venue.rest_filled_trade_backed:
+            return f
+        now = time.time()
+        if (abs(f - rec.trades_checked_f) <= POS_EPS
+                and now - rec.trades_checked_t < self.REST_FILL_RECHECK_S):
+            return max(min(f, rec.trades_checked_units), rec.ws_cum)
+        try:
+            traded = self.venue.order_trade_units(
+                [rec.order_id, *rec.prior_ids], since_s=rec.placed_t)
+        except Exception as e:                                  # noqa: BLE001
+            self._log_once(f"rest_fill_check_{rec.order_id}",
+                           f"WARNING: {rec.key} {rec.order_id}: {EXCHANGE_ID} reports "
+                           f"{f:g} {UNIT_LABEL} filled ({source}) but its trades could "
+                           f"not be read to confirm it ({e}) — not booked; a real trade "
+                           f"is booked when it arrives")
+            return rec.rest_cum
+        rec.trades_checked_f, rec.trades_checked_units = f, traded
+        rec.trades_checked_t = now
+        if traded < f - POS_EPS:
+            self.counters["rest_fill_unconfirmed"] = (
+                self.counters.get("rest_fill_unconfirmed", 0) + 1)
+            raw = (getattr(o, "raw", None) or {}).get("info") or {}
+            entry = raw.get("order") if isinstance(raw.get("order"), dict) else raw
+            sizes = (f" (origSz {entry.get('origSz')}, sz {entry.get('sz')}, "
+                     f"status {raw.get('status')})"
+                     if isinstance(entry, dict) and "origSz" in entry else "")
+            self._log_once(f"rest_fill_unconfirmed_{rec.order_id}:{f:.8f}",
+                           f"note: {rec.key} {rec.order_id} reads {f:g} of {rec.amount:g} "
+                           f"{UNIT_LABEL} filled ({source}){sizes}, but {EXCHANGE_ID}'s trades "
+                           f"show {traded:g} — booking only the trades (the venue resized "
+                           f"the order; nothing was filled for the rest)")
+        return max(min(f, traded), rec.ws_cum)
+
     def _drain_settling(self, now: float) -> None:
         """The final-state read a requote's cancel owes, done on the slow tick
         rather than between pricing a quote and placing its replacement (a
@@ -2432,7 +2739,7 @@ class ArbBot:
                                    f"failed ({reason}): {e} — will retry")
                 continue
             self._last_msgs.pop(f"settling_{oid}", None)
-            rec.rest_cum = max(rec.rest_cum, self.venue.to_units(o.filled or 0.0))
+            rec.rest_cum = max(rec.rest_cum, self._rest_filled_units(rec, o, reason))
             self._book(rec, source=reason)
             if _still_resting(o):
                 self._log_once(f"settling_open_{oid}",
@@ -2462,7 +2769,7 @@ class ArbBot:
             rec = self.orders[key]
             o = open_orders.get(rec.order_id)
             if o is not None:
-                rec.rest_cum = max(rec.rest_cum, self.venue.to_units(o.filled or 0.0))
+                rec.rest_cum = max(rec.rest_cum, self._rest_filled_units(rec, o, "poll"))
                 self._book(rec, source="poll")
             elif now - max(rec.placed_t, rec.last_fill_t) >= SETTLE_GRACE_S:
                 self._settle(key, cancel_first=False, reason="left the book")
@@ -2473,11 +2780,18 @@ class ArbBot:
             _log(f"cancelling untracked {SYMBOL_VENUE} order {oid} "
                  f"({o.side.value} {o.remaining}@{o.price}) — only the bot's "
                  f"1 buy + 1 sell may rest")
+            t0 = time.perf_counter()
             try:
                 self.venue.cancel(oid)
                 self.counters["quotes_cancelled"] += 1
                 self._bal_dirty = True
+                self._order_event("cancel", key="untracked", side=o.side.value,
+                                  order_id=oid, price=o.price, ms=self._ms_since(t0),
+                                  result="ok", reason="untracked order")
             except Exception as e:
+                self._order_event("cancel", key="untracked", side=o.side.value,
+                                  order_id=oid, price=o.price, ms=self._ms_since(t0),
+                                  result="failed", reason="untracked order", msg=str(e)[:300])
                 _log(f"WARNING: cancel {oid} failed: {e}")
 
     def _settle(self, key: str, cancel_first: bool, reason: str,
@@ -2524,6 +2838,10 @@ class ArbBot:
             cancel_failed = False
             final = None
             if cancel_first:
+                ev = {"key": key, "side": rec.side, "purpose": rec.purpose,
+                      "order_id": rec.order_id, "price": rec.price, "amount": rec.amount,
+                      "reason": reason}
+                t0 = time.perf_counter()
                 try:
                     if defer_read:
                         final = self.venue.cancel_final(rec.order_id)
@@ -2531,16 +2849,21 @@ class ArbBot:
                         self.venue.cancel(rec.order_id)
                     self.counters["quotes_cancelled"] += 1
                 except Exception as e:  # keep going: the order may already be gone
+                    self._order_event("cancel", **ev, ms=self._ms_since(t0),
+                                      result="failed", msg=str(e)[:300])
                     _log(f"cancel {rec.order_id} failed ({e}); settling anyway")
                     cancel_failed = True
                 else:
+                    self._order_event("cancel", **ev, ms=self._ms_since(t0), result="ok",
+                                      filled=(None if final is None
+                                              else float(final.filled or 0.0)))
                     # no _bal_dirty on these paths: the cancel only FREES
                     # margin, so the cached head-room errs safe, and marking
                     # it dirty would put a REST margin read in front of the
                     # replacement — the delay this path exists to remove
                     if final is not None:
                         rec.rest_cum = max(rec.rest_cum,
-                                           self.venue.to_units(final.filled or 0.0))
+                                           self._rest_filled_units(rec, final, reason))
                         self._book(rec, source=reason)
                         self._release_entry_margin(rec)   # what is left unfilled
                         self._drop_rec(key)
@@ -2553,7 +2876,7 @@ class ArbBot:
                         self._persist_position()
                         return
             o = self.venue.get_order(rec.order_id)
-            rec.rest_cum = max(rec.rest_cum, self.venue.to_units(o.filled or 0.0))
+            rec.rest_cum = max(rec.rest_cum, self._rest_filled_units(rec, o, reason))
             self._book(rec, source=reason)
             if cancel_failed and _still_resting(o):
                 # The cancel did NOT take and the order is still live on the
@@ -2774,18 +3097,37 @@ class ArbBot:
         global HEDGE_THRESHOLD_UNITS, RECONCILE_TOLERANCE_UNITS
         global POSITION_RECONCILE_TOLERANCE_UNITS
         lot_units = round(self.volume_min * self.contract_size, 8)
+        # HEDGE_ROUND_FRACTION < 1 hedges a gap from that share of a lot: the
+        # gates derived from the lot open there too, or they would hold back
+        # the very gap the rounding sends (and the reconciler call it parity)
+        gate_units = round(lot_units * HEDGE_ROUND_FRACTION, 8)
+        share = ("one" if HEDGE_ROUND_FRACTION >= 1.0
+                 else f"{HEDGE_ROUND_FRACTION:g} of a (HEDGE_ROUND_FRACTION)")
         self._lot_gates = set()
         if HEDGE_THRESHOLD_UNITS is None:
-            HEDGE_THRESHOLD_UNITS = lot_units
+            HEDGE_THRESHOLD_UNITS = gate_units
             self._lot_gates.add("HEDGE_THRESHOLD_UNITS")
             self.hedge_threshold_from = "mt5_min_lot"
-            _log(f"hedge threshold: one {SYMBOL_MT5} min lot ({self.volume_min:g} lot) = "
+            _log(f"hedge threshold: {share} {SYMBOL_MT5} min lot ({self.volume_min:g} lot) = "
                  f"{HEDGE_THRESHOLD_UNITS:g} {UNIT_LABEL} (HEDGE_THRESHOLD_UNITS None)")
         if RECONCILE_TOLERANCE_UNITS is None:
-            RECONCILE_TOLERANCE_UNITS = lot_units
+            RECONCILE_TOLERANCE_UNITS = gate_units
             self._lot_gates.add("RECONCILE_TOLERANCE_UNITS")
-            _log(f"reconcile tolerance: one {SYMBOL_MT5} min lot = "
+            _log(f"reconcile tolerance: {share} {SYMBOL_MT5} min lot = "
                  f"{RECONCILE_TOLERANCE_UNITS:g} {UNIT_LABEL} (RECONCILE_TOLERANCE_UNITS None)")
+        if HEDGE_ROUND_FRACTION < 1.0:
+            for name, value in (("HEDGE_THRESHOLD_UNITS", HEDGE_THRESHOLD_UNITS),
+                                ("RECONCILE_TOLERANCE_UNITS", RECONCILE_TOLERANCE_UNITS)):
+                if name not in self._lot_gates and value > gate_units + 1e-9:
+                    _log(f"WARNING: {name}={value:g} {UNIT_LABEL} is above "
+                         f"HEDGE_ROUND_FRACTION {HEDGE_ROUND_FRACTION:g} of a min lot "
+                         f"({gate_units:g} {UNIT_LABEL}): a gap between the two is not "
+                         f"rounded up" + (" by this check" if name.startswith("RECONCILE")
+                                          else "") + f" — set {name} = None to follow it")
+        if HEDGE_ROUND_FRACTION < 1.0:
+            _log(f"hedge rounding: a leftover of {HEDGE_ROUND_FRACTION:g} of a "
+                 f"{SYMBOL_MT5} lot step or more is hedged as a whole step "
+                 f"(HEDGE_ROUND_FRACTION)")
         if POSITION_RECONCILE_TOLERANCE_UNITS is None:
             POSITION_RECONCILE_TOLERANCE_UNITS = lot_units / 2.0
             self._lot_gates.add("POSITION_RECONCILE_TOLERANCE_UNITS")
@@ -2806,12 +3148,13 @@ class ArbBot:
         if not gates:
             return
         lot_units = round(self.volume_min * self.contract_size, 8)
+        gate_units = round(lot_units * HEDGE_ROUND_FRACTION, 8)
         if "HEDGE_THRESHOLD_UNITS" in gates:
-            HEDGE_THRESHOLD_UNITS = lot_units
+            HEDGE_THRESHOLD_UNITS = gate_units
             if self.hedger is not None:
-                self.hedger.threshold_units = lot_units
+                self.hedger.threshold_units = gate_units
         if "RECONCILE_TOLERANCE_UNITS" in gates:
-            RECONCILE_TOLERANCE_UNITS = lot_units
+            RECONCILE_TOLERANCE_UNITS = gate_units
         if "POSITION_RECONCILE_TOLERANCE_UNITS" in gates:
             POSITION_RECONCILE_TOLERANCE_UNITS = lot_units / 2.0
         self.mt5_min_lot_units = self.volume_min * self.contract_size
@@ -2971,10 +3314,21 @@ class ArbBot:
         if self.pos_fault is not None and source != "fill":
             # the venue figure parity would hedge to is the one in doubt: a
             # "correction" from it is exactly what unhedged EXANTE (2026-11-02)
-            self._log_once("pos_fault_parity",
+            # keyed on the figures, so it says so again whenever they move:
+            # under one key it was logged twice in 48 minutes while the
+            # reconciler went on printing "fixing hedge" every 60 s
+            wait = ""
+            if POSITION_FAULT_ADOPT_S:
+                left = POSITION_FAULT_ADOPT_S - (time.time()
+                                                 - self.pos_fault.get("stable_since",
+                                                                      time.time()))
+                wait = (f"; the venue's figure is taken in {max(0.0, left):.0f}s if it "
+                        f"does not move" if left > 0 else "; taking the venue's figure")
+            self._log_once(f"pos_fault_parity:{self.pos_fault['read']:+.4f}:"
+                           f"{self.pos_fault['expected']:+.4f}",
                            f"parity hedge ({source}) FROZEN by the position fault — "
                            f"{EXCHANGE_ID} reads {self.pos_fault['read']:+g}, this bot's "
-                           f"fills say {self.pos_fault['expected']:+g} {UNIT_LABEL}")
+                           f"fills say {self.pos_fault['expected']:+g} {UNIT_LABEL}{wait}")
             return
         if LIVE_TRADING:
             try:
@@ -2985,13 +3339,34 @@ class ArbBot:
                      f"— quotes down; reconcile will re-check and fix (next "
                      f"window <= {RECONCILE_INTERVAL_S / 60:g} min)")
                 return
+            if source != "fill" and (self._pos_suspect_since is not None
+                                     or self.pos_fault is not None):
+                # (a fill's own hedge in HEDGE_MODE 'parity' is exempt, as
+                # from the fault above: right after a fill the venue's read
+                # normally lags it for a moment, and the fill is real)
+                # the read just taken DISAGREES with the fills' figure and
+                # was held back: which of them is right is not known yet, and
+                # a parity hedge from the fills' figure is a trade on a guess.
+                # The fault froze this only after POSITION_FAULT_GRACE_S; in
+                # those seconds the reconciler sold 3 lots of MT5 on phantom
+                # fills (2026-11-09, XYZ-JP225, 14 s before the fault). The
+                # reconciler re-checks; the figures agree or the fault decides.
+                read = self._venue_read_units
+                self._log_once(f"pos_suspect_parity:{read if read is not None else 0:+.4f}:"
+                               f"{self.venue_pos_units or 0:+.4f}",
+                               f"parity hedge ({source}) HELD: {EXCHANGE_ID} reads "
+                               f"{read if read is not None else float('nan'):+g} but this "
+                               f"bot's fills say {self.venue_pos_units or 0:+g} {UNIT_LABEL} "
+                               f"— no MT5 order until the figures agree")
+                return
         self.mt5_net_units = self._read_mt5_net_units()
         delta_units = round(-self._venue_exposure_units() - self.mt5_net_units, 8)  # see hedger
         if abs(delta_units) < HEDGE_THRESHOLD_UNITS:
             self.hedge_ok = True
             self._hand_off_to_hedger(source, delta_units, 0.0)
             return
-        lots = round_to_step(abs(delta_units) / self.contract_size, self.volume_step)
+        lots = _hedge_lots(abs(delta_units) / self.contract_size, self.volume_step,
+                           self.volume_min, HEDGE_ROUND_FRACTION)
         if lots < self.volume_min:
             self.hedge_ok = True  # sub-min-lot residue: nothing the broker can do
             self._hand_off_to_hedger(source, delta_units, 0.0)
@@ -3013,6 +3388,7 @@ class ArbBot:
             return
         if source == "reconcile" and self._reconcile_over_volume(side, lots):
             return
+        t0 = time.perf_counter()
         try:
             res = send_split(self._mt5_market, side, lots, self.volume_max,
                              self.volume_step, self.volume_min)
@@ -3020,6 +3396,15 @@ class ArbBot:
         except HedgeTooLarge as e:
             res, err = None, e
         filled = res.filled_lots if res is not None else 0.0
+        from .hedger import _order_price
+        first = res.orders[0][1] if res is not None and res.orders else None
+        self._order_event("hedge", mode=source, symbol=SYMBOL_MT5, side=side.value,
+                          lots=filled, lots_asked=lots, price=_order_price(first),
+                          order_id=str(getattr(first, "order_id", "") or "") or None,
+                          ms=self._ms_since(t0), delta_units=delta_units,
+                          result=("ok" if err is None else
+                                  "partial" if filled > 1e-9 else "failed"),
+                          msg=None if err is None else str(err)[:300])
         if filled > 1e-9:
             for got, o in res.orders:
                 self.counters["hedges"] += 1
@@ -3163,9 +3548,12 @@ class ArbBot:
             place=self._mt5_market, symbol_venue=SYMBOL_VENUE, to_units=self.venue.to_units,
             contract_size=self.contract_size, volume_step=self.volume_step,
             volume_min=self.volume_min, volume_max=self.volume_max,
+            round_fraction=HEDGE_ROUND_FRACTION,
             threshold_units=HEDGE_THRESHOLD_UNITS, live=LIVE_TRADING, started_utc=self._started_utc,
             on_result=self._on_event_hedge, on_failure=self._on_event_hedge_failed,
-            log=_log)
+            log=_log, on_event=lambda e: self._order_event(
+                e.get("ev", "hedge"), **{k: v for k, v in e.items() if k != "ev"},
+                symbol=SYMBOL_MT5))
         # no after_place: the ticket pairing runs on the loop thread once the
         # terminal lists the new ticket (_settle_mt5_book), so the hedger's
         # thread is back at its queue the moment order_send returns
@@ -3315,13 +3703,23 @@ class ArbBot:
         if MARKET_PAIR and time.time() - self._last_fire_t < PAIR_POSITION_SETTLE_S:
             return      # the terminal may not list the new ticket yet
         self.venue.read_position()
+        # the venue's own figure, held back or not: an exit is never sized
+        # past it (_clamp_exit_to_venue) and a fault reports it (dump_state).
+        # The extras are the venue's own numbers too, whichever position the
+        # anchor holds: a fault left them at the last accepted read, so the
+        # snapshot showed the unrealized PnL of a position the account had
+        # left (2026-11-09: +1.38 where the real leg was about -2)
+        self._venue_read_units = self.venue.position_units
+        self._venue_read_t = time.time()
+        self.venue_entry_px, self.venue_upnl = self.venue.entry_px, self.venue.upnl
+        self.venue_ufunding, self.venue_liq_px = self.venue.ufunding, self.venue.liq_px
         if self._venue_read_contradicts(self.venue_pos_units, self.venue.position_units,
                                         time.time()):
             return      # held back: the fills' figure stays the anchor
         self.venue_pos_units = self.venue.position_units
         self._fills_since_read = 0.0
-        self.venue_entry_px, self.venue_upnl = self.venue.entry_px, self.venue.upnl
-        self.venue_ufunding, self.venue_liq_px = self.venue.ufunding, self.venue.liq_px
+        self._read_ok_t = time.time()
+        self._anchor_uncertain = False
 
     def _pos_fault_tolerance(self) -> float:
         """How far a venue read may sit from the fills' figure and still be
@@ -3348,6 +3746,22 @@ class ArbBot:
         it. A read that moved with NO fill of ours behind it (a liquidation,
         a manual trade) is taken as before — the parity check is for that."""
         tol = self._pos_fault_tolerance()
+        if self._anchor_uncertain and expected is not None and abs(read - expected) >= tol:
+            # a fill landed within POSITION_READ_SETTLE_S of the last accepted
+            # read, so the anchor was deliberately left alone and cannot be
+            # the judge of anything. Take the read: it is the only figure
+            # here that is certainly the venue's own.
+            self._log_once(f"anchor_uncertain:{read:+.4f}",
+                           f"position check: a fill landed within "
+                           f"{POSITION_READ_SETTLE_S:g}s of the last accepted read, so "
+                           f"the tracked anchor may hold it twice — taking "
+                           f"{EXCHANGE_ID}'s {read:+g} {UNIT_LABEL} as the position")
+            self._anchor_uncertain = False
+            self._pos_suspect_since = None
+            if self.pos_fault is not None:
+                self.pos_fault = None
+                self._update_gate_reasons()
+            return False
         if expected is None or abs(read - expected) < tol:
             if self.pos_fault is not None:
                 _log(f"position check: {EXCHANGE_ID} reads {read:+g} {UNIT_LABEL}, as this "
@@ -3373,7 +3787,7 @@ class ArbBot:
             if now - self._pos_suspect_since < POSITION_FAULT_GRACE_S:
                 return True
             self.pos_fault = {"read": round(read, 8), "expected": round(expected, 8),
-                              "since": _utcnow()}
+                              "since": _utcnow(), "stable_since": now}
             _log(f"POSITION FAULT: {EXCHANGE_ID} has read {read:+g} {UNIT_LABEL} for "
                  f"{now - self._pos_suspect_since:.0f}s while this bot's fills make it "
                  f"{expected:+g} — NEW ENTRIES STOPPED and parity hedges FROZEN (exits keep "
@@ -3382,7 +3796,24 @@ class ArbBot:
                  f"and restart it — a start takes the venue's figure")
             self._update_gate_reasons()
         else:
+            prev = self.pos_fault.get("read")
+            if prev is None or abs(read - prev) > tol:
+                # the venue's figure is MOVING: this is the read in doubt,
+                # which is the case the fault exists for. Keep waiting.
+                self.pos_fault["stable_since"] = now
+            self.pos_fault.setdefault("stable_since", now)
             self.pos_fault.update(read=round(read, 8), expected=round(expected, 8))
+            held = now - self.pos_fault["stable_since"]
+            if POSITION_FAULT_ADOPT_S and held >= POSITION_FAULT_ADOPT_S:
+                _log(f"POSITION FAULT resolved: {EXCHANGE_ID} has read {read:+g} "
+                     f"{UNIT_LABEL} unchanged for {held:.0f}s while this bot's fills "
+                     f"make it {expected:+g} - the fills are wrong, not the venue: "
+                     f"taking the venue's figure (a restart would do the same). "
+                     f"Entries and parity resume.")
+                self.pos_fault = None
+                self._pos_suspect_since = None
+                self._update_gate_reasons()
+                return False        # accept it: the resync and parity follow
         return True
 
     def _read_venue_margin(self) -> None:
@@ -3451,6 +3882,13 @@ class ArbBot:
         2026-10-27); report/paper_trades.jsonl keeps it."""
         if MARKET_PAIR and not LIVE_TRADING:
             return self.venue_pos_units if self.venue_pos_units is not None else 0.0
+        if (LIVE_TRADING and self._venue_read_units is not None
+                and (self.pos_fault is not None or self._pos_suspect_since is not None)):
+            # the figures disagree: report what the ACCOUNT holds, not the
+            # anchor in doubt (2026-11-09: the snapshot showed +0.021 long
+            # while Hyperliquid held -0.02823 short). The anchor is in the
+            # snapshot as perp.tracked_units
+            return self._venue_read_units
         return self._position_units()
 
     def _venue_exposure_units(self) -> float:
@@ -3760,9 +4198,12 @@ class ArbBot:
         if self.derisk_active:
             reasons.append("liquidation threshold hit (sticky until restart): "
                            + "; ".join(self.derisk_reasons))
-        if reasons != self.close_only_reasons:
-            _log("entry gate: " + ("; ".join(reasons) if reasons else
-                                   "clear — entries enabled"))
+        # a gate that HOLDS is restated, not said once and then forgotten:
+        # the terminal should never look idle while entries are stopped
+        if reasons:
+            self._log_restate("entry_gate", "entry gate: " + "; ".join(reasons))
+        else:
+            self._log_cleared("entry_gate", "entry gate: clear — entries enabled")
         self.close_only_reasons = reasons
 
     # ── risk controls (daily limits + margin de-risk; see atjte.engines.common.risk) ──
@@ -5166,7 +5607,8 @@ class ArbBot:
                  + " — another project's hedge book, not counted here")
         if not unknown:
             return
-        lots_need = round_to_step(abs(need) / self.contract_size, self.volume_step)
+        lots_need = _hedge_lots(abs(need) / self.contract_size, self.volume_step,
+                                self.volume_min, HEDGE_ROUND_FRACTION)
         held = ", ".join(f"magic {m}: {q:+g} lot" for m, q in sorted(unknown.items()))
         held_units = sum(unknown.values()) * self.contract_size
         msg = (f"{SYMBOL_MT5} holds positions of a magic that is not this bot's "
@@ -5592,11 +6034,18 @@ class ArbBot:
         Failure logging is throttled per ``(key, error class)`` — the target
         price is left OUT of the message — so a repeated failure logs once,
         not once per price tick."""
+        ev = {"key": rec.key, "side": rec.side, "purpose": rec.purpose,
+              "order_id": rec.order_id, "from_price": rec.price, "price": t["price"],
+              "amount": rec.amount, "level": t.get("level")}
+        t0 = time.perf_counter()
         try:
             res = self.venue.edit_limit(rec.order_id, rec.side, t["price"],
                                         units=rec.amount)
         except Exception as e:
             cls = _classify_order_error(e)
+            self._order_event_once(f"amend_{rec.key}", "amend", **ev, ms=self._ms_since(t0),
+                                   result="failed" if cls == "other" else cls,
+                                   msg=str(e)[:300])
             self._log_once(f"amend_{rec.key}:{cls}",
                            f"amend {rec.key} failed ({cls}): {e}")
             if cls == "gone":
@@ -5607,6 +6056,11 @@ class ArbBot:
             return "resting"
         status = str((((res or {}).get("info") or {}).get("editStatus") or {})
                      .get("status") or "").lower()
+        self._order_event_clear(f"amend_{rec.key}")
+        self._order_event("amend", **ev, ms=self._ms_since(t0),
+                          result=("filled" if status == "filled"
+                                  or (res or {}).get("status") == "closed" else "ok"),
+                          new_order_id=str((res or {}).get("id") or "") or None)
         if status == "filled" or (res or {}).get("status") == "closed":
             self._log_once(f"amend_{rec.key}:gone",
                            f"amend {rec.key}: order already filled — settling")
@@ -5701,22 +6155,25 @@ class ArbBot:
             if need is None or avail is None:
                 return amount          # cannot judge: the venue is the judge
             if need > avail:
-                # once per blocked spell: the figures move with every tick,
-                # and a line per pass flooded the log (2026-11-02)
-                if f"margin_{key}" not in self._last_msgs:
-                    self._log_once(f"margin_{key}",
-                                   f"skip {key}: {amount:g} {UNIT_LABEL} needs {need:.2f} "
-                                   f"{self.venue.quote} margin ("
-                                   + ("notional x the market's initial margin"
-                                      if getattr(getattr(self.venue, "client", None),
-                                                 "broker_margin", False)
-                                      else "notional / leverage")
-                                   + (f" x {PLACE_MARGIN_SAFETY:g}"
-                                      if PLACE_MARGIN_SAFETY != 1 else "")
-                                   + f") but the account has {avail:.2f} available "
-                                   f"— skipped until it fits")
+                # restated while it holds: the figures move with every tick,
+                # so the wording rounds them to keep it quiet (a line per
+                # pass flooded the log, 2026-11-02) while a material change
+                # — and the fact that it is STILL blocked — still shows
+                self._log_restate(
+                    f"margin_{key}",
+                    f"skip {key}: {amount:g} {UNIT_LABEL} needs {need:.2f} "
+                    f"{self.venue.quote} margin ("
+                    + ("notional x the market's initial margin"
+                       if getattr(getattr(self.venue, "client", None),
+                                  "broker_margin", False)
+                       else "notional / leverage")
+                    + (f" x {PLACE_MARGIN_SAFETY:g}"
+                       if PLACE_MARGIN_SAFETY != 1 else "")
+                    + f") but the account has {avail:.2f} available "
+                    f"— skipped until it fits")
                 return None
-            self._last_msgs.pop(f"margin_{key}", None)
+            self._log_cleared(f"margin_{key}",
+                              f"{key}: margin fits again — entries resume")
             return amount
         capacity = self.venue.entry_capacity(t["side"], t["price"], SPOT_FUNDS_SAFETY)
         fit = amount if capacity is None else max(min(amount, capacity), 0.0)
@@ -5856,6 +6313,10 @@ class ArbBot:
         t = self._fresh_target(key, {**t, "amount": amount})   # priced as of NOW
         if t is None:
             return
+        if t["purpose"] == "exit":
+            t = self._clamp_exit_to_venue(key, t)
+            if t is None:
+                return
         reduce_only = bool(REDUCE_ONLY_EXITS and t["purpose"] == "exit"
                            and self.venue.supports_reduce_only)
         lifted = self._lift_to_min_value(t)
@@ -5873,12 +6334,19 @@ class ArbBot:
             self._log_once(f"preplace_{key}", f"skip {key} {t['amount']:g} {UNIT_LABEL}: {why}")
             return
         self._last_msgs.pop(f"preplace_{key}", None)
+        ev = {"key": key, "side": t["side"], "purpose": t["purpose"], "amount": t["amount"],
+              "price": t["price"], "level": t.get("level"),
+              "post_only": not t.get("taker"), "reduce_only": reduce_only}
+        t0 = time.perf_counter()
         try:
             o = self.venue.place_limit(t["side"], t["amount"], t["price"],
                                        post_only=not t.get("taker"),
                                        reduce_only=reduce_only)
         except Exception as e:
             msg = str(e).lower()
+            self._order_event_once(f"place_{key}", "place", **ev, ms=self._ms_since(t0),
+                                   result="paused" if "paused until" in msg else "failed",
+                                   msg=str(e)[:300])
             if "paused until" in msg:
                 # the gateway holds orders after a venue rejection (IBKR):
                 # once per pause, not once per re-priced order
@@ -5891,8 +6359,12 @@ class ArbBot:
             if "insufficient" in msg:
                 self._pause_entries(t)
             return
+        place_ms = self._ms_since(t0)
+        self._order_event_clear(f"place_{key}")
         if o.status is OrderStatus.REJECTED:
             why = ((o.raw or {}).get('info') or {}).get('sendStatus') or o.raw
+            self._order_event_once(f"place_{key}", "place", **ev, ms=place_ms,
+                                   result="rejected", msg=str(why)[:300])
             self._log_once(f"place_{key}",
                            f"place {key} {t['amount']:g}@{t['price']} rejected by the venue: "
                            f"{why}")
@@ -5900,6 +6372,10 @@ class ArbBot:
                 self._bal_dirty = True
                 self._pause_entries(t)
             return
+        self._order_event("place", **ev, ms=place_ms, order_id=str(o.order_id or ""),
+                          result="ok" if not _no_order_id(o.order_id) else "no order id",
+                          status=getattr(o.status, "value", str(o.status)),
+                          filled=float(o.filled or 0.0))
         if _no_order_id(o.order_id):
             # the venue's answer names no order (Hyperliquid's ws post with
             # no status — reported with the request quota at its cap): nothing
@@ -5936,6 +6412,47 @@ class ArbBot:
         if rec.rest_cum > POS_EPS:
             self._book(rec, source="place")
         self._persist_position()
+
+    def _clamp_exit_to_venue(self, key: str, t: dict) -> Optional[dict]:
+        """An exit, sized against the venue's latest position read: never
+        bigger than what that read holds on the side it closes, and not sent
+        at all when the read holds nothing there — the tracked figure is then
+        the wrong side of the venue's.
+
+        Only a read taken AFTER the last booked fill judges: an older one has
+        not seen that fill (an entry that just filled is exited at once, and
+        the read that shows it is still coming). Until then the exit goes as
+        the strategy sized it.
+
+        2026-11-09, XYZ-JP225: with the tracked position wrong, exits went
+        out bigger than the position (Hyperliquid shrank them, which read as
+        fills), and later, the tracked figure long while the account was
+        short, a sell-long-exit every second, every one refused "Reduce only
+        order would increase position", while the real short had no exit."""
+        read = self._venue_read_units
+        if (not LIVE_TRADING or read is None
+                or self._venue_read_t <= self._last_fill_t):
+            return t
+        closes = read if t["side"] == "sell" else -read
+        if closes <= POS_EPS:
+            self._log_once(f"exit_contra_{key}:{read:+.6f}",
+                           f"skip {key}: {EXCHANGE_ID} reads {read:+g} {UNIT_LABEL}, so a "
+                           f"{t['side']} exit closes nothing there (this bot's fills say "
+                           f"{self._position_units():+g}) — not sent until the figures agree")
+            return None
+        if t["amount"] <= closes + POS_EPS:
+            return t
+        amt = self.venue.amount_to_precision(closes)
+        if amt <= POS_EPS or (self.amount_min and amt < self.amount_min - POS_EPS):
+            self._log_once(f"exit_clamp_min_{key}:{read:+.6f}",
+                           f"skip {key}: {EXCHANGE_ID} reads {read:+g} {UNIT_LABEL}, under "
+                           f"the venue's minimum order — the {t['amount']:g} exit is not sent")
+            return None
+        self._log_once(f"exit_clamp_{key}:{read:+.6f}:{t['amount']:.6f}",
+                       f"{key}: exit of {t['amount']:g} {UNIT_LABEL} sent as {amt:g} — "
+                       f"{EXCHANGE_ID} reads {read:+g}, and an exit never exceeds the "
+                       f"position it closes")
+        return {**t, "amount": amt}
 
     def _lift_to_min_value(self, t: dict) -> Optional[float]:
         """The size an order under the venue's minimum order VALUE
@@ -6093,8 +6610,15 @@ class ArbBot:
             kept = [(float(ts), float(v))
                     for ts, v in (data.get("samples") or ())
                     if float(ts) >= cutoff]
+            # the bid / ask basis only under the same BASIS_MODE: another
+            # mode prices them off other sides of the books
+            basis = [(float(ts), float(b), float(a))
+                     for ts, b, a in (data.get("basis") or ())
+                     if float(ts) >= cutoff] \
+                if data.get("basis_mode", BASIS_MODE) == BASIS_MODE else []
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return
+        self.__dict__.setdefault("_basis_1s", deque(maxlen=self._samples.maxlen)).extend(basis)
         self._samples.extend(kept)
         if kept:
             self._sample_t = kept[-1][0]
@@ -6107,13 +6631,18 @@ class ArbBot:
         cutoff = time.time() - self.SAMPLES_KEEP_S
         out = [[round(ts, 2), round(v, 4)]
                for ts, v in self._samples if ts >= cutoff]
+        basis = [[round(ts, 2), round(b, 4), round(a, 4)]
+                 for ts, b, a in self.__dict__.get("_basis_1s") or () if ts >= cutoff]
         try:
             # compact, not pretty-printed: three hours of samples is ~10k
             # rows, written every second -- 170 KB flat vs 430 KB indented
             _atomic_write(SAMPLES_FILE, {"updated_utc": _utcnow(),
                                          "interval_s": SAMPLE_INTERVAL_S,
                                          "hedge_ratio": HEDGE_RATIO,
-                                         "samples": out}, indent=None)
+                                         "basis_mode": BASIS_MODE,
+                                         "samples": out,
+                                         # [ts, bid basis, ask basis] (BASIS_MODE)
+                                         "basis": basis}, indent=None)
             self._last_msgs.pop("samples_io", None)
         except OSError as e:
             self._log_once("samples_io",
@@ -6126,6 +6655,10 @@ class ArbBot:
         if now - self._sample_t >= SAMPLE_INTERVAL_S:
             self._sample_t = now
             self._samples.append((now, self.spread_now))
+            b = getattr(self, "_basis_now", None)
+            if b is not None and now - b[0] <= BASIS_SAMPLE_FRESH_S:
+                self.__dict__.setdefault("_basis_1s", deque(
+                    maxlen=self._samples.maxlen)).append((now, b[1], b[2]))
         if now - self._samples_persist_t >= SAMPLES_PERSIST_S:
             self._samples_persist_t = now
             self._persist_samples()
@@ -6221,6 +6754,8 @@ class ArbBot:
         :meth:`_sample_basis` and the filler's :meth:`_basis_fill_once`)."""
         with self._basis_lock:
             self._push_basis_locked(now, bid_basis, ask_basis)
+        # the latest pair, for the 1 s chart series (:meth:`_sample_spread`)
+        self._basis_now = (now, float(bid_basis), float(ask_basis))
 
     def _push_basis_locked(self, now: float, bid_basis: float, ask_basis: float) -> None:
         q = self._basis_samples
@@ -6761,7 +7296,12 @@ class ArbBot:
         gateway (``fetch_ohlcv``: the CCXT, Hyperliquid and Lighter gateways
         serve it) and the MT5 rates through the MT5 gateway. A leg whose
         gateway serves no history comes back empty, said in the log — never
-        a direct venue or terminal call from the bot."""
+        a direct venue or terminal call from the bot.
+
+        An EMPTY page is a span the market did not trade (a 24 h window that
+        starts on a Sunday opens on a closed CME): the cursor jumps the
+        page's span and reads on, as ``atjte spread-history`` does. Stopping
+        there left the whole venue leg empty (2026-11-09)."""
         venue: dict = {}
         mt5: dict = {}
         try:
@@ -6769,12 +7309,13 @@ class ArbBot:
             for _ in range(HISTORY_PAGES):
                 rows = self.venue.exchange.fetch_ohlcv(SYMBOL_VENUE, "1m", since=cursor,
                                                        limit=HISTORY_PAGE)
-                if not rows:
-                    break
-                for row in rows:
-                    venue[int(float(row[0]) // 1000)] = float(row[4])
-                nxt = int(rows[-1][0]) + 60_000
-                if nxt <= cursor or nxt > end_ms:
+                if rows:
+                    for row in rows:
+                        venue[int(float(row[0]) // 1000)] = float(row[4])
+                    nxt = max(int(rows[-1][0]) + 60_000, cursor + 60_000)
+                else:
+                    nxt = cursor + HISTORY_PAGE * 60_000
+                if nxt >= end_ms:
                     break
                 cursor = nxt
         except Exception as e:
@@ -6800,11 +7341,25 @@ class ArbBot:
         without the panel opening a connection of its own. Best-effort."""
         if getattr(self, "_history_backfilled", True) or self._srv_offset_s is None:
             return
-        if now < getattr(self, "_history_retry_t", 0.0):
+        job = getattr(self, "_history_job", None)
+        if job is None:
+            if now < getattr(self, "_history_retry_t", 0.0):
+                return
+            # read on a thread of its own, with a long reply timeout: a
+            # Databento-priced leg takes 15–30 s, and this pass (reconcile,
+            # risk, the order poll) must never wait for a chart's history
+            asked = now
+            job = self._history_job = _HistoryRead(
+                lambda: self.history_closes(asked - REPORT_HISTORY_S, asked))
+            job.start(HISTORY_IN_THREAD)
+        if not job.done.is_set():
             return
+        self._history_job = None
         self._history_backfilled = True
         try:
-            venue, mt5 = self.history_closes(now - REPORT_HISTORY_S, now)
+            if job.error is not None:
+                raise job.error
+            venue, mt5 = job.result
             n = self.reporter.backfill_bars(venue, mt5, now)
             if n:
                 _log(f"report: {n} one-minute bars filled from the gateways' history "
@@ -7002,6 +7557,7 @@ class ArbBot:
                        "maker_fee": getattr(self.venue, "maker_fee", None),
                        "taker_fee": getattr(self.venue, "taker_fee", None),
                        "hedge_threshold_units": HEDGE_THRESHOLD_UNITS,
+                       "hedge_round_fraction": HEDGE_ROUND_FRACTION,
                        "hedge_threshold_from": getattr(self, "hedge_threshold_from",
                                                        "setting"),
                        "reconcile_tolerance_units": RECONCILE_TOLERANCE_UNITS,
@@ -7064,7 +7620,13 @@ class ArbBot:
             "mt5_health": getattr(self, "mt5_health", None),
             "hedge_mode": HEDGE_MODE,
             "event_hedger": self.hedger.status() if self.hedger is not None else None,
-            "perp": {"position_units": self.venue_pos_units,
+            "perp": {"position_units": (self.venue_pos_units if self.pos_fault is None
+                                        and self._pos_suspect_since is None
+                                        else self._reported_position_units()),
+                     # the fills' figure (the quoting anchor), when it is not
+                     # the venue's: during a position fault
+                     "tracked_units": (self.venue_pos_units if self.pos_fault is not None
+                                       or self._pos_suspect_since is not None else None),
                      "entry_price": self.venue_entry_px,
                      "unrealized_pnl": self.venue_upnl,
                      "unrealized_funding": self.venue_ufunding,

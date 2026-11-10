@@ -32,9 +32,12 @@ every TRADE logon: if the gateway dies, EXANTE cancels its DAY quotes.
 Fills are pushed the moment the FIX execution report arrives, without a fee;
 EXANTE books the commission as a transaction, which the gateway reads over
 REST and pushes the fill again with. EXANTE allows 25 order requests per 10
-seconds (amends and cancels included) — the gateway's budget (`msgs_per_min`,
-138) stays under it. Set higher (up to 6000) to test what the account really
-gets: a rate-limit refusal then pauses new orders and amends for 10 s, never
-cancels.
+seconds (amends and cancels included, each cancelled order counted) — the
+gateway's budget (`msgs_per_min`, 120) and its burst (what is left of the 25
+after 10 s of that rate: 5) keep every 10 s window at or under it, and new
+orders and amends always leave 2 of the burst to cancels, so a quote can come
+down while new orders wait. Set higher (up to 6000) to test what the account
+really gets: a rate-limit refusal then pauses new orders and amends for 10 s,
+never cancels.
 The FIX sessions are down 16:58-17:00 New York time every day (EXANTE's
 maintenance): the bots' quotes come down and go back up by themselves.

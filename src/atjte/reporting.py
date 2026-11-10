@@ -115,6 +115,10 @@ SNAPSHOT_FILE = "snapshot.json"
 TRADES_FILE = "trades.jsonl"
 BARS_FILE = "bars.jsonl"
 SEED_FILE = "seed.json"
+#: every order action with its outcome and latency — place, amend, cancel,
+#: fill, hedge — one row each, ``ts`` in epoch seconds to the millisecond
+ORDERS_FILE = "orders.jsonl"
+ORDERS_KEEP_S = 14 * 86400.0
 
 REPORT_SNAPSHOT_S = 5.0        # default snapshot cadence (engine setting)
 REPORT_DEALS_S = 30.0          # default MT5 deal poll cadence (engine setting)
@@ -627,16 +631,30 @@ def mt5_block(*, symbol: str, magic: int, ok: bool, contract: float,
 
 def swap_terms(info: dict) -> Optional[dict]:
     """The overnight swap terms of an MT5 symbol from its ``symbol_info``:
-    ``{mode, long, short, point, rollover3days}`` — ``long`` / ``short`` per
-    lot per day as the terminal states them (positive = the position is
-    PAID), in the unit ``mode`` names (MT5's SYMBOL_SWAP_MODE: 1 points,
-    2 base currency, 3 margin currency, 4 deposit currency, 5 / 6 annual
-    interest %). None without them."""
+    ``{mode, long, short, point, rollover3days, base, profit, margin}`` —
+    ``long`` / ``short`` per lot per day as the terminal states them
+    (positive = the position is PAID), in the unit ``mode`` names (MT5's
+    SYMBOL_SWAP_MODE: 1 points, 2 base currency, 3 margin currency,
+    4 deposit currency, 5 / 6 annual interest %). None without them.
+
+    Modes 2 and 3 state a CURRENCY amount, so turning one into a rate needs
+    the lot's notional in that same currency — which needs the symbol's
+    three currencies. They are kept here because nothing downstream can get
+    them back: a report is read long after the terminal that wrote it is
+    gone (2026-11-05: JP225 is mode 3 and US500 mode 2, and both read "—" on
+    the panel's funding column for want of these three fields)."""
     if not isinstance(info, dict) or info.get("swap_mode") is None:
         return None
-    return {"mode": int(info["swap_mode"]), "long": _f(info.get("swap_long")),
-            "short": _f(info.get("swap_short")), "point": _f(info.get("point")),
-            "rollover3days": info.get("swap_rollover3days")}
+    out = {"mode": int(info["swap_mode"]), "long": _f(info.get("swap_long")),
+           "short": _f(info.get("swap_short")), "point": _f(info.get("point")),
+           "rollover3days": info.get("swap_rollover3days")}
+    # only where there is something to say, so a terminal that names no
+    # currency writes exactly what it always did
+    for key, src in (("base", "currency_base"), ("profit", "currency_profit"),
+                     ("margin", "currency_margin")):
+        if info.get(src):
+            out[key] = str(info[src])
+    return out
 
 
 def symbol_parts(symbol: str) -> tuple[str, str]:
@@ -683,6 +701,9 @@ class Reporter:
         self._mark_venue_t: Optional[float] = None
         self._mark_mt5_t: Optional[float] = None
         self._bars_pruned_t = 0.0
+        self._orders_pruned_t = 0.0
+        #: the order log is written from the loop AND the hedger's thread
+        self._orders_lock = threading.Lock()
         self._warned: set[str] = set()
         self._fx_symbol: Optional[str] = None
         self._fx_inverse = False       # _fx_symbol quotes USD in the account ccy
@@ -703,6 +724,7 @@ class Reporter:
             return
         self._load_seen()
         self._prune_bars(time.time(), force=True)
+        self._prune_orders(time.time(), force=True)
 
     # ── paths ────────────────────────────────────────────────────────────────
     @property
@@ -716,6 +738,50 @@ class Reporter:
     @property
     def bars_file(self) -> Path:
         return self.dir / BARS_FILE
+
+    @property
+    def orders_file(self) -> Path:
+        return self.dir / ORDERS_FILE
+
+    def record_order(self, event: dict) -> bool:
+        """Append one order event to ``orders.jsonl``: ``ev`` (place, amend,
+        cancel, fill, hedge), ``ts`` (epoch s, ms precision; now when absent)
+        and what the event knows — key, side, price, ms, result, msg. Never
+        raises: the log is for the operator, never in the order path's way."""
+        if not self.ok:
+            return False
+        rec = {"ts": round(time.time(), 3), **event}
+        if isinstance(rec.get("ts"), float):
+            rec["ts"] = round(rec["ts"], 3)
+        try:
+            line = json.dumps(rec, default=str) + "\n"
+            with self._orders_lock:
+                with self.orders_file.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            self._prune_orders(time.time())
+        except (OSError, TypeError, ValueError) as e:
+            self._warn("orders_io", f"cannot append {ORDERS_FILE}: {e}")
+            return False
+        return True
+
+    def _prune_orders(self, now: float, force: bool = False) -> None:
+        if not force and now - self._orders_pruned_t < BARS_PRUNE_EVERY_S:
+            return
+        self._orders_pruned_t = now
+        if not self.orders_file.exists():
+            return
+        with self._orders_lock:
+            rows = read_jsonl(self.orders_file)
+            keep = [r for r in rows if (_f(r.get("ts")) or 0.0) >= now - ORDERS_KEEP_S]
+            if len(keep) == len(rows):
+                return
+            try:
+                tmp = self.orders_file.with_name(self.orders_file.name + ".tmp")
+                tmp.write_text("".join(json.dumps(r, default=str) + "\n" for r in keep),
+                               encoding="utf-8")
+                os.replace(tmp, self.orders_file)
+            except OSError as e:
+                self._warn("orders_prune", f"cannot prune {ORDERS_FILE}: {e}")
 
     @property
     def seed_file(self) -> Path:

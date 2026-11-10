@@ -16,6 +16,10 @@
                                                     the historical spread of ANY venue symbol vs
                                                     ANY MT5 symbol, through their gateways
                                                     (read-only; atjte.spread_history)
+    atjte account-ledger fetch <gateway> | import-hyperliquid <gateway> --file F | status
+                                                    the ACCOUNT ledger: every trade, funding,
+                                                    deal, deposit / withdrawal of a gateway's
+                                                    account, kept forever (atjte.account_ledger)
     atjte gateway NAME | --new NAME --venue V | …   exactly ``atjte-gateway`` — here so a frozen
                                                     application can run its gateways by
                                                     relaunching itself, as it does its bots
@@ -29,7 +33,8 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 COMMANDS = ("bot", "migrate", "workspace", "version", "mt5-probe", "report",
-            "backfill", "fixcheck", "gateway", "reporter", "spread-history")
+            "backfill", "fixcheck", "gateway", "reporter", "spread-history",
+            "account-ledger")
 
 #: what each gateway kind speaks to its platform with — most are imported
 #: lazily, so a missing one shows only when that gateway starts
@@ -64,6 +69,8 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("mt5-probe", help="attach to MT5 and report the account (ATJ_MT5_* env vars)")
     sub.add_parser("reporter", add_help=False,
                    help="the reporting database: run | rebuild [--strategy KEY] | status")
+    sub.add_parser("account-ledger", add_help=False,
+                   help="the account ledger: fetch <gateway> | import-hyperliquid | status")
     sub.add_parser("gateway", add_help=False,
                    help="run or create a gateway (the arguments of atjte-gateway)")
 
@@ -163,6 +170,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # its own parser, and every venue's dispatch, live in the entry point
         from .gateways.fix.gateway import main as gateway_main
         return gateway_main(argv[1:])
+    if argv[:1] == ["account-ledger"]:
+        # its own parser: fetch / import-hyperliquid / status
+        from .account_ledger import main as ledger_main
+        return ledger_main(argv[1:])
     if argv[:1] == ["reporter"]:
         # its own parser: run / rebuild / status (atjte.reportdb.daemon)
         from .reportdb.daemon import main as reporter_main

@@ -103,10 +103,13 @@ def encode(pairs: Iterable[tuple[int, object]]) -> bytes:
 class Msg:
     """One decoded frame: the ordered pairs, plus lookup by tag."""
 
-    __slots__ = ("pairs",)
+    __slots__ = ("pairs", "rx_ts")
 
     def __init__(self, pairs: list[tuple[int, str]]) -> None:
         self.pairs = pairs
+        #: when the session read it off the socket (epoch s, this machine's
+        #: clock), before parsing; None for a message not read off a wire
+        self.rx_ts: float | None = None
 
     @property
     def msg_type(self) -> str:

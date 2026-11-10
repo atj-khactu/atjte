@@ -700,3 +700,25 @@ class Venue:
         """One order's current state, open or closed (a gateway without a
         venue-side fetchOrder looks it up itself — Lighter's)."""
         return self.client.get_order(order_id, self.symbol)
+
+    @property
+    def rest_filled_trade_backed(self) -> bool:
+        """Whether an order read's ``filled`` is the venue's own count of what
+        TRADED. False where it is derived (Hyperliquid: ``origSz - sz``, and
+        the venue lowers ``sz`` with no trade when a reduce-only order is
+        bigger than the position): the engine then books only what the
+        account's trades confirm (:meth:`order_trade_units`)."""
+        return bool(getattr(self.client, "rest_filled_trade_backed", True))
+
+    def order_trade_units(self, order_ids, since_s: float = 0.0) -> float:
+        """The base units this account's own trades on this symbol filled for
+        any of ``order_ids`` (an amended order's earlier ids too), from
+        ``since_s`` (epoch seconds) less a minute. Raises on a read error."""
+        ids = {str(i) for i in order_ids if i}
+        since_ms = int(max(0.0, float(since_s or 0.0) - 60.0) * 1000) or None
+        trades = self.exchange.fetch_my_trades(self.symbol, since_ms)
+        total = 0.0
+        for t in trades or []:
+            if str(t.get("order") or "") in ids:
+                total += float(t.get("amount") or 0.0)
+        return self.to_units(total)

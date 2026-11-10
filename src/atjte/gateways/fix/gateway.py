@@ -890,6 +890,8 @@ class FixGateway:
         while not self._stop.is_set():
             try:
                 conn, addr = self._srv.accept()
+                from atjte.net import no_delay
+                no_delay(conn)
             except (socket.timeout, TimeoutError):
                 continue
             except OSError:

@@ -121,6 +121,51 @@ def _step(value: float, step: float) -> float:
     return round(math.floor(value / step + 1e-9) * step, 8)
 
 
+def valid_round_fraction(fraction: Any) -> float:
+    """``HEDGE_ROUND_FRACTION`` as a float in (0.5, 1.0], else ValueError.
+    At 0.5 or under, a gap sitting on the boundary would hedge a lot one
+    way and straight back the other way: an FX re-size or a tiny fill
+    flips it (:func:`hedge_lots`)."""
+    try:
+        f = float(1.0 if fraction is None else fraction)
+    except (TypeError, ValueError):
+        raise ValueError(f"HEDGE_ROUND_FRACTION must be a number, not {fraction!r}") from None
+    if not 0.5 < f <= 1.0:
+        raise ValueError(f"HEDGE_ROUND_FRACTION {f:g} is out of range: it must be above 0.5 "
+                         f"and at most 1.0 (0.5 or under trades a lot back and forth on a "
+                         f"gap sitting at half a lot)")
+    return f
+
+
+def hedge_lots(gap_lots: float, volume_step: float, volume_min: float,
+               fraction: float = 1.0) -> float:
+    """The lots to send for an unsigned gap of ``gap_lots``: whole
+    ``volume_step``s, plus one more step when what is left is at least
+    ``fraction`` of a step; under ``volume_min``, the minimum when the gap
+    is at least ``fraction`` of it, else 0 (carried).
+
+    ``fraction`` 1.0 rounds DOWN (the leftover is up to a whole step or
+    minimum lot). 0.75 rounds up from three quarters: the leftover is at
+    most 0.75 of a step either way, and a hedge reverses only once the gap
+    has moved 2 x 0.75 - 1 = 0.5 step back (the slack that stops a gap at
+    the boundary trading a lot back and forth; :func:`valid_round_fraction`
+    refuses 0.5 and under). The rule reads only the gap, so the event
+    hedger and the parity hedge size alike."""
+    gap = float(gap_lots)       # not rounded: at 1.0 this is round_to_step exactly
+    if gap <= 0:
+        return 0.0
+    vmin = float(volume_min or 0.0)
+    if vmin > 0 and gap < vmin - 1e-9:
+        return round(vmin, 8) if fraction < 1.0 and gap >= fraction * vmin - 1e-9 else 0.0
+    step = float(volume_step or 0.0)
+    if step <= 0:
+        return gap
+    n = math.floor(gap / step + 1e-9)
+    if fraction < 1.0 and gap - n * step >= fraction * step - 1e-9:
+        n += 1
+    return round(n * step, 8)
+
+
 def split_lots(lots: float, volume_max: float, volume_step: float,
                volume_min: float = 0.0) -> list[float]:
     """``lots`` as order sizes of at most ``volume_max`` (0 / None = no cap),

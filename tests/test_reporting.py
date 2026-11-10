@@ -254,6 +254,15 @@ class ReporterTest(unittest.TestCase):
         self.assertEqual(swap, {"mode": 1, "long": -55.3, "short": 21.1, "point": 0.01,
                                 "rollover3days": 3})
         self.assertIsNone(R.swap_terms({}))
+        # the symbol's currencies, where the terminal names them: a mode 2 / 3
+        # swap is an amount in one of them and cannot be read without it
+        named = R.swap_terms({"swap_mode": 3, "swap_long": -12.0, "swap_short": -7.2,
+                              "point": 0.01, "swap_rollover3days": 5,
+                              "currency_base": "USD", "currency_profit": "JPY",
+                              "currency_margin": "JPY"})
+        self.assertEqual(named["base"], "USD")
+        self.assertEqual(named["profit"], "JPY")
+        self.assertEqual(named["margin"], "JPY")
         blk = R.mt5_block(symbol="XAUUSD", magic=77006, ok=True, contract=100.0,
                           srv_offset_s=10800.0, account=acct, top=None, positions=pos,
                           swap=swap)

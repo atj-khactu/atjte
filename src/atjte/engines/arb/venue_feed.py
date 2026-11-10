@@ -1168,11 +1168,24 @@ def trade_from_ccxt(exchange_id: str, symbol: str, t: dict) -> Optional[Trade]:
         # exchange time when given (a fills snapshot replays old fills the bot
         # uses this to stay quiet about)
         timestamp=ms_to_dt(t.get("timestamp")) or datetime.now(timezone.utc),
-        # keep the queue light: only the gateway's receive time, where it
-        # stamps one (the event hedger's timing line)
-        raw=({"gw_rx_ms": (t.get("info") or {})["gw_rx_ms"]}
-             if isinstance(t.get("info"), dict) and t["info"].get("gw_rx_ms") else None),
+        # keep the queue light: only the timing stamps a gateway put on the
+        # fill (the event hedger's timing line and the order log's latency
+        # split: TIMING_KEYS)
+        raw=_timing_of(t.get("info")),
     )
+
+
+#: the stamps a gateway may put on a fill (epoch ms): its receipt
+#: (``gw_rx_ms``), and EXANTE's split — the order leaving, the venue's
+#: TransactTime / SendingTime, the report read off the socket
+TIMING_KEYS = ("gw_rx_ms", "order_sent_ms", "venue_transact_ms", "venue_sending_ms", "rx_ms")
+
+
+def _timing_of(info) -> Optional[dict]:
+    if not isinstance(info, dict):
+        return None
+    out = {k: info[k] for k in TIMING_KEYS if info.get(k)}
+    return out or None
 
 
 def _f(x) -> Optional[float]:

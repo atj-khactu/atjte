@@ -80,6 +80,51 @@ _TYPE_LABELS: dict[str, tuple[str, str]] = {
                          "that direction off."),
 }
 
+#: a PRESET of a type: ``strategy_settings_template_<preset>.py`` beside the
+#: type's own template — the same strategy with other defaults (the grid's
+#: ``stock``: bps distances, levels in MT5 lots). Offered as its own entry
+#: (key ``<kind>_<preset>``, ``preset`` set) and copied into a project as the
+#: folder's ``strategy_settings_template.py``.
+PRESET_PREFIX = "strategy_settings_template_"
+#: ``(kind, preset) -> (label, blurb)``; an unlisted preset is labelled from
+#: its file's docstring
+_PRESET_LABELS: dict[tuple[str, str], tuple[str, str]] = {
+    ("grid", "stock"): ("Grid — stocks & ETFs",
+                        "The Grid with defaults for any stock or ETF: a 10 bp step "
+                        "(basis points of the price), 2 levels of one hedge minimum "
+                        "lot each, entries only while the step covers 2 hedge "
+                        "spreads, quoting inside the US cash session."),
+}
+
+
+def presets(type_folder: Path) -> list[str]:
+    """The preset names of one type folder, sorted (``['stock']``)."""
+    try:
+        return sorted(p.stem[len(PRESET_PREFIX):] for p in Path(type_folder).iterdir()
+                      if p.is_file() and p.suffix == ".py"
+                      and p.stem.startswith(PRESET_PREFIX) and len(p.stem) > len(PRESET_PREFIX))
+    except OSError:
+        return []
+
+
+def add_presets(out: dict[str, dict]) -> dict[str, dict]:
+    """*out* (a :func:`strategy_types` result) with each type's presets
+    after it: ``<key>_<preset>`` = the type's entry plus ``preset`` and its
+    own label / blurb. The base types stay first, so a lookup by folder
+    (``dir``) finds the type itself."""
+    res: dict[str, dict] = {}
+    for key, t in out.items():
+        res[key] = t
+    for key, t in out.items():
+        for name in presets(t["path"]):
+            label, blurb = _PRESET_LABELS.get(
+                (t["kind"], name),
+                (f"{t['label']} — {name.replace('_', ' ')}",
+                 _first_sentence(Path(t["path"]) / f"{PRESET_PREFIX}{name}.py")))
+            res[f"{key}_{name}"] = {**t, "label": label, "blurb": blurb, "preset": name}
+    return res
+
+
 _RUNTIME_FILES = {"bot_state.json", "position_state.json", "stop.signal",
                   "spread_1s.json", "fill_marks.csv", "strategy_settings.py"}
 _RUNTIME_DIRS = {"__pycache__", "logs", "data", ".pytest_cache"}
@@ -164,7 +209,7 @@ def strategy_types(engine: Optional[str] = None,
                 label = f"{label} ({eng})"
             out[key] = {"dir": t.name, "entry": entry.name, "label": label,
                         "blurb": blurb, "path": t, "engine": eng, "kind": kind}
-    return out
+    return add_presets(out)
 
 
 def type_dir(engine: str, type_name: str) -> Path:
@@ -212,27 +257,39 @@ def is_shim(text: str) -> bool:
 
 
 def copy_strategy_type(engine: str, type_name: str, dest: Path, *,
-                       overwrite: bool = False, src: Optional[Path] = None) -> Path:
+                       overwrite: bool = False, src: Optional[Path] = None,
+                       preset: Optional[str] = None) -> Path:
     """Materialise one type into ``<dest>`` (a project's ``strategies/<type>/``
     folder, created if needed): the shim as ``<type>.py`` plus every
     non-runtime file of the type folder (the settings template, extra
     modules), never state files or a live ``strategy_settings.py``. Returns
     *dest*. An existing entry or template is left alone unless *overwrite*.
     *src* names a type folder outside the library (a caller's own copy of a
-    type); the library's folder is used when it is None."""
+    type); the library's folder is used when it is None. *preset* copies
+    ``strategy_settings_template_<preset>.py`` as the folder's
+    ``strategy_settings_template.py``; preset files are never copied as
+    themselves."""
     src = type_dir(engine, type_name) if src is None else Path(src)
+    preset_file = None
+    if preset:
+        preset_file = src / f"{PRESET_PREFIX}{preset}.py"
+        if not preset_file.is_file():
+            raise LookupError(f"{type_name} has no preset {preset!r} "
+                              f"(have: {presets(src)})")
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     for p in sorted(src.iterdir()):
         if p.name in _RUNTIME_FILES or p.name in _RUNTIME_DIRS or p.name == "__init__.py":
             continue
-        if p.is_dir():
+        if p.is_dir() or p.stem.startswith(PRESET_PREFIX):
             continue
         target = dest / p.name
         if p.name == f"{type_name}.py":
             if overwrite or not target.exists():
                 target.write_text(shim_source(type_name, engine), encoding="utf-8")
             continue
+        if p.name == "strategy_settings_template.py" and preset_file is not None:
+            p = preset_file
         if overwrite or not target.exists():
             shutil.copyfile(p, target)
     return dest

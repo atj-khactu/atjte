@@ -91,7 +91,9 @@ def main(argv=None) -> int:
                 signal.signal(sig, lambda *_a: stop.set())
             except (ValueError, OSError):
                 pass
-    up = DatabentoUpstream(cfg.api_key, cfg.dataset, cfg.symbols, live=cfg.live, log=log)
+    up = DatabentoUpstream(cfg.api_key, cfg.dataset, cfg.symbols, live=cfg.live, log=log,
+                           quote_schema=cfg.quote_schema,
+                           prints_dir=cfg.dir / "prints")
     log(f"{cfg.name}: Databento {cfg.dataset} — {', '.join(cfg.symbols)}; live "
         f"{'on' if cfg.live else 'off'}")
     try:

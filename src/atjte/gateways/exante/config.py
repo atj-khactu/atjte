@@ -16,7 +16,7 @@
      "fix_host": "fixuat2.exante.eu",       # demo; live: the bridge EXANTE names
      "symbols": ["XAU/USD.E.FX"],           # EXANTE ids, one market each
      "depth": 10, "tif": "DAY",             # DAY: what CancelOnDisconnect covers
-     "msgs_per_min": 138, "max_inflight": 10,
+     "msgs_per_min": 120, "max_inflight": 10,
      "clients": []}                         # allowlist; empty = any with the token
 
 Optional: ``quote_source`` — CME Group futures priced from a Databento
@@ -135,7 +135,7 @@ class GatewayConfig:
     depth: int = 10
     tif: str = "DAY"
     heartbeat_s: int = 30
-    msgs_per_min: float = 138.0
+    msgs_per_min: float = 120.0
     max_inflight: int = 10
     clients: list = field(default_factory=list)
     #: ``quote_source``: the Databento gateway CME futures are priced from
@@ -298,7 +298,7 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         raise ConfigError(f"{CONFIG_NAME}: {X.DEMO_HOST} is EXANTE's demo bridge — a live "
                           f"gateway names its live bridge ({', '.join(X.LIVE_HOSTS[:2])}, ...)")
     try:
-        msgs = float(raw.get("msgs_per_min") or 138.0)
+        msgs = float(raw.get("msgs_per_min") or 120.0)
         cfg = GatewayConfig(
             name=str(raw.get("name") or d.name), dir=d, network=network,
             listen_port=int(raw.get("listen_port") or (DEMO_LISTEN_PORT if network == "demo"

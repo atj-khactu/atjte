@@ -121,7 +121,8 @@ def _tls_connect(host: str, port: int, timeout_s: float, verify: bool = True):
                 f"only for Kraken's UAT certificate mismatch.")
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-    raw = socket.create_connection((host, int(port)), timeout=timeout_s)
+    from atjte.net import no_delay
+    raw = no_delay(socket.create_connection((host, int(port)), timeout=timeout_s))
     return ctx.wrap_socket(raw, server_hostname=host)
 
 
@@ -386,7 +387,9 @@ class FixSession:
         while not self._stop.is_set():
             data = self._read()
             if data:
+                rx = time.time()        # the read's moment: each message's arrival
                 for msg in self._parser.drain(data):
+                    msg.rx_ts = rx
                     self._inbound(msg)
             self._housekeep()
 

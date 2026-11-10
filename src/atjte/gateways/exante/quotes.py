@@ -45,6 +45,12 @@ LEASE_DMS_S = 15.0
 #: the most one automatic candle fetch may cost (Databento bills historical
 #: data per request); a dearer one is skipped by the Databento gateway
 HISTORY_MAX_COST_USD = 0.05
+#: how long a candle read waits for the Databento gateway: its historical
+#: API (a cost quote, then the fetch) took 18–25 s from this machine on
+#: 2026-11-09, past the lease's 20 s — and the bot's chart history came
+#: back empty. Served off the connection thread (ExanteGateway), so it
+#: delays nothing else.
+OHLCV_TIMEOUT_S = 90.0
 _EXPIRY_RE = re.compile(r"^([FGHJKMNQUVXZ])(\d{4})$")
 
 
@@ -123,10 +129,12 @@ class DatabentoQuotes:
     def ohlcv(self, db_symbol: str, timeframe: str, since=None, limit=None) -> list:
         """``db_symbol``'s mid candles, CCXT rows: the Databento gateway's
         live buffer, filled before it at most :data:`HISTORY_MAX_COST_USD`."""
-        rows = self.lease.read("fetch_ohlcv", symbol=db_symbol, timeframe=timeframe,
-                               since=since, limit=limit,
-                               params={"price": "mid",
-                                       "max_cost_usd": HISTORY_MAX_COST_USD})
+        from atjte.gateways.fix.client import request_timeout
+        with request_timeout(OHLCV_TIMEOUT_S):
+            rows = self.lease.read("fetch_ohlcv", symbol=db_symbol, timeframe=timeframe,
+                                   since=since, limit=limit,
+                                   params={"price": "mid",
+                                           "max_cost_usd": HISTORY_MAX_COST_USD})
         return list(rows or [])
 
     def _ticker(self, t: dict) -> None:

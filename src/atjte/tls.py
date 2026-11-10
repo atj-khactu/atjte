@@ -34,4 +34,16 @@ def client_context(cafile: str = "") -> ssl.SSLContext:
         pass
     if cafile:
         ctx.load_verify_locations(cafile=cafile)
+        # Python 3.13+ sets VERIFY_X509_STRICT on every default context: RFC
+        # 5280 conformance checks on top of the chain check. EXANTE's private
+        # CA issues certificates without an Authority Key Identifier, which
+        # strict mode refuses ("Missing Authority Key Identifier") — so the
+        # live FIX bridge could not be reached from a frozen build (2026-11-09,
+        # acp-dev 0.1.20). From source it worked only because databento's
+        # pip_system_certs swaps ssl.SSLContext for Windows' verifier at
+        # startup, a .pth hook a frozen exe never runs. Only the strict
+        # extension checks go, and only on a context told to trust a private
+        # CA: the chain must still end at that CA, CERT_REQUIRED and hostname
+        # checking stay as they are.
+        ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_STRICT", 0)
     return ctx

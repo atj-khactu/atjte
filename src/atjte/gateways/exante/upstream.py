@@ -210,6 +210,8 @@ class ExanteUpstream:
 
         self._orders: dict[str, _Order] = {}         # EXANTE OrderID -> order
         self._by_cl: dict[str, str] = {}             # every ClOrdID we sent -> OrderID
+        #: ClOrdID -> when its request left this side (epoch ms, after sendall)
+        self._sent_ms: dict[str, int] = {}
         self._answers: dict[str, dict] = {}          # ClOrdID -> the report that answered it
         self._reject_pause: dict[str, tuple[float, str]] = {}   # symbol -> (until, why)
         self._mass_done = threading.Event()
@@ -482,11 +484,15 @@ class ExanteUpstream:
                 f"(TICKER/CCY:CCY-YYMMDD) resolves by itself — add its EXANTE id "
                 f"(e.g. XAU/USD.E.FX) to the gateway's Instruments")
         base = mt.group(1)
-        for ex in RESOLVE_EXCHANGES:
+        # ``TICKER.EXCHANGE`` on each exchange, then the bare ticker: EXANTE
+        # files some products under a group with no exchange (live,
+        # 2026-11-09: 1-Ounce Gold is group ``1OZ`` while its contracts are
+        # ``1OZ.COMEX.Z2026``; ``1OZ.COMEX`` is a 404)
+        for grp in [f"{base}.{ex}" for ex in RESOLVE_EXCHANGES] + [base]:
             try:
-                rows = self.rest.group(f"{base}.{ex}")
+                rows = self.rest.group(grp)
             except ccxt.BadRequest:
-                continue                        # no such product on that exchange
+                continue                        # no such product group
             found = []
             for r in rows:
                 # the OUTRIGHT future only: a group also lists calendar spreads
@@ -556,8 +562,12 @@ class ExanteUpstream:
             self.counters["tickers"] += 1
             self._emit("ticker", sym, d)
             if self._h.get("book") is not None:
-                b = book_payload(sym, {"bids": [[d["bid"], d["bidVolume"] or 0.0]],
-                                       "asks": [[d["ask"], d["askVolume"] or 0.0]]})
+                # the Databento gateway's 10-level book when it streams
+                # mbp-10 (``info["book"]``), else just the top it quoted
+                depth = (t.get("info") or {}).get("book") or {}
+                b = book_payload(sym, {
+                    "bids": depth.get("bids") or [[d["bid"], d["bidVolume"] or 0.0]],
+                    "asks": depth.get("asks") or [[d["ask"], d["askVolume"] or 0.0]]})
                 if b is not None:
                     self._emit("book", sym, b)
 
@@ -660,12 +670,20 @@ class ExanteUpstream:
                 self._cond.wait(min(left, 0.25))
             return self._answers.pop(cl)
 
-    def _send(self, msg_type: str, body) -> None:
+    def _send(self, msg_type: str, body, cl: str = "") -> None:
         try:
             self.trade.send(msg_type, body)
         except SessionDown as e:
             raise ccxt.ExchangeNotAvailable(f"the EXANTE TRADE session is down: {e}") from None
         self.counters["posts"] += 1
+        if cl:
+            # when the request LEFT this side (after sendall): the start of
+            # the order's latency split (the fill's order_sent_ms)
+            with self._lock:
+                self._sent_ms[cl] = int(time.time() * 1000)
+                if len(self._sent_ms) > 4000:
+                    for k in list(self._sent_ms)[:2000]:
+                        self._sent_ms.pop(k, None)
 
     def place(self, account, symbol, side, amount, price, *, post_only, reduce_only,
               cloid) -> dict:
@@ -677,7 +695,7 @@ class ExanteUpstream:
         self._send(X.NEW_ORDER, X.new_order(cl_ord_id=cloid, exante_id=sid, side=side,
                                             qty=amount, price=price, account=self.account_id,
                                             tif=self.tif, cancel_on_disconnect=True,
-                                            now=self._clock()))
+                                            now=self._clock()), cl=cloid)
         ans = self._wait_answer(cloid)
         if ans is None:
             # silence is not a refusal: the order may be resting. The book
@@ -721,7 +739,7 @@ class ExanteUpstream:
             self._by_cl[new_cl] = o.order_id
         self._send(X.REPLACE, X.replace_request(cl_ord_id=new_cl, orig_cl_ord_id=o.cl_ord_id,
                                                 exante_id=o.exante_id, side=o.side, qty=qty,
-                                                price=price, now=self._clock()))
+                                                price=price, now=self._clock()), cl=new_cl)
         ans = self._wait_answer(new_cl)
         if ans is None:
             raise ccxt.RequestTimeout(f"EXANTE did not answer the amend of {order_id} "
@@ -909,10 +927,24 @@ class ExanteUpstream:
                  "fee": None, "takerOrMaker": "maker",
                  "info": {"execId": r["exec_id"], "cumQty": r["cum"], "source": "fix",
                           "orderPos": r["order_pos"],
+                          **self._latency_split(o, r),
                           # when this gateway had the execution report (this
                           # machine's clock): the hedge timing's first local hop
                           "gw_rx_ms": int(self._clock() * 1000)}}
         self._record_fill(trade)
+
+    def _latency_split(self, o: "_Order", r: dict) -> dict:
+        """Where an execution's time went, epoch ms: when the order (or its
+        last amend) left this side (``order_sent_ms``), EXANTE's TransactTime
+        (60) and SendingTime (52) — its clock — and when this side read the
+        report off the socket (``rx_ms``). Missing parts are left out."""
+        with self._lock:
+            sent = self._sent_ms.get(o.cl_ord_id or "") or self._sent_ms.get(o.cloid or "")
+        out = {"order_sent_ms": sent,
+               "venue_transact_ms": X.fix_time_ms(r.get("transact_time") or ""),
+               "venue_sending_ms": X.fix_time_ms(r.get("sending_time") or ""),
+               "rx_ms": int(r["rx_ts"] * 1000) if r.get("rx_ts") else None}
+        return {k: v for k, v in out.items() if v}
 
     def _record_fill(self, trade: dict) -> None:
         with self._lock:

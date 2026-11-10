@@ -65,6 +65,11 @@ class HyperliquidGatewayClient(GatewayConnector):
     #: Hyperliquid modify re-issues the order under a new id; the engine
     #: adopts the id the amend returns
     supports_amend = True
+    #: an order read's ``filled`` is ccxt's ``origSz - sz``, and Hyperliquid
+    #: lowers ``sz`` with no trade when a reduce-only order is bigger than the
+    #: position: the engine books only what the account's trades confirm
+    #: (``Venue.order_trade_units``; 2026-11-09, phantom fills on XYZ-JP225)
+    rest_filled_trade_backed = False
     venue_label = "Hyperliquid"
     GATEWAY_CLASS = HlGatewayClient
     DEFAULT_GATEWAY_PORT = DEFAULT_PORT

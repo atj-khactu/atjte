@@ -255,6 +255,15 @@ MT5_REFUSED_HOLD_S = 600.0
 MT5_ADOPT_MAGICS = []
 MT5_DEVIATION_POINTS = 20
 HEDGE_THRESHOLD_UNITS = 1.0
+# How a hedge's leftover under one MT5 lot step is rounded. 1.0 = DOWN: a
+# leftover of up to a whole step (a whole min lot under the minimum) stays
+# unhedged until more fills add to it. 0.75 = UP from three quarters: e.g.
+# with a 1-lot step, a 0.8-lot gap is hedged with 1 lot (0.2 over), a 0.6 one
+# is carried; a hedge reverses only once the gap has moved half a lot back,
+# so no gap trades a lot back and forth. Must be above 0.5 and at most 1.0.
+# Below 1.0, HEDGE_THRESHOLD_UNITS / RECONCILE_TOLERANCE_UNITS = None follow
+# it (that share of a min lot); a value written above it holds the rounding.
+HEDGE_ROUND_FRACTION = 1.0
 # HOW the fill is hedged:
 #   'event'  -- the websocket fill callback hands the fill straight to a
 #               dedicated hedge thread, which sends the MT5 market order for

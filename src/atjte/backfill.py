@@ -342,17 +342,36 @@ def _execution_trade(exchange, element: dict) -> Optional[dict]:
     }
 
 
+def contract_size_of(exchange, symbol: str) -> float:
+    """The market's ``contractSize`` (base units per contract), 1 where the
+    market has none (spot) or cannot be read."""
+    try:
+        cs = (exchange.market(symbol) or {}).get("contractSize")
+        return float(cs) if cs else 1.0
+    except Exception:                               # noqa: BLE001 — no market: units
+        return 1.0
+
+
 def to_fill_records(trades: list[dict], exchange_id: str, symbol: str,
-                    base: str = "", quote: str = "") -> list[dict]:
-    """CCXT trade dicts as the report's fill records (``source = "backfill"``)."""
+                    base: str = "", quote: str = "",
+                    contract_size: float = 1.0) -> list[dict]:
+    """CCXT trade dicts as the report's fill records (``source = "backfill"``).
+
+    A CCXT trade's ``amount`` counts CONTRACTS on a contract market; the
+    report counts BASE UNITS, as the live path books them (``Venue.to_units``).
+    ``contract_size`` converts: EXANTE's MGC is 10 oz a contract, and one
+    contract read back from the venue was booked as 1 oz (2026-11-09: a
+    manual sell made the replay disagree with the venue by 9 oz and put
+    today's realized at -508.91 against EXANTE's own +115.34)."""
     out = []
+    k = float(contract_size or 1.0)
     for t in trades:
         price = float(t.get("price") or 0.0)
         fee = t.get("fee") or {}
         out.append(reporting.fill_record(
             exchange_id, trade_id=str(t.get("id")),
             ts=float(t.get("timestamp") or 0) / 1000.0, side=str(t.get("side") or ""),
-            amount=float(t.get("amount") or 0.0), price=price, symbol=symbol,
+            amount=float(t.get("amount") or 0.0) * k, price=price, symbol=symbol,
             fee_usd=reporting.fee_usd(_f(fee.get("cost")), fee.get("currency"), price,
                                       base, quote),
             order_id=str(t["order"]) if t.get("order") else None, source="backfill",
@@ -602,7 +621,9 @@ def run(strategy_dir: Path, *, since_ts: Optional[float] = None, venue: bool = T
             log(f"venue leg failed: {type(e).__name__}: {e}")
         try:
             records = to_fill_records(trades, ident["exchange_id"], ident["symbol"],
-                                      getattr(vc, "base", ""), getattr(vc, "quote", ""))
+                                      getattr(vc, "base", ""), getattr(vc, "quote", ""),
+                                      contract_size_of(getattr(vc, "exchange", None),
+                                                       ident["symbol"]))
             summary["venue_fetched"] = len(records)
             if not dry_run:
                 summary["venue_new"] = sum(1 for r in records if rep.record_fill(r))

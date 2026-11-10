@@ -42,8 +42,10 @@ The API key never leaves this object; nothing on the wire carries it.
 """
 from __future__ import annotations
 
+import json
 import threading
 import time
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
@@ -61,10 +63,17 @@ MID_SCHEMA = "bbo-1m"
 PRICES = ("trades", "mid")
 #: 1 m live bars kept per symbol and basis
 LIVE_KEEP_S = 3 * 86400
-#: the top-of-book schema the live quotes are streamed in
+#: the top-of-book schema the live quotes are streamed in (the default;
+#: ``quote_schema`` "mbp-10" streams the 10-level book instead)
 QUOTE_SCHEMA = "mbp-1"
-#: Databento's record type (``rtype``) of an ``mbp-1`` record
+#: Databento's record type (``rtype``) of an ``mbp-1`` / ``mbp-10`` record
 RTYPE_MBP_1 = 1
+RTYPE_MBP_10 = 10
+QUOTE_RTYPES = (RTYPE_MBP_1, RTYPE_MBP_10)
+#: the depth an ``mbp-10`` record carries
+BOOK_DEPTH = 10
+#: days of CME trade prints kept in the journal (``prints/``)
+PRINTS_KEEP_DAYS = 3
 #: the heartbeat interval asked of the live session, and how long a silent
 #: session (no record, no heartbeat) is taken for alive
 HEARTBEAT_S = 10
@@ -141,10 +150,24 @@ def bars_from_records(records, basis: str, bar_s: int) -> dict[int, list]:
     return out
 
 
+def book_of(rec, depth: int = BOOK_DEPTH) -> dict:
+    """An ``mbp-10`` record's book, ``{"bids": [[px, size], ...], "asks": ...}``
+    best first, the levels Databento left unset (a thin book) dropped."""
+    out: dict = {"bids": [], "asks": []}
+    for i in range(depth):
+        for side, key in (("bid", "bids"), ("ask", "asks")):
+            px = _px(rec, f"{side}_px_{i:02d}")
+            if px is None or px <= 0:
+                continue
+            out[key].append([px, float(getattr(rec, f"{side}_sz_{i:02d}", 0) or 0)])
+    return out
+
+
 def quote_of(rec, symbol: str, now: float) -> Optional[dict]:
-    """An ``mbp-1`` record as a CCXT ticker; None unless the book is
-    two-sided. ``timestamp`` is when the gateway RECEIVED it (the clock its
-    clients judge freshness by); the exchange's own time is in ``info``."""
+    """An ``mbp-1`` / ``mbp-10`` record as a CCXT ticker; None unless the
+    book is two-sided. ``timestamp`` is when the gateway RECEIVED it (the
+    clock its clients judge freshness by); the exchange's own time is in
+    ``info``, and an ``mbp-10`` record's whole book in ``info["book"]``."""
     bid, ask = _px(rec, "bid_px_00"), _px(rec, "ask_px_00")
     if bid is None or ask is None or bid <= 0 or ask <= 0:
         return None
@@ -152,7 +175,8 @@ def quote_of(rec, symbol: str, now: float) -> Optional[dict]:
             "bidVolume": float(getattr(rec, "bid_sz_00", 0) or 0),
             "askVolume": float(getattr(rec, "ask_sz_00", 0) or 0), "last": None,
             "timestamp": int(now * 1000),
-            "info": {"ts_event": getattr(rec, "ts_event", None), "source": "databento"}}
+            "info": {"ts_event": getattr(rec, "ts_event", None), "source": "databento",
+                     **({"book": book_of(rec)} if _rtype(rec) == RTYPE_MBP_10 else {})}}
 
 
 def _rtype(rec) -> Optional[int]:
@@ -186,7 +210,8 @@ class DatabentoUpstream:
                  historical_factory: Optional[Callable[[str], Any]] = None,
                  live_factory: Optional[Callable[[str], Any]] = None,
                  clock: Callable[[], float] = time.time,
-                 heartbeat_s: int = HEARTBEAT_S) -> None:
+                 heartbeat_s: int = HEARTBEAT_S, quote_schema: str = QUOTE_SCHEMA,
+                 prints_dir: Optional[Path] = None) -> None:
         self._key = api_key
         self.dataset = dataset
         self.symbols = list(symbols)
@@ -201,6 +226,15 @@ class DatabentoUpstream:
         #: one session per key: creating it, and adding a subscription to it
         self._live_lock = threading.Lock()
         self.heartbeat_s = int(heartbeat_s)
+        #: the schema live quotes are streamed in: "mbp-1", or "mbp-10" (the book too)
+        self.quote_schema = str(quote_schema or QUOTE_SCHEMA)
+        #: why mbp-10 was given up for mbp-1 (Databento refused it), or ""
+        self.quote_fallback = ""
+        #: where the CME trade prints of the quoted symbols are journaled
+        #: (``<SYMBOL>_<YYYYMMDD>.jsonl``, :data:`PRINTS_KEEP_DAYS`), or None
+        self._prints_dir: Optional[Path] = Path(prints_dir) if prints_dir else None
+        self._prints_lock = threading.Lock()
+        self._prints_fh: dict[str, Any] = {}           # symbol -> (day, open file)
         self._last_rx = 0.0                     # anything from the live session
         self._quote_syms: set[str] = set()      # symbols streamed as quotes
         self._quotes: dict[str, dict] = {}      # symbol -> its latest ticker
@@ -295,14 +329,56 @@ class DatabentoUpstream:
             self._quote_syms.add(symbol)
             self._quote_bars.setdefault(symbol, {})
         try:
-            self._live_subscribe([(QUOTE_SCHEMA, [symbol], C.stype_of(symbol))])
+            try:
+                self._live_subscribe([(self.quote_schema, [symbol], C.stype_of(symbol))])
+            except Exception as e:                          # noqa: BLE001
+                if not self._schema_refused(str(e)):
+                    raise
+                self._fall_back_to_top(str(e), resubscribe=False)   # this one, now:
+                self._live_subscribe([(self.quote_schema, [symbol], C.stype_of(symbol))])
         except Exception as e:                              # noqa: BLE001
             with self._lock:
                 self._quote_syms.discard(symbol)
             self._err(f"quotes for {symbol}", e)
             raise ccxt.ExchangeNotAvailable(f"databento: live quotes for {symbol}: "
                                             f"{type(e).__name__}: {e}") from None
-        self._log(f"databento: live quotes ({QUOTE_SCHEMA}) for {symbol}")
+        self._log(f"databento: live quotes ({self.quote_schema}) for {symbol}")
+
+    # ── a 10-level book the plan does not cover ──────────────────────────────
+    def _schema_refused(self, text: str) -> bool:
+        """Databento refused the 10-level quote schema ("Not authorized for
+        mbp-10 schema"): the plan covers top of book only."""
+        return self.quote_schema == "mbp-10" and "mbp-10" in str(text or "").lower()
+
+    def _fall_back_to_top(self, why: str, resubscribe: bool = True) -> None:
+        """``quote_schema`` mbp-10 refused: stream top of book (``mbp-1``)
+        instead, for every symbol already quoted — a refused 10-level book
+        used to leave the quotes, and with them every bot pricing off them,
+        silent (2026-11-09). Logged once; the status says so
+        (``quote_fallback``). The re-subscription runs on its own thread:
+        this is called from Databento's record callback."""
+        with self._lock:
+            if self.quote_schema != "mbp-10":
+                return
+            self.quote_schema = QUOTE_SCHEMA
+            self.quote_fallback = (f"mbp-10 refused by Databento ({str(why)[:200]}): "
+                                   f"top of book (mbp-1) instead")
+            syms = sorted(self._quote_syms)
+        self.counters["quote_fallbacks"] = self.counters.get("quote_fallbacks", 0) + 1
+        self._log(f"databento: {self.quote_fallback}"
+                  + (f" — re-subscribing {', '.join(syms)}" if syms and resubscribe else ""))
+        if resubscribe and syms:
+            threading.Thread(target=self._resubscribe_quotes, args=(syms,),
+                             name="db-quotes-fallback", daemon=True).start()
+
+    def _resubscribe_quotes(self, syms: list[str]) -> None:
+        by_stype: dict[str, list[str]] = {}
+        for s in syms:
+            by_stype.setdefault(C.stype_of(s), []).append(s)
+        try:
+            self._live_subscribe([(self.quote_schema, ss, st) for st, ss in by_stype.items()])
+        except Exception as e:                              # noqa: BLE001
+            self._err("quotes fallback", e)
 
     def set_quote_handler(self, fn: Optional[Callable[[str, dict], None]]) -> None:
         self._on_quote = fn
@@ -355,6 +431,8 @@ class DatabentoUpstream:
         err = getattr(rec, "err", None)                        # ErrorMsg
         if err is not None:
             self._err("live", RuntimeError(str(err)))
+            if self._schema_refused(str(err)):
+                self._fall_back_to_top(str(err))
             return
         stype_in_symbol = getattr(rec, "stype_in_symbol", None)
         if stype_in_symbol is not None:             # SymbolMappingMsg
@@ -362,14 +440,57 @@ class DatabentoUpstream:
                 self._ids.setdefault(int(rec.instrument_id), set()).add(str(stype_in_symbol))
             return
         syms = self._ids.get(int(getattr(rec, "instrument_id", -1) or -1)) or ()
-        if _rtype(rec) == RTYPE_MBP_1:
+        if _rtype(rec) in QUOTE_RTYPES:
             for sym in syms:
                 if sym in self._quote_syms:
+                    if self._prints_dir is not None and str(getattr(rec, "action", "")) == "T":
+                        self._journal_print(sym, rec)
                     self._quote(sym, rec)
             return
         for sym in syms:
             if sym in self._live_bars:
                 self._bar(sym, rec)
+
+    # ── the CME trade prints (a fill's exchange time, matched by the panel) ──
+    def _journal_print(self, sym: str, rec) -> None:
+        """Append one CME trade (an ``mbp-1`` / ``mbp-10`` record with action
+        ``T``) to the symbol's journal of the day: the exchange's time
+        (``ts_event``, ns), price, size and aggressor side (B / A / N). A fill
+        on a broker routing to CME (EXANTE) is matched against these to time
+        it on the exchange's clock. Never raises."""
+        try:
+            ts = int(getattr(rec, "ts_event", 0) or 0)
+            px = _px(rec, "price")
+            if not ts or px is None:
+                return
+            day = time.strftime("%Y%m%d", time.gmtime(ts / NS))
+            line = json.dumps({"t": ts, "px": px, "sz": float(getattr(rec, "size", 0) or 0),
+                               "side": str(getattr(rec, "side", "") or "")}) + chr(10)
+            with self._prints_lock:
+                cur = self._prints_fh.get(sym)
+                if cur is None or cur[0] != day:
+                    if cur is not None:
+                        cur[1].close()
+                    self._prints_dir.mkdir(parents=True, exist_ok=True)
+                    cur = (day, open(self._prints_dir / f"{sym}_{day}.jsonl", "a",
+                                     encoding="utf-8"))
+                    self._prints_fh[sym] = cur
+                    self._prune_prints()
+                cur[1].write(line)
+                cur[1].flush()
+            self.counters["prints"] = self.counters.get("prints", 0) + 1
+        except Exception as e:                              # noqa: BLE001
+            self._err("prints journal", e)
+
+    def _prune_prints(self) -> None:
+        cutoff = time.strftime("%Y%m%d", time.gmtime(time.time() - PRINTS_KEEP_DAYS * 86400))
+        for f in self._prints_dir.glob("*_*.jsonl"):
+            day = f.stem.rsplit("_", 1)[-1]
+            if day.isdigit() and day < cutoff:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
 
     def _quote(self, sym: str, rec) -> None:
         q = quote_of(rec, sym, self._clock())
@@ -379,9 +500,11 @@ class DatabentoUpstream:
             prev = self._quotes.get(sym)
             self._quotes[sym] = q
             self._quote_bar(sym, q, rec)
-        if prev is not None and all(prev[k] == q[k] for k in
-                                    ("bid", "ask", "bidVolume", "askVolume")):
-            return                                  # a trade that left the top as it was
+        same_top = prev is not None and all(prev[k] == q[k] for k in
+                                            ("bid", "ask", "bidVolume", "askVolume"))
+        if same_top and ((prev.get("info") or {}).get("book")
+                         == (q.get("info") or {}).get("book")):
+            return                                  # a trade that left the book as it was
         self.counters["quotes"] += 1
         fn = self._on_quote
         if fn is not None:
@@ -587,6 +710,7 @@ class DatabentoUpstream:
                 "live_alive": self.live_alive(), "quote_symbols": quotes,
                 "live_bars": live, "dataset": self.dataset, "symbols": list(self.symbols),
                 "dataset_end": self._range[1], "last_error": self.last_error,
+                "quote_schema": self.quote_schema, "quote_fallback": self.quote_fallback,
                 "counters": dict(self.counters)}
 
     def read(self, what: str, args: dict) -> Any:

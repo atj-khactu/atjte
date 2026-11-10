@@ -62,7 +62,12 @@ READ_WHAT = ("fetch_balance", "fetch_positions", "fetch_open_orders",
              "fetch_ohlcv",
              # the account's funding payments: paid hourly as cash, never as a
              # fill and with no accrual on the position to watch
-             "fetch_funding_history")
+             "fetch_funding_history",
+             # the account's non-funding ledger (deposits, withdrawals,
+             # transfers, vault moves): the account ledger reads it for the
+             # books (atjte.account_ledger); Hyperliquid only — another
+             # upstream answers it as an unknown read
+             "fetch_ledger")
 #: the read that hands a bot its market list (``{"markets", "currencies"}``,
 #: :func:`atjte.gateways.common.markets_payload`): the bot loads it into a
 #: CCXT instance that opens no connection of its own

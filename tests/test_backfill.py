@@ -189,6 +189,32 @@ class PagingTest(unittest.TestCase):
         self.assertAlmostEqual(recs[0]["fee_usd"], 4.0)          # 0.001 XAUT at 4000
         self.assertEqual(recs[0]["order"], "o1")
 
+    def test_a_contract_is_booked_in_base_units(self):
+        """EXANTE MGC, 2026-11-09: a manual sell of 1 contract (10 oz) read
+        back by the catch-up was booked as 1 oz — the replay then disagreed
+        with the venue by 9 oz and today's realized read -508.91 against
+        EXANTE's +115.34. The report counts base units, like the live path."""
+        t = {"id": "abb4c489@1", "order": "abb4c489", "side": "sell", "amount": 1.0,
+             "price": 4126.9, "timestamp": T0 * 1000, "fee": None, "info": {}}
+        rec = B.to_fill_records([t], "exante", "MGC/USD:USD-261130", "MGC", "USD",
+                                contract_size=10.0)[0]
+        self.assertEqual(rec["amount"], 10.0)
+        self.assertEqual(B.to_fill_records([t], "exante", "MGC/USD:USD-261130")[0]["amount"],
+                         1.0)                                   # default: units already
+
+        class Mkt:
+            def __init__(self, cs):
+                self.cs = cs
+
+            def market(self, symbol):
+                if self.cs == "boom":
+                    raise KeyError(symbol)
+                return {"contractSize": self.cs}
+        self.assertEqual(B.contract_size_of(Mkt(10.0), "MGC/USD:USD-261130"), 10.0)
+        self.assertEqual(B.contract_size_of(Mkt(None), "PAXG/USD"), 1.0)      # spot
+        self.assertEqual(B.contract_size_of(Mkt("boom"), "X"), 1.0)           # unreadable
+        self.assertEqual(B.contract_size_of(None, "X"), 1.0)
+
     def test_ibkr_realized_is_before_fees_both_commissions_added_back(self):
         """MGC 2026-10-21, sell 1 at 4148.6: TWS's realizedPNL 66.913333 is
         net of the closing 0.96 AND the opening 0.96 its average cost carries;
