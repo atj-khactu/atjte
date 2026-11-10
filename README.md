@@ -14,6 +14,9 @@ opens no venue connection of its own.
 `atjte` is the open-source engine and its gateways (MIT). ATJ's strategy
 control panel is a separate application built on it.
 
+- **Members' site** (the control panel, licenses, the track record): [member.atjresearch.com](https://member.atjresearch.com)
+- **YouTube** (ATJ Traders): [youtube.com/@ATJTraders618](https://www.youtube.com/@ATJTraders618)
+
 ## Disclaimer
 
 **Read this before you install or run atjte.**
