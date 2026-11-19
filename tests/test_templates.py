@@ -59,7 +59,11 @@ class TestTypes(unittest.TestCase):
     def test_listing(self):
         types = T.strategy_types()
         self.assertEqual(set(types), {"grid", "grid_futures", "bollinger", "fixed",
-                                      "fixed_entry_exit", "grid_stock"})
+                                      "fixed_entry_exit", "grid_stock",
+                                      "bollinger_fair_basis", "bollinger_smooth"})
+        self.assertEqual(types["bollinger_fair_basis"]["label"],
+                         "Bollinger Ladder - Fair Basis Filter")
+        self.assertEqual(types["bollinger_fair_basis"]["dir"], "bollinger_fair_basis_bot")
         self.assertEqual(types["grid_futures"]["kind"], "grid_futures")
         self.assertIn("Grid-futures", types["grid_futures"]["label"])
         self.assertEqual(types["fixed"]["engine"], "arb")

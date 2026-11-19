@@ -38,8 +38,11 @@ from atjte.gateways.hyperliquid.gateway import (  # noqa: F401  (re-exported)
 )
 
 DEFAULT_PORT = 5660
-#: a post-only check needs a book this fresh (the bot's own quote gate is
-#: stricter: VENUE_TICKER_STALE_S); older, the quote is refused as unavailable
+#: a post-only check older than this says so in its refusal text, nothing
+#: more: the book's AGE never refuses a quote (2026-11-16). A quiet book is
+#: still the book — MGCG7's Databento book went 26-30 s between changes and
+#: 69 of 80 entries were refused as "no fresh book". Liveness is the bot's
+#: gate (the venue session + the MT5 quotes), not the last change's age.
 POST_ONLY_MAX_AGE_S = 10.0
 #: the extra read the connector's ``flex_account`` makes
 ACCOUNT_SUMMARY = "account_summary"
@@ -74,20 +77,24 @@ class IbkrGateway(HlGateway):
 
     # ── the emulated flags ───────────────────────────────────────────────────
     def _check_post_only(self, c: _Client, side: str, price: float) -> None:
-        """Refuse a quote that would take liquidity — IB would fill it."""
+        """Refuse a quote that would take liquidity — IB would fill it —
+        judged against the LATEST book whatever its age (a quiet book is
+        still the book). Only a symbol with no book at all is refused: there
+        is nothing to check against, and the bot cannot price it either."""
         t = self._tickers.get(c.symbol) or {}
         bid, ask = t.get("bid"), t.get("ask")
-        ts = t.get("timestamp")
-        age = (self._clock() - float(ts) / 1000.0) if ts else float("inf")
-        if bid is None or ask is None or age > POST_ONLY_MAX_AGE_S:
-            raise GatewayRefusal(f"post-only {side} of {c.symbol}: no fresh book to check "
-                                 f"against ({'no ticker yet' if not ts else f'{age:.0f}s old'})",
-                                 "unavailable")
+        if bid is None or ask is None:
+            raise GatewayRefusal(f"post-only {side} of {c.symbol}: no book to check against "
+                                 f"(no ticker yet)", "unavailable")
         bid, ask = float(bid), float(ask)
         if (side == "buy" and price >= ask) or (side == "sell" and price <= bid):
+            ts = t.get("timestamp")
+            age = (self._clock() - float(ts) / 1000.0) if ts else None
+            old = (f", book {age:.0f}s old" if age is not None and age > POST_ONLY_MAX_AGE_S
+                   else "")
             # both spellings the engine's _classify_order_error matches
             raise GatewayRefusal(f"post-only {side} at {price:g} would cross "
-                                 f"({bid:g} / {ask:g}) — not sent (postWouldExecute)",
+                                 f"({bid:g} / {ask:g}{old}) — not sent (postWouldExecute)",
                                  "invalid_order")
 
     def _check_reduce_only(self, c: _Client, side: str, amount: float) -> None:

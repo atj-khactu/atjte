@@ -32,8 +32,20 @@ belongs to that client id, which is what lets TWS hand them back with their
   ``fetch_ohlcv`` = one ``reqHistoricalData`` of MIDPOINT bars (the Spread
   History page's fetch pages it by ``since``).
 
+**Priced from Databento** (``quote_source`` in gateway.json, the EXANTE
+gateway's mechanism, :mod:`atjte.gateways.exante.quotes`): every CME Group
+future (CME, CBOT, NYMEX, COMEX — ``GC/USD:USD-261229`` = CME's ``GCZ6``,
+from IB's ``localSymbol``) takes its ticker from a Databento gateway's
+``GLBX.MDP3`` top of book over ONE read-only lease instead of
+``reqMktData`` — no IB market-data subscription is asked for it, and an IB
+tick for it (the margin probe's snapshot) is never pushed. Orders, fills,
+reads and candles (IB's MIDPOINT bars, free) stay IB's. Its public stream is
+up while the lease is up, Databento's live session speaks and a quote came
+within :data:`DB_TICKER_STALE_S`.
+
 Liveness, the engine's rules: public OK = the session is up and no symbol a
-client subscribed has a market-data refusal; private OK = the session is up
+client subscribed has a market-data refusal (a Databento-priced symbol: see
+above); private OK = the session is up
 (fills and order status ride the same session). Quiet is not dead: a market
 that does not move sends nothing, and the session's own socket is the
 verdict. Lost, the session is re-dialled every few seconds and the
@@ -43,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -51,6 +64,7 @@ from typing import Any, Callable, Optional
 import ccxt
 
 from ..common import BOOK_LEVELS, book_payload, jsonable
+from ..hyperliquid.cloid import slot_of as cloid_slot_of
 from .config import ContractSpec
 from .hedge_refs import is_hedge_ref
 
@@ -69,6 +83,30 @@ ACK_WAIT_S = 2.0
 ORDER_REJECT_CODES = frozenset({201, 203})
 #: the default of that pause (gateway.json ``reject_pause_s``; 0 = off)
 REJECT_PAUSE_S = 60.0
+#: a rejection for MARGIN (2026-11-16: "Equity with Loan Value … must exceed
+#: the initial margin", two grid bots each re-sending an entry every 60 s
+#: on a fully used account) is the ACCOUNT's, not the symbol's: every
+#: symbol's position-ADDING orders are held — a reducing one (reduce-only,
+#: or against the position and no bigger) still goes, it frees margin — for
+#: ``reject_pause_s`` doubled with each hold in a row, up to
+#: MARGIN_HOLD_MAX_S. A fill on the account lifts the hold (the margin
+#: changed); quiet for MARGIN_HOLD_MAX_S after one ends starts over at 1x.
+MARGIN_REJECT_MARKERS = ("MARGIN", "EQUITY WITH LOAN", "AVAILABLE FUNDS")
+MARGIN_HOLD_MAX_S = 900.0
+#: TWS pushes an API client only its OWN orders' executions, so a trade
+#: placed by hand in TWS reached no bot and its MT5 hedge waited for the
+#: parity check (2026-11-16: 17 GOL closed in TWS, the hedge followed a
+#: minute later). ``reqExecutions`` does return them (the journal held an
+#: 'ActivityMonitor' fill), so the account's executions are read this often
+#: (gateway.json ``manual_fills_poll_s``; 0 = off) and each one this gateway
+#: did not place — neither our cloid nor a hedge ref — is pushed as a fill
+#: to the bot on that account + symbol, ``info.manual = True``: the engine
+#: hedges it and reports it as an untracked fill, its position following
+#: the parity check. Pushed once; again once with its fee if that came later.
+MANUAL_POLL_S = 5.0
+#: a manual fill's fee is pushed only this soon after the fill (the bot
+#: holds a fill's record for its fee 10 s, arb_bot.FEE_WAIT_S)
+MANUAL_FEE_PUSH_S = 8.0
 #: the probed initial-margin rate per symbol is re-asked this often
 IM_RATE_TTL_S = 3600.0
 #: ``fetch_ohlcv``: CCXT timeframe -> (IB bar size, bar seconds, the most
@@ -95,6 +133,14 @@ DEPTH_RESET_CODE = 317
 _CONN_INFO_CODES = {2104, 2106, 2107, 2108, 2158, 2119}
 _OPEN = {"PendingSubmit", "ApiPending", "PreSubmitted", "Submitted", "PendingCancel",
          "ApiUpdate", "ValidationError"}
+#: a Databento-priced symbol's quote older than this marks its stream down
+#: (the EXANTE gateway's rule; Databento's heartbeats keep the SESSION up)
+DB_TICKER_STALE_S = 60.0
+#: the exchanges whose futures Databento's GLBX.MDP3 carries (IB's names)
+CME_GROUP = frozenset({"CME", "CBOT", "NYMEX", "COMEX"})
+MONTH_CODES = "FGHJKMNQUVXZ"
+#: CME's raw outright symbol: root, month code, last digit of the year
+_CME_RAW_RE = re.compile(r"^[A-Z0-9]{1,6}[FGHJKMNQUVXZ]\d$")
 _STATUS = {"Filled": "closed", "Cancelled": "canceled", "ApiCancelled": "canceled",
            "Inactive": "canceled"}
 
@@ -131,6 +177,29 @@ def _ms(dt) -> Optional[int]:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
+    return None
+
+
+def databento_symbol(m: dict, overrides: Optional[dict] = None) -> Optional[str]:
+    """CME's raw symbol (Databento ``GLBX.MDP3``, ``raw_symbol``) of a market
+    this upstream lists — ``GC/USD:USD-261229`` -> ``GCZ6`` — or None when it
+    is not a future on a CME Group exchange. ``overrides`` (``quote_source.
+    symbols``) map the market symbol or IB's ``localSymbol`` to it. IB's
+    ``localSymbol`` IS CME's for GC / MGC / ES; where it is not that shape,
+    the trading class + month code + the year's last digit."""
+    info = m.get("info") or {}
+    for key in (m.get("symbol"), info.get("localSymbol")):
+        if overrides and key and key in overrides:
+            return str(overrides[key])
+    if not m.get("future") or str(info.get("exchange") or "").upper() not in CME_GROUP:
+        return None
+    local = str(info.get("localSymbol") or "").replace(" ", "").upper()
+    if _CME_RAW_RE.match(local):
+        return local
+    month = str(info.get("contractMonth") or info.get("lastTradeDate") or "")[:6]
+    root = str(info.get("tradingClass") or m.get("base") or "").upper()
+    if root and len(month) == 6 and month.isdigit() and 1 <= int(month[4:]) <= 12:
+        return f"{root}{MONTH_CODES[int(month[4:]) - 1]}{month[3]}"
     return None
 
 
@@ -212,7 +281,7 @@ class IbkrUpstream:
     def __init__(self, accounts: dict[str, str], contracts: list[ContractSpec], *,
                  host: str = "127.0.0.1", port: int = 7497, client_id: int = 7,
                  network: str = "paper", reject_pause_s: float = REJECT_PAUSE_S,
-                 journal=None,
+                 manual_fills_poll_s: float = MANUAL_POLL_S, journal=None, quotes: Any = None, quote_symbols: Optional[dict] = None,
                  log: Optional[Callable[[str], None]] = None) -> None:
         if not accounts:
             raise ValueError("the gateway needs at least one account")
@@ -241,6 +310,13 @@ class IbkrUpstream:
         self.reject_pause_s = max(0.0, float(reject_pause_s))
         self._oid_sym: dict[int, str] = {}          # orderId -> symbol (its rejection's)
         self._paused: dict[str, tuple[float, str]] = {}   # symbol -> (until, why)
+        self._oid_acct: dict[int, str] = {}         # orderId -> account (a margin rejection's)
+        self.manual_fills_poll_s = max(0.0, float(manual_fills_poll_s))
+        #: execId -> when its manual fill was pushed without a fee (again with it)
+        self._manual_fee_due: dict[str, float] = {}
+        self._manual_poll_err = ""
+        #: account -> (until, level, why): its position-adding orders held
+        self._margin_hold: dict[str, tuple[float, int, str]] = {}
         self._im_rate: dict[str, tuple[float, float]] = {}   # symbol -> (t, rate)
         self._seen_fills: set[str] = set()
         #: every execution seen, kept across restarts and days (journal.py);
@@ -251,6 +327,13 @@ class IbkrUpstream:
         #: None: its ticks, market-data refusals and fills go to it, never
         #: to a venue bot — and its orders and fills stay out of the venue's reads
         self.hedge = None
+        #: the Databento source CME Group futures are priced from
+        #: (:class:`~atjte.gateways.exante.quotes.DatabentoQuotes`), or None:
+        #: every quote from TWS
+        self.quotes = quotes
+        self._quote_overrides = dict(quote_symbols or {})
+        self._db_of: dict[str, str] = {}             # symbol -> Databento symbol
+        self._syms_of_db: dict[str, tuple] = {}      # Databento symbol -> symbols
         self._connected_once = False
         self.last_error = ""
         self.counters = {"tickers": 0, "fills": 0, "orders": 0, "errors": 0,
@@ -306,6 +389,12 @@ class IbkrUpstream:
         self._log(f"ib upstream: {len(self._markets)} market(s) from {len(self._specs)} "
                   f"contract spec(s); {len(self._accounts)} account(s) on client id "
                   f"{self.client_id}")
+        if self.quotes is not None:
+            # in the background: a Databento gateway not up yet is waited for
+            self.quotes.set_handler(self._on_db_ticker)
+            self.quotes.start()
+            self._log(f"ib upstream: {len(self._db_of)} CME Group future(s) priced from "
+                      f"{self.quotes.describe()} (subscribed when a bot asks)")
 
     async def _boot(self) -> None:
         from ib_async import IB
@@ -319,6 +408,8 @@ class IbkrUpstream:
         await self._connect()
         await self._load_markets()
         self._loop.create_task(self._keep_connected())
+        if self.manual_fills_poll_s > 0:
+            self._loop.create_task(self._poll_manual_fills())
 
     async def _connect(self) -> None:
         await self.ib.connectAsync(self.host, self.port, clientId=self.client_id,
@@ -369,6 +460,66 @@ class IbkrUpstream:
         self._log(f"ib upstream: {len(fills or [])} execution(s) from TWS, {new} new or "
                   f"updated in the journal ({len(self._journal)} kept)")
 
+    async def _poll_manual_fills(self) -> None:
+        """Every ``manual_fills_poll_s``: the account's executions, for the
+        trades this gateway did not place (MANUAL_POLL_S)."""
+        while True:
+            await asyncio.sleep(self.manual_fills_poll_s)
+            if self.ib is None or not self.ib.isConnected():
+                continue
+            try:
+                fills = await asyncio.wait_for(self.ib.reqExecutionsAsync(), READ_TIMEOUT_S)
+                self._manual_poll_err = ""
+            except Exception as e:                  # noqa: BLE001 — the next poll retries
+                self.counters["errors"] += 1
+                text = f"{type(e).__name__}: {e}"
+                if text != self._manual_poll_err:   # logged once per error, not per poll
+                    self._manual_poll_err = text
+                    self._log(f"ib upstream: reading executions for manual trades failed "
+                              f"({text}) — retrying every {self.manual_fills_poll_s:g} s")
+                continue
+            for f in fills or []:
+                try:
+                    self._take_manual_fill(f)
+                except Exception:                   # noqa: BLE001
+                    self.counters["errors"] += 1
+
+    def _take_manual_fill(self, fill) -> None:
+        """One execution from ``reqExecutions``: pushed when it is a trade
+        this gateway did not place, made since it started."""
+        ref = str(getattr(fill.execution, "orderRef", "") or "")
+        if is_hedge_ref(ref) or cloid_slot_of(ref) is not None:
+            return                                  # ours: pushed by execDetails
+        d = self.trade_dict(fill)
+        d["info"]["manual"] = True
+        eid = d["id"]
+        account = self._by_id.get(fill.execution.acctNumber or "", "")
+        if eid in self._seen_fills:
+            due = self._manual_fee_due.get(eid)
+            if due is not None and d["fee"] is not None:
+                self._manual_fee_due.pop(eid, None)     # its fee, once
+                if self._journal is not None:
+                    self._journal.record([d])
+                # only while the bot still holds the record for its fee
+                # (arb_bot.FEE_WAIT_S, 10 s): later, it would read the
+                # second push as a new fill and report the trade twice
+                if time.time() - due < MANUAL_FEE_PUSH_S:
+                    self._h["fill"](account, d)
+            return
+        self._seen_fills.add(eid)
+        if self._journal is not None:
+            self._journal.record([d])
+        if (d["timestamp"] or 0) < self._t0_ms - 5_000 or not account:
+            return                                  # before this gateway: history only
+        if d["fee"] is None:
+            self._manual_fee_due[eid] = time.time()
+        self.counters["manual_fills"] = self.counters.get("manual_fills", 0) + 1
+        self._lift_margin_hold(account)             # the margin changed
+        self._log(f"ib upstream: MANUAL fill on {d['symbol']} ({account}): {d['side']} "
+                  f"{d['amount']:g} @ {d['price']:g}, order ref {ref or '(none)'} — not "
+                  f"placed by this gateway; pushed to its bot to hedge")
+        self._h["fill"](account, d)
+
     async def _keep_connected(self) -> None:
         """Re-dial a lost session and re-make the subscriptions."""
         while True:
@@ -388,6 +539,11 @@ class IbkrUpstream:
                 self._err("reconnect", e)
 
     def stop(self) -> None:
+        if self.quotes is not None:
+            try:
+                self.quotes.stop()
+            except Exception:                       # noqa: BLE001
+                pass
         if self._loop is None:
             return
 
@@ -438,6 +594,17 @@ class IbkrUpstream:
             markets[m["symbol"]] = m
             contracts[m["symbol"]] = contract
             sym_of[contract.conId] = m["symbol"]
+        if self.quotes is not None:
+            db_of = dict(self._db_of)
+            for m, _c in listed:
+                db = databento_symbol(m, self._quote_overrides)
+                if db is not None:
+                    db_of[m["symbol"]] = db
+            by_db: dict[str, list] = {}
+            for s, d in db_of.items():
+                by_db.setdefault(d, []).append(s)
+            self._db_of = db_of
+            self._syms_of_db = {d: tuple(v) for d, v in by_db.items()}
         self._markets, self._contracts, self._sym_of = markets, contracts, sym_of
 
     def add_contracts(self, specs: list[ContractSpec],
@@ -534,12 +701,25 @@ class IbkrUpstream:
 
     @property
     def public_ok(self) -> bool:
-        return self._up and not any(s in self._md_error for s in self._symbols)
+        return self._up and all(self.public_ok_for(s) for s in list(self._symbols))
 
     def public_ok_for(self, symbol: str) -> bool:
         """THIS symbol's market data: one refused contract (no subscription
-        for it) never takes another symbol's quotes down."""
-        return self._up and symbol in self._symbols and symbol not in self._md_error
+        for it) never takes another symbol's quotes down. A Databento-priced
+        one: the lease and its live session up, a quote within
+        :data:`DB_TICKER_STALE_S` (TWS's session is the private side's)."""
+        if symbol not in self._symbols:
+            return False
+        db = self._db_of.get(symbol)
+        if db is not None and self.quotes is not None:
+            t = self._last.get(symbol)
+            fresh = bool(t) and time.time() - t["timestamp"] / 1000.0 <= DB_TICKER_STALE_S
+            return bool(self.quotes.ok(db) and fresh)
+        return self._up and symbol not in self._md_error
+
+    def quote_source_of(self, symbol: str) -> str:
+        db = self._db_of.get(symbol)
+        return f"databento:{db}" if db is not None and self.quotes is not None else "tws"
 
     def private_ok(self, account: str) -> bool:
         return self._up and account in self._accounts
@@ -555,6 +735,10 @@ class IbkrUpstream:
                 "connected": self._up, "markets": len(self._markets),
                 "orders_paused": {s: w for s in self._paused
                                   if (w := self.orders_paused(s))},
+                "margin_hold": {a: w for a in self._margin_hold
+                                if (w := self.margin_held(a))},
+                "quotes": self.quotes.status() if self.quotes is not None else None,
+                "quote_source": {s: self.quote_source_of(s) for s in sorted(self._symbols)},
                 "counters": dict(self.counters), "last_error": self.last_error}
 
     def _err(self, where: str, e: BaseException) -> None:
@@ -601,7 +785,11 @@ class IbkrUpstream:
         if reqId is not None and int(reqId) > 0 and code >= 100:
             self._order_errors[int(reqId)] = f"{code}: {text}"
             if code in ORDER_REJECT_CODES:
-                self._pause_orders(self._oid_sym.get(int(reqId)) or sym, code, text)
+                if any(m in text.upper() for m in MARGIN_REJECT_MARKERS):
+                    self._hold_margin(self._oid_acct.get(int(reqId)),
+                                      self._oid_sym.get(int(reqId)) or sym, code, text)
+                else:
+                    self._pause_orders(self._oid_sym.get(int(reqId)) or sym, code, text)
         if code in (1100, 1300, 2110):
             self._event("connection")
         self.counters["errors"] += 1
@@ -620,6 +808,68 @@ class IbkrUpstream:
             self._log(f"ib upstream: IBKR rejected an order on {symbol} ({why}) — new orders "
                       f"on {symbol} refused for {self.reject_pause_s:g} s")
 
+    def _hold_margin(self, account: Optional[str], symbol: Optional[str], code: int,
+                     text: str) -> None:
+        """IBKR rejected an order on ``account`` for margin: hold its
+        position-adding orders (MARGIN_REJECT_MARKERS). A rejection inside a
+        running hold (orders already in flight) does not lengthen it."""
+        if not account or self.reject_pause_s <= 0:
+            return
+        now = time.time()
+        until, level, _w = self._margin_hold.get(account, (0.0, 0, ""))
+        if until > now:
+            return
+        level = 1 if now - until > MARGIN_HOLD_MAX_S else level + 1
+        hold = min(MARGIN_HOLD_MAX_S, self.reject_pause_s * 2 ** (level - 1))
+        why = f"{code}: {' '.join(text.replace('<br>', ' ').split())}"
+        self._margin_hold[account] = (now + hold, level, why)
+        self.counters["margin_holds"] = self.counters.get("margin_holds", 0) + 1
+        self._log(f"ib upstream: IBKR rejected an order{' on ' + symbol if symbol else ''} "
+                  f"for MARGIN ({why}) — new position-adding orders on account {account} "
+                  f"held for {hold:g} s (reducing orders still go; a fill lifts it)")
+
+    def margin_held(self, account: str) -> Optional[str]:
+        until, _level, why = self._margin_hold.get(account, (0.0, 0, ""))
+        if until <= time.time():
+            return None
+        end = datetime.fromtimestamp(until, tz=timezone.utc).strftime("%H:%M:%S")
+        return (f"position-adding orders on account {account} held until {end} UTC: IBKR "
+                f"rejected one for margin ({why})")
+
+    def _position(self, account: str, symbol: str) -> float:
+        """The account's signed position in ``symbol`` (contracts), from TWS's
+        synced state; 0 when it cannot be read (the hold then applies)."""
+        try:
+            con_id = self._contracts[symbol].conId
+            return sum(_qty(p.position) or 0.0 for p in self.ib.positions(
+                self.account_id(account)) or [] if p.contract.conId == con_id)
+        except Exception:                           # noqa: BLE001
+            return 0.0
+
+    def _margin_refusal(self, account: str, symbol: str, side: str,
+                        amount: Optional[float], reduce_only: bool) -> Optional[str]:
+        """Why this order is refused under the account's margin hold, else
+        None: reduce-only, or against the position and no bigger, goes."""
+        held = self.margin_held(account)
+        if not held or reduce_only:
+            return None
+        pos = self._position(account, symbol)
+        qty = float(amount or 0.0)
+        against = pos > 0 if side == "sell" else pos < 0
+        if against and qty <= abs(pos) + 1e-9:
+            return None
+        return held
+
+    def _lift_margin_hold(self, account: str) -> None:
+        """A fill on ``account`` changed its margin: end its hold now (its
+        level stays, so the next margin rejection holds twice as long)."""
+        until, level, why = self._margin_hold.get(account, (0.0, 0, ""))
+        now = time.time()
+        if until > now:
+            self._margin_hold[account] = (now, level, why)
+            self._log(f"ib upstream: margin hold on account {account} lifted — a fill "
+                      f"changed its margin")
+
     def orders_paused(self, symbol: str) -> Optional[str]:
         """Why ``symbol``'s new orders are refused right now, else None."""
         until, why = self._paused.get(symbol, (0.0, ""))
@@ -636,6 +886,11 @@ class IbkrUpstream:
         """Live market data for ``symbol``, once — and again when TWS refused
         it before (a subscription bought since then only shows on a new
         request: the next client to attach asks again)."""
+        db = self._db_of.get(symbol) if self.quotes is not None else None
+        if db is not None:                  # priced from Databento: no reqMktData
+            self._symbols.add(symbol)
+            self.quotes.subscribe(db)
+            return
         if self._loop is None:
             return
         if symbol in self._symbols and symbol not in self._md_error:
@@ -646,6 +901,8 @@ class IbkrUpstream:
         self._loop.call_soon_threadsafe(self._subscribe, symbol)
 
     def _subscribe(self, symbol: str) -> None:
+        if self.quotes is not None and symbol in self._db_of:
+            return                          # Databento's (a reconnect re-makes TWS's only)
         try:
             self._md_error.pop(symbol, None)
             if symbol in self._tickers:     # the refused request: replaced
@@ -723,6 +980,8 @@ class IbkrUpstream:
             d = self.ticker_dict(t)
             if d is None:
                 continue
+            if self.quotes is not None and d["symbol"] in self._db_of:
+                continue                    # priced from Databento: never mixed
             if d["bid"] and d["ask"]:
                 self._md_error.pop(d["symbol"], None)
             self._last[d["symbol"]] = d
@@ -738,6 +997,41 @@ class IbkrUpstream:
                     self.counters["books"] = self.counters.get("books", 0) + 1
                     try:
                         self._h["book"](d["symbol"], b)   # the gateway throttles it
+                    except Exception:
+                        self.counters["errors"] += 1
+
+    def _on_db_ticker(self, db_symbol: str, t: dict) -> None:
+        """A Databento top of book, as the ticker of every market priced off
+        that contract. Stamped with the gateway's RECEIVE time — the clock
+        the freshness checks (and the gateway's post-only check) read; the
+        exchange's own is ``info.ts_event``."""
+        bid, ask = t.get("bid"), t.get("ask")
+        if bid is None or ask is None:
+            return
+        now_ms = int(time.time() * 1000)
+        info = t.get("info") or {}
+        for sym in self._syms_of_db.get(db_symbol, ()):
+            if sym not in self._symbols:
+                continue
+            d = {"symbol": sym, "bid": float(bid), "ask": float(ask), "last": None,
+                 "bidVolume": t.get("bidVolume"), "askVolume": t.get("askVolume"),
+                 "timestamp": now_ms,
+                 "info": {"source": "databento", "databentoSymbol": db_symbol,
+                          "ts_event": info.get("ts_event")}}
+            self._last[sym] = d
+            self.counters["tickers"] += 1
+            try:
+                self._h["ticker"](sym, d)
+            except Exception:
+                self.counters["errors"] += 1
+            if self._h.get("book") is not None:
+                depth = info.get("book") or {}
+                b = book_payload(sym, {
+                    "bids": depth.get("bids") or [[d["bid"], d["bidVolume"] or 0.0]],
+                    "asks": depth.get("asks") or [[d["ask"], d["askVolume"] or 0.0]]})
+                if b is not None:
+                    try:
+                        self._h["book"](sym, b)
                     except Exception:
                         self.counters["errors"] += 1
 
@@ -816,7 +1110,8 @@ class IbkrUpstream:
         contract = self._contracts.get(symbol)
         if contract is None:
             raise ccxt.BadSymbol(f"{symbol} is not among this gateway's contracts")
-        paused = self.orders_paused(symbol)
+        paused = (self.orders_paused(symbol)
+                  or self._margin_refusal(account, symbol, side, amount, reduce_only))
         if paused:
             raise ccxt.InvalidOrder(paused)
         # GTC: the quote rests until the bot re-prices it or the reaper pulls
@@ -828,6 +1123,7 @@ class IbkrUpstream:
         async def go():
             trade = self.ib.placeOrder(contract, order)
             self._oid_sym[trade.order.orderId] = symbol
+            self._oid_acct[trade.order.orderId] = account
             await self._await_ack(trade)
             return self.order_dict(trade)
         o = self._call(go(), ORDER_TIMEOUT_S)
@@ -838,7 +1134,8 @@ class IbkrUpstream:
     def amend(self, account, symbol, order_id, side, price, amount, *, cloid,
               post_only, reduce_only) -> dict:
         """Modify in place: TWS keeps the order id and its reference."""
-        paused = self.orders_paused(symbol)
+        paused = (self.orders_paused(symbol)
+                  or self._margin_refusal(account, symbol, side, amount, reduce_only))
         if paused:
             raise ccxt.InvalidOrder(paused)
         self.counters["posts"] += 1
@@ -886,6 +1183,8 @@ class IbkrUpstream:
         return d
 
     def _on_exec(self, trade, fill) -> None:
+        self._lift_margin_hold(self._by_id.get(getattr(fill.execution, "acctNumber", "") or "",
+                                               ""))
         d = self._enrich(self.trade_dict(fill))
         if self._journal is not None:
             self._journal.record([d])

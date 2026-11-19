@@ -30,6 +30,33 @@ there is no venue-side cancel-all — the gateway's per-bot reaper is the
 only dead man's switch, so if the GATEWAY dies its orders stay resting in
 TWS until you cancel them there.
 
+## CME futures priced from Databento (optional)
+
+With a `quote_source` in `gateway.json`, every CME Group future the gateway
+lists (CME, CBOT, NYMEX, COMEX: GC, MGC, ES …) takes its quotes from a
+Databento gateway (`atjte-gateway --new databento_cme --venue databento`,
+dataset `GLBX.MDP3`) instead of TWS — no IB market-data subscription is
+needed for it. Orders, fills, positions and candles stay IB's.
+
+```json
+"quote_source": {"gateway": "databento_cme"}
+```
+
+- The Databento symbol is CME's own, from IB's local symbol:
+  `GC/USD:USD-261229` → `GCZ6`, `MGC/USD:USD-261229` → `MGCZ6`.
+  `"symbols": {"GC/USD:USD-261229": "GCZ6"}` overrides one.
+- Put the Databento gateway's `db_gateway_token` in THIS folder's
+  `gateway.env` too (same value). The Databento API key stays in the
+  Databento gateway's own `gateway.env`.
+- A contract's quotes are up while the Databento gateway is attached, its
+  live session speaks and a quote came within 60 s (CME's daily halt reads
+  as down: no quoting then). The post-only check runs against the
+  Databento book.
+- Start the Databento gateway first. If it is not up yet, the IBKR gateway
+  starts anyway and attaches when it comes up.
+- `atjte-gateway NAME --check` resolves the source (dataset, port) without
+  connecting to anything.
+
 ## The hedge side (optional)
 
 With a `hedge` block in `gateway.json` the gateway ALSO serves the hedge leg

@@ -68,6 +68,9 @@ LEGACY_TO_CANONICAL: dict[str, str] = {
     # the schedule: the daily windows are breaks, as the panel names them
     # (2026-10-27)
     "DAILY_BLACKOUTS": "DAILY_BREAKS",
+    # grid futures: the day the basis reaches spot is the CONVERGENCE date,
+    # a cash-settled future has no delivery (2026-11-16)
+    "CARRY_DELIVERY": "CONVERGENCE_DATE",
 }
 CANONICAL_TO_LEGACY: dict[str, str] = {v: k for k, v in LEGACY_TO_CANONICAL.items()}
 

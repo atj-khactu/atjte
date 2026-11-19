@@ -222,18 +222,18 @@ class DailyLimitTest(unittest.TestCase):
         self.assertEqual(daily_limit_reasons(day, -1e6, None, None, None), [])
         self.assertFalse(day.loss_latched)
 
-    def test_loss_latches_and_stays_latched_after_a_recovery(self):
+    def test_the_loss_limit_follows_the_current_pnl(self):
         day = DayBook(date="d")
         self.assertEqual(daily_limit_reasons(day, -99.0, 100.0, None, None), [])
         reasons = daily_limit_reasons(day, -100.0, 100.0, None, None)
         self.assertEqual(len(reasons), 1)
         self.assertIn("daily loss limit", reasons[0])
         self.assertTrue(day.loss_latched)
-        # back in profit: still close-only for the rest of the day
-        self.assertEqual(len(daily_limit_reasons(day, +250.0, 100.0, None, None)), 1)
-        # ... and a new day clears it
-        day.roll("other-day")
-        self.assertEqual(daily_limit_reasons(day, +250.0, 100.0, None, None), [])
+        # back inside the limit: trading normally again (2026-11-18, the
+        # operator's rule - it was close-only for the rest of the day)
+        self.assertEqual(daily_limit_reasons(day, -99.0, 100.0, None, None), [])
+        self.assertFalse(day.loss_latched)
+        self.assertEqual(len(daily_limit_reasons(day, -150.0, 100.0, None, None)), 1)
 
     def test_unknown_pnl_cannot_latch_but_never_clears(self):
         day = DayBook(date="d")
@@ -269,8 +269,8 @@ class DailyLimitTest(unittest.TestCase):
         day = DayBook(date="d")
         self.assertEqual(len(daily_limit_reasons(day, -1600.0, 1500.0, None, None)), 1)
         self.assertEqual(day.loss_latched_cap, 1500.0)
-        # recovered under the SAME limit: stays latched
-        self.assertEqual(len(daily_limit_reasons(day, -1400.0, 1500.0, None, None)), 1)
+        # recovered under the SAME limit: released (it follows the PnL)
+        self.assertEqual(daily_limit_reasons(day, -1400.0, 1500.0, None, None), [])
         # raised above today's loss: released
         self.assertEqual(daily_limit_reasons(day, -1688.0, 2500.0, None, None), [])
         self.assertFalse(day.loss_latched)
@@ -286,12 +286,11 @@ class DailyLimitTest(unittest.TestCase):
         self.assertIn("<= -1800", reasons[0])
         self.assertEqual(day.loss_latched_cap, 1800.0)
 
-    def test_a_lowered_loss_limit_never_releases(self):
+    def test_a_lowered_loss_limit_judges_the_pnl_against_it(self):
         day = DayBook(date="d")
         daily_limit_reasons(day, -1600.0, 1500.0, None, None)
-        # lowered, then raised back to below the cap it latched at
-        self.assertEqual(len(daily_limit_reasons(day, +500.0, 1000.0, None, None)), 1)
-        self.assertEqual(len(daily_limit_reasons(day, +500.0, 1400.0, None, None)), 1)
+        self.assertEqual(daily_limit_reasons(day, +500.0, 1000.0, None, None), [])
+        self.assertEqual(len(daily_limit_reasons(day, -1200.0, 1000.0, None, None)), 1)
         self.assertTrue(day.loss_latched)
 
     def test_a_latch_of_unknown_cap_follows_the_current_limit(self):

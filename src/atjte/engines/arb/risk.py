@@ -297,29 +297,23 @@ def daily_limit_reasons(day: DayBook, pnl_usd: Optional[float],
     """The close-only reasons the daily limits impose, latching ``day``'s
     flags as a side effect.
 
-    Each limit is **sticky for the rest of the day**: once the loss is taken
-    or the volume is traded, the strategy stays close-only until the day
-    rolls (:meth:`DayBook.roll` clears the latches) — a PnL that recovers or
-    a counter that cannot fall must not re-open the book. (``sample_project``
-    keeps its equivalent latch until the process restarts; here the reset is
-    the day roll, which is what "close-only for the rest of the day" means.)
-    One exception, the operator's: a loss limit RAISED above the one the
-    latch was set under, with today's PnL above the new limit, releases it
-    (MGC 2026-10-22: latched at a lower cap, raised to 2,500, still
-    close-only at −1,688). A lowered limit never releases. A latch of unknown
-    cap (state written before it was kept) follows the current limit once.
-    None or a non-positive limit is off. A PnL of None cannot latch the loss
-    limit but never clears one either."""
+    The LOSS limit follows the CURRENT PnL (2026-11-18, the operator's
+    rule): close-only while today's PnL is at or below -limit, trading
+    normally again once it recovers above it. (It was sticky for the rest of
+    the day.) Twice the limit is not a limit but a HALT - the engine's
+    (``ArbBot._loss_hard_stop``). A PnL of None cannot latch the loss limit
+    but never clears one either.
+
+    A VOLUME limit is sticky for the rest of the day: the traded volume
+    cannot fall, so the strategy stays close-only until the day rolls
+    (:meth:`DayBook.roll` clears the latches). None or a non-positive limit
+    is off."""
     reasons: list[str] = []
     if max_loss_usd and max_loss_usd > 0:
         cap = float(max_loss_usd)
-        if (day.loss_latched and pnl_usd is not None and pnl_usd > -cap
-                and cap > day.loss_latched_cap):
-            day.loss_latched = False
-            day.loss_latched_cap = 0.0
-        if pnl_usd is not None and pnl_usd <= -cap:
-            day.loss_latched = True
-            day.loss_latched_cap = max(day.loss_latched_cap, cap)
+        if pnl_usd is not None:
+            day.loss_latched = pnl_usd <= -cap
+            day.loss_latched_cap = cap if day.loss_latched else 0.0
         if day.loss_latched:
             shown = "n/a" if pnl_usd is None else f"{pnl_usd:+.2f}"
             reasons.append(f"daily loss limit hit (today {shown} USD <= -{cap:g})")

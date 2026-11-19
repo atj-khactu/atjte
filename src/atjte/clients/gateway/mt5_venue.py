@@ -504,6 +504,16 @@ class MT5VenueClient(GatewayConnector):
                                      comment=self.comment)
         raw = o.raw if isinstance(o.raw, dict) else {}
         px = raw.get("price") or None
+        if (o.filled or 0) > 0:
+            # order_send's ``price`` is not the fill on every broker: Blueberry
+            # answers the REQUEST price (3852.26 where the deal was 3853.02,
+            # 2026-11-17), IC Markets 0 — the broker's DEAL is the fill
+            dealt = self._deal_price(raw, str(o.order_id or raw.get("order") or ""))
+            if dealt:
+                if px and abs(float(px) - dealt) > 1e-9:
+                    raw = {**raw, "request_price": px}
+                px = dealt
+                raw = {**raw, "price": dealt, "price_from": "deal"}
         out = Order(exchange=self.name, order_id=str(o.order_id or raw.get("order") or ""),
                     symbol=symbol or self.symbol, side=side, type=OrderType.MARKET,
                     amount=float(amount), price=float(px) if px else None,
@@ -520,6 +530,59 @@ class MT5VenueClient(GatewayConnector):
             threading.Thread(target=self._compact, name="mt5-quote-closeby",
                              daemon=True).start()
         return out
+
+    #: how far either side of now (broker clock) the deal of a fill is looked for
+    DEAL_LOOKUP_S = 600.0
+
+    def _deal_price(self, raw: dict, order_id: str) -> Optional[float]:
+        """The volume-weighted price of the broker's deal(s) for this fill —
+        found by the deal ticket ``order_send`` answered, else by its order —
+        or None when the terminal does not list them (the caller keeps the
+        price it has; logged)."""
+        deal = int(raw.get("deal") or 0)
+        order = int(order_id) if str(order_id or "").isdigit() else 0
+        if not deal and not order:
+            return None
+        try:
+            now = time.time() + self._server_offset_s()
+            frm = datetime.fromtimestamp(now - self.DEAL_LOOKUP_S, tz=timezone.utc)
+            to = datetime.fromtimestamp(now + self.DEAL_LOOKUP_S, tz=timezone.utc)
+            rows = [d for d in self.history_deals(frm, to) or ()
+                    if isinstance(d, dict)
+                    and ((deal and int(d.get("ticket") or 0) == deal)
+                         or (order and int(d.get("order") or 0) == order))]
+            vol = sum(float(d.get("volume") or 0.0) for d in rows)
+            if vol > 0:
+                return sum(float(d.get("volume") or 0.0) * float(d.get("price") or 0.0)
+                           for d in rows) / vol
+        except Exception as e:                              # noqa: BLE001
+            self._log(f"mt5 quote: the deal of order {order_id} was not read "
+                      f"({type(e).__name__}: {e}) — booked at the order's price")
+            return None
+        self._log(f"mt5 quote: no deal listed for order {order_id} yet — booked at the "
+                  f"order's price")
+        return None
+
+    def next_close_lots(self, side: OrderSide, symbol: Optional[str] = None) -> Optional[float]:
+        """The size in LOTS of the ticket an order of ``side`` would close
+        first - this magic's oldest OPPOSITE ticket, the order the gateway
+        closes them in (``MT5Gateway._place_closing_first``) - 0.0 when it
+        holds none (such an order would OPEN a position, not close one), None
+        when the tickets could not be read. A reducing order larger than this is split by the
+        gateway into one broker order per ticket, each at its own price
+        (2026-11-17 20:24: every 10 oz exit went as two 5 oz closes ~0.2 s
+        apart, the second lower); sized to it, the order is ONE."""
+        opposite = PositionSide.SHORT if side is OrderSide.BUY else PositionSide.LONG
+        try:
+            tickets = [p for p in self._own(self.gateway.get_positions(symbol or self.symbol)
+                                            or [])
+                       if p.side is opposite and float(p.size or 0.0) > 0]
+        except Exception:                                   # noqa: BLE001
+            return None
+        if not tickets:
+            return 0.0
+        oldest = min(tickets, key=lambda p: int(p.position_id or 0))
+        return float(oldest.size)
 
     def _own(self, positions) -> list:
         """THIS magic's tickets only (an adopted magic's are never closed)."""

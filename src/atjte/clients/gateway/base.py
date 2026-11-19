@@ -67,6 +67,11 @@ class GatewayConnector(CCXTClient):
     transport_label = "gw"
     #: whether the gateway amends in place (a subclass or the session says)
     supports_amend = False
+    #: ... and whether that amend REPLACES the order — a cancel plus a fresh
+    #: order at the new price — rather than editing the resting one. A
+    #: replacement has to be sized to what is still UNFILLED: sending the
+    #: order's original size re-exposes the part that already filled.
+    amend_replaces = False
     #: the gateway holds the key: a live start needs none in this process
     signs_elsewhere = True
     venue_label = "venue"

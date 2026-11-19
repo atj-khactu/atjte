@@ -64,12 +64,21 @@ PRICES = ("trades", "mid")
 #: 1 m live bars kept per symbol and basis
 LIVE_KEEP_S = 3 * 86400
 #: the top-of-book schema the live quotes are streamed in (the default;
-#: ``quote_schema`` "mbp-10" streams the 10-level book instead)
+#: ``quote_schema`` "mbp-10" streams the 10-level book instead, "cmbp-1" the
+#: CONSOLIDATED top of book: the direct book merged with CME's IMPLIED prices)
 QUOTE_SCHEMA = "mbp-1"
-#: Databento's record type (``rtype``) of an ``mbp-1`` / ``mbp-10`` record
+#: Databento's record type (``rtype``) of an ``mbp-1`` / ``mbp-10`` /
+#: ``cmbp-1`` record. ``mbp-1`` is the direct book only: a back month quoted
+#: mostly through calendar spreads looks far wider than it trades (GCG7 2.6
+#: wide against TWS's tight implied market, 2026-11-18); ``cmbp-1`` carries
+#: the same ``bid_px_00`` / ``ask_px_00`` / sizes with the implied side merged in.
 RTYPE_MBP_1 = 1
 RTYPE_MBP_10 = 10
-QUOTE_RTYPES = (RTYPE_MBP_1, RTYPE_MBP_10)
+RTYPE_CMBP_1 = 177
+QUOTE_RTYPES = (RTYPE_MBP_1, RTYPE_MBP_10, RTYPE_CMBP_1)
+#: the quote schemas that fall back to ``mbp-1`` when Databento refuses them
+#: (the plan does not cover them)
+FALLBACK_SCHEMAS = ("mbp-10", "cmbp-1")
 #: the depth an ``mbp-10`` record carries
 BOOK_DEPTH = 10
 #: days of CME trade prints kept in the journal (``prints/``)
@@ -78,6 +87,12 @@ PRINTS_KEEP_DAYS = 3
 #: session (no record, no heartbeat) is taken for alive
 HEARTBEAT_S = 10
 LIVE_SILENT_S = 3 * HEARTBEAT_S
+#: a live session silent this long is closed and opened afresh with every
+#: subscription (:meth:`DatabentoUpstream.check_live`): Databento's client
+#: reconnects only on a disconnect it sees, and a connection that died
+#: without one left GC unquoted for 4.5 h (2026-11-18, silent from 06:36 UTC,
+#: no error, no reconnect). Also the least time between two such reopens.
+LIVE_REOPEN_S = 6 * HEARTBEAT_S
 #: how long the dataset's published range is trusted before it is re-asked
 RANGE_TTL_S = 60.0
 DEFAULT_LIMIT = 500
@@ -164,7 +179,7 @@ def book_of(rec, depth: int = BOOK_DEPTH) -> dict:
 
 
 def quote_of(rec, symbol: str, now: float) -> Optional[dict]:
-    """An ``mbp-1`` / ``mbp-10`` record as a CCXT ticker; None unless the
+    """An ``mbp-1`` / ``mbp-10`` / ``cmbp-1`` record as a CCXT ticker; None unless the
     book is two-sided. ``timestamp`` is when the gateway RECEIVED it (the
     clock its clients judge freshness by); the exchange's own time is in
     ``info``, and an ``mbp-10`` record's whole book in ``info["book"]``."""
@@ -211,7 +226,8 @@ class DatabentoUpstream:
                  live_factory: Optional[Callable[[str], Any]] = None,
                  clock: Callable[[], float] = time.time,
                  heartbeat_s: int = HEARTBEAT_S, quote_schema: str = QUOTE_SCHEMA,
-                 prints_dir: Optional[Path] = None) -> None:
+                 prints_dir: Optional[Path] = None,
+                 watchdog: Optional[bool] = None) -> None:
         self._key = api_key
         self.dataset = dataset
         self.symbols = list(symbols)
@@ -222,6 +238,12 @@ class DatabentoUpstream:
         self._clock = clock
         self._hist = None
         self._live = None
+        #: a thread calling :meth:`check_live` every heartbeat; by default
+        #: only on Databento's own client (tests drive ``check_live`` by hand)
+        self._watchdog = (live_factory is None) if watchdog is None else bool(watchdog)
+        self._watchdog_started = False
+        self._last_reopen = 0.0
+        self._stopped = False
         self._lock = threading.Lock()
         #: one session per key: creating it, and adding a subscription to it
         self._live_lock = threading.Lock()
@@ -252,7 +274,7 @@ class DatabentoUpstream:
         self.live_ok = False
         self.last_error = ""
         self.counters = {"reads": 0, "cost_quotes": 0, "live_records": 0, "quotes": 0,
-                         "heartbeats": 0, "reconnects": 0, "errors": 0,
+                         "heartbeats": 0, "reconnects": 0, "reopens": 0, "errors": 0,
                          "auto_fetches": 0, "auto_skipped": 0, "auto_cost_usd": 0.0}
 
     # ── lifecycle ────────────────────────────────────────────────────────────
@@ -315,6 +337,79 @@ class DatabentoUpstream:
                 live.start()
                 self._live = live
             self.live_ok = True
+            if fresh and self._watchdog and not self._watchdog_started:
+                self._watchdog_started = True
+                threading.Thread(target=self._watchdog_loop, name="db-live-watchdog",
+                                 daemon=True).start()
+
+    # ── a session that died without a disconnect ─────────────────────────────
+    def _watchdog_loop(self) -> None:
+        while True:
+            time.sleep(self.heartbeat_s)
+            try:
+                self.check_live()
+            except Exception as e:                          # noqa: BLE001
+                self._err("live watchdog", e)
+
+    def _live_subs(self) -> list:
+        """Every subscription the live session should carry now: the bars'
+        (``symbols``) and the quotes' (in the current ``quote_schema``)."""
+        subs: list = []
+        if self.live_on and self.symbols:
+            by_stype: dict[str, list[str]] = {}
+            for s in self.symbols:
+                by_stype.setdefault(C.stype_of(s), []).append(s)
+            subs += [(schema, syms, st) for st, syms in by_stype.items()
+                     for schema in ("ohlcv-1m", MID_SCHEMA)]
+        with self._lock:
+            quoted = sorted(self._quote_syms)
+        by_stype = {}
+        for s in quoted:
+            by_stype.setdefault(C.stype_of(s), []).append(s)
+        subs += [(self.quote_schema, syms, st) for st, syms in by_stype.items()]
+        return subs
+
+    def check_live(self) -> bool:
+        """Reopen the live session when it has been silent (no record, no
+        heartbeat) for :data:`LIVE_REOPEN_S`, or when opening it again
+        failed: the old one is stopped on its own thread (a dead socket may
+        block), a new one subscribes everything (:meth:`_live_subs`). At
+        most once per LIVE_REOPEN_S. Returns True when it reopened."""
+        now = self._clock()
+        if self._stopped or now - self._last_reopen < LIVE_REOPEN_S:
+            return False
+        subs = self._live_subs()
+        if not subs:
+            return False
+        live = self._live
+        if live is not None and now - self._last_rx <= LIVE_REOPEN_S:
+            return False
+        self._last_reopen = now
+        silent = now - self._last_rx
+        with self._live_lock:
+            old, self._live = self._live, None
+        self.live_ok = False
+        if old is not None:
+            threading.Thread(target=self._stop_quietly, args=(old,),
+                             name="db-live-stop", daemon=True).start()
+        self._log(f"databento: the live session was silent {silent:.0f} s (no record, no "
+                  f"heartbeat) — reopening it with {sum(len(s[1]) for s in subs)} "
+                  f"subscription(s)")
+        try:
+            self._live_subscribe(subs)
+        except Exception as e:                              # noqa: BLE001
+            self._err("live reopen", e)
+            return False
+        self.counters["reopens"] += 1
+        self._log("databento: the live session reopened")
+        return True
+
+    @staticmethod
+    def _stop_quietly(live) -> None:
+        try:
+            live.stop()
+        except Exception:                                   # noqa: BLE001
+            pass
 
     def subscribe_quotes(self, symbol: str) -> None:
         """Stream ``symbol``'s top of book (``mbp-1``) on the live session —
@@ -344,24 +439,27 @@ class DatabentoUpstream:
                                             f"{type(e).__name__}: {e}") from None
         self._log(f"databento: live quotes ({self.quote_schema}) for {symbol}")
 
-    # ── a 10-level book the plan does not cover ──────────────────────────────
+    # ── a quote schema the plan does not cover ───────────────────────────────
     def _schema_refused(self, text: str) -> bool:
-        """Databento refused the 10-level quote schema ("Not authorized for
-        mbp-10 schema"): the plan covers top of book only."""
-        return self.quote_schema == "mbp-10" and "mbp-10" in str(text or "").lower()
+        """Databento refused the configured quote schema ("Not authorized for
+        mbp-10 schema", the same for cmbp-1): the plan covers the direct top
+        of book only."""
+        return (self.quote_schema in FALLBACK_SCHEMAS
+                and self.quote_schema in str(text or "").lower())
 
     def _fall_back_to_top(self, why: str, resubscribe: bool = True) -> None:
-        """``quote_schema`` mbp-10 refused: stream top of book (``mbp-1``)
-        instead, for every symbol already quoted — a refused 10-level book
+        """``quote_schema`` mbp-10 / cmbp-1 refused: stream the direct top of
+        book (``mbp-1``) instead, for every symbol already quoted — a refused 10-level book
         used to leave the quotes, and with them every bot pricing off them,
         silent (2026-11-09). Logged once; the status says so
         (``quote_fallback``). The re-subscription runs on its own thread:
         this is called from Databento's record callback."""
         with self._lock:
-            if self.quote_schema != "mbp-10":
+            refused = self.quote_schema
+            if refused not in FALLBACK_SCHEMAS:
                 return
             self.quote_schema = QUOTE_SCHEMA
-            self.quote_fallback = (f"mbp-10 refused by Databento ({str(why)[:200]}): "
+            self.quote_fallback = (f"{refused} refused by Databento ({str(why)[:200]}): "
                                    f"top of book (mbp-1) instead")
             syms = sorted(self._quote_syms)
         self.counters["quote_fallbacks"] = self.counters.get("quote_fallbacks", 0) + 1
@@ -401,6 +499,7 @@ class DatabentoUpstream:
         self._log("databento: the live session reconnected (subscriptions resumed)")
 
     def stop(self) -> None:
+        self._stopped = True                    # the watchdog reopens nothing now
         live, self._live = self._live, None
         if live is not None:
             try:

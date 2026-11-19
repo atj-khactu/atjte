@@ -61,6 +61,12 @@ class IbkrGatewayClient(GatewayConnector):
     #: a fill is pushed without its fee; TWS's commission report follows and
     #: the gateway pushes the fill again with it (ArbBot._report_fill waits)
     fees_follow_fills = True
+    #: the margin is IBKR's per contract (the gateway's initial-margin probe,
+    #: ``limits.leverage.max``): the engine's LEVERAGE is not applied — IB has
+    #: no such call — and not used to judge an entry (LEVERAGE 1 asked the
+    #: whole notional of an MGC contract, 38,740 USD, and blocked every
+    #: entry, 2026-11-16 — as on EXANTE, 2026-11-02)
+    broker_margin = True
     venue_label = "IBKR"
     GATEWAY_CLASS = _IbLease
     DEFAULT_GATEWAY_PORT = DEFAULT_PORT

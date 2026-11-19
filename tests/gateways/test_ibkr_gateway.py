@@ -183,18 +183,30 @@ class GatewayTest(GatewayCase):
         with self.assertRaises(ccxt.InvalidOrder):          # an amend that would cross
             c.amend(o["id"], "buy", 2650.2, None)
 
-    def test_a_quote_without_a_fresh_book_is_not_sent(self):
+    def test_a_quote_with_no_book_at_all_is_not_sent(self):
         """Refused as UNAVAILABLE (the lease's GatewayDown, what the engine
         treats as the order path being down and retries later) — not as an
         invalid order, which it is not."""
         c = self.lease()
         with self.assertRaises(GatewayDown) as cm:
             c.place("buy", 1, 2649.0, post_only=True)
-        self.assertIn("no fresh book", str(cm.exception))
-        self.up.push_ticker(2650.0, 2650.2, age_s=60.0)
-        with self.assertRaises(GatewayDown):
-            c.place("buy", 1, 2649.0, post_only=True)
+        self.assertIn("no book to check against", str(cm.exception))
         self.assertFalse([x for x in self.up.calls if x[0] == "place"])
+
+    def test_a_quiet_book_is_still_the_book(self):
+        """MGCG7's Databento book went 26-30 s without a change and the old
+        10 s rule refused 69 of 80 entries as "no fresh book" (2026-11-16):
+        a book of any age is checked against and the quote is sent; one that
+        would cross it is still refused."""
+        c = self.lease()
+        self.up.push_ticker(2650.0, 2650.2, age_s=60.0)
+        o = c.place("buy", 1, 2649.0, post_only=True)
+        self.assertEqual(o["status"], "open")
+        a = c.amend(o["id"], "buy", 2649.5, None)
+        self.assertEqual(a["id"], o["id"])
+        with self.assertRaises(ccxt.InvalidOrder) as cm:          # crosses the old book
+            c.place("buy", 1, 2650.2, post_only=True)
+        self.assertIn("60s old", str(cm.exception))
 
     def test_a_taker_order_skips_the_post_only_check(self):
         c = self.lease()
@@ -530,6 +542,127 @@ class UpstreamTest(unittest.TestCase):
                       cloid="c3")
         self.assertEqual(self.ib.calls[-1][0], "placeOrder")
         self.assertEqual(self.up.status()["orders_paused"], {})
+
+    MARGIN = ("Order rejected - reason:We are unable to accept your order. Your Available "
+              "Funds are in sufficient to cover the change in the <br>account's margin "
+              "requirements if this order executes. In order to obtain the desired position "
+              "your Equity with<br> Loan Value [50409.13 EUR] must exceed the new total "
+              "Initial Margin of  [51302.21 EUR].")
+
+    def _long(self, qty):
+        from types import SimpleNamespace as NS
+        con_id = self.up._contracts[MGC].conId
+        self.ib._positions = [NS(account=ACCOUNT_ID, contract=NS(conId=con_id), position=qty)]
+
+    def test_a_margin_rejection_holds_only_position_adding_orders(self):
+        """2026-11-16: a fully margined account; two bots each re-sent an
+        entry every 60 s. A margin rejection holds the ACCOUNT's adding
+        orders; reducing ones still go (they free margin)."""
+        self._long(3)
+        o = self.up.place("main", MGC, "buy", 1, 2649.5, post_only=True, reduce_only=False,
+                          cloid="c1")
+        self.up._on_error(int(o["id"]), 201, self.MARGIN)
+        self.assertIsNone(self.up.orders_paused(MGC))              # not the symbol pause
+        self.assertIn("main", self.up.status()["margin_hold"])
+        n = len(self.ib.calls)
+        with self.assertRaises(ccxt.InvalidOrder) as cm:
+            self.up.place("main", MGC, "buy", 1, 2649.4, post_only=True, reduce_only=False,
+                          cloid="c2")
+        self.assertIn("margin", str(cm.exception))
+        self.assertNotIn("<br>", str(cm.exception))
+        with self.assertRaises(ccxt.InvalidOrder):                 # a flip adds: held
+            self.up.place("main", MGC, "sell", 4, 2650.0, post_only=True,
+                          reduce_only=False, cloid="c3")
+        self.assertEqual(len(self.ib.calls), n)                     # nothing reached TWS
+        self.up.place("main", MGC, "sell", 2, 2650.0, post_only=True, reduce_only=False,
+                      cloid="c4")                                   # reduces: goes
+        self.up.place("main", MGC, "sell", 1, 2650.0, post_only=True, reduce_only=True,
+                      cloid="c5")
+        self.assertEqual(len(self.ib.calls), n + 2)
+
+    def test_margin_holds_back_off_and_a_fill_lifts_one(self):
+        from types import SimpleNamespace as NS
+        o = self.up.place("main", MGC, "buy", 1, 2649.5, post_only=True, reduce_only=False,
+                          cloid="c1")
+        holds = []
+        for _ in range(6):
+            self.up._on_error(int(o["id"]), 201, self.MARGIN)
+            until, level, why = self.up._margin_hold["main"]
+            holds.append(round(until - time.time()))
+            self.up._on_error(int(o["id"]), 201, self.MARGIN)      # in flight: no longer
+            self.assertEqual(self.up._margin_hold["main"][1], level)
+            self.up._margin_hold["main"] = (time.time() - 1, level, why)   # it ran out
+        self.assertEqual(holds, [60, 120, 240, 480, 900, 900])
+        # long quiet after the last one: starts over at 1x
+        self.up._margin_hold["main"] = (time.time() - U.MARGIN_HOLD_MAX_S - 5, 6, "x")
+        self.up._on_error(int(o["id"]), 201, self.MARGIN)
+        self.assertEqual(self.up._margin_hold["main"][1], 1)
+        # a fill on the account lifts it at once
+        self.up._lift_margin_hold("main")
+        self.assertIsNone(self.up.margin_held("main"))
+        self.up.place("main", MGC, "buy", 1, 2649.4, post_only=True, reduce_only=False,
+                      cloid="c2")
+        self.assertEqual(self.ib.calls[-1][0], "placeOrder")
+        self.up.reject_pause_s = 0.0                               # off
+        self.up._margin_hold.clear()
+        self.up._on_error(int(o["id"]), 201, self.MARGIN)
+        self.assertEqual(self.up._margin_hold, {})
+
+    def _exec(self, eid, ref, *, side="SLD", when=None, fee=None):
+        from ib_async import CommissionReport, Execution, Fill
+        when = when or datetime.now(timezone.utc)
+        ex = Execution(execId=eid, time=when, acctNumber=ACCOUNT_ID, exchange="COMEX",
+                       side=side, shares=1.0, price=4200.0, permId=7, orderId=0,
+                       orderRef=ref, lastLiquidity=2)
+        rep = (CommissionReport(execId=eid, commission=fee, currency="USD")
+               if fee is not None else CommissionReport())
+        return Fill(self.up._contracts[MGC], ex, rep, when)
+
+    def test_a_manual_tws_trade_is_pushed_to_the_bot_once_then_with_its_fee(self):
+        """2026-11-16: 17 GOL closed by hand in TWS reached no bot (TWS
+        pushes an API client only its own orders' executions); the MT5 hedge
+        waited for the parity check. reqExecutions returns them: pushed."""
+        fills = [self._exec("m.1", "ActivityMonitor"),
+                 self._exec("m.2", ""),
+                 self._exec("own.1", "0xa71e0001000660660a4e0de8000048ce"),   # ours
+                 self._exec("h.1", "acph:77019:x"),                              # a hedge
+                 self._exec("old.1", "", when=datetime.now(timezone.utc) - timedelta(hours=1))]
+        for f in fills:
+            self.up._take_manual_fill(f)
+        got = [(a, t["id"], t["info"]["manual"], t["fee"]) for k, a, t in self.pushed
+               if k == "fill"]
+        self.assertEqual(got, [("main", "m.1", True, None), ("main", "m.2", True, None)])
+        for f in fills:                                   # the next poll: nothing again
+            self.up._take_manual_fill(f)
+        self.assertEqual(len([p for p in self.pushed if p[0] == "fill"]), 2)
+        # the fee arrives on a later poll: m.1 pushed once more, with it
+        self.up._take_manual_fill(self._exec("m.1", "ActivityMonitor", fee=0.31))
+        self.up._take_manual_fill(self._exec("m.1", "ActivityMonitor", fee=0.31))
+        last = [t for k, a, t in self.pushed if k == "fill"]
+        self.assertEqual(len(last), 3)
+        self.assertEqual((last[-1]["id"], last[-1]["fee"]["cost"]), ("m.1", 0.31))
+        # a fee later than the bot waits for one: journaled, not pushed
+        self.up._take_manual_fill(self._exec("m.4", ""))
+        self.up._manual_fee_due["m.4"] -= U.MANUAL_FEE_PUSH_S + 1
+        n = len(self.pushed)
+        self.up._take_manual_fill(self._exec("m.4", "", fee=0.31))
+        self.assertEqual(len(self.pushed), n)
+        self.assertNotIn("m.4", self.up._manual_fee_due)
+        # a push the session already made (execDetails) is never pushed again
+        self.up._on_exec(None, self._exec("m.3", ""))
+        n = len(self.pushed)
+        self.up._take_manual_fill(self._exec("m.3", ""))
+        self.assertEqual(len(self.pushed), n)
+
+    def test_a_manual_fill_lifts_the_margin_hold(self):
+        self.up._margin_hold["main"] = (time.time() + 60, 1, "x")
+        self.up._take_manual_fill(self._exec("m.9", ""))
+        self.assertIsNone(self.up.margin_held("main"))
+
+    def test_the_manual_poll_is_off_at_zero(self):
+        up = U.IbkrUpstream({"main": ACCOUNT_ID}, [CFG.ContractSpec("MGC", "COMEX")],
+                            network="paper", manual_fills_poll_s=0)
+        self.assertEqual(up.manual_fills_poll_s, 0.0)
 
     def test_no_pause_when_it_is_off_or_for_other_errors(self):
         o = self.up.place("main", MGC, "buy", 1, 2649.5, post_only=True, reduce_only=False,
@@ -921,6 +1054,13 @@ class ConnectorTest(GatewayCase):
         self.conn.disconnect()
         super().tearDown()
 
+    def test_ibkrs_own_margin_judges_an_entry_never_leverage(self):
+        """IB sets the margin per contract and has no leverage call: LEVERAGE
+        1 asked an MGC entry for its whole notional (38,740 USD) and blocked
+        it live, 2026-11-16 — the engine must take the market's rate."""
+        self.assertTrue(IbkrGatewayClient.broker_margin)
+        self.assertTrue(self.conn.broker_margin)
+
     def test_the_math_runs_on_the_gateways_markets_and_reaches_no_network(self):
         x = self.conn.exchange
         self.assertIsInstance(x, IbkrExchange)
@@ -1166,6 +1306,169 @@ class AddContractsTest(UpstreamTest):
         self.assertEqual(self.asked, [])
         self.assertFalse((self.tmp / CFG.MARKETS_NAME).exists())
         self.assertTrue(any("do not parse" in m for m in self.logs))
+
+
+class FakeDbQuotes:
+    """The Databento lease (exante.quotes.DatabentoQuotes) as the upstream
+    uses it: what it subscribes, and its health."""
+
+    def __init__(self):
+        self.subscribed, self.healthy, self.started = [], True, False
+        self.handler = None
+
+    def set_handler(self, fn):
+        self.handler = fn
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.started = False
+
+    def describe(self):
+        return "GLBX.MDP3 from the Databento gateway databento_cme (port 5670)"
+
+    def subscribe(self, db):
+        if db not in self.subscribed:
+            self.subscribed.append(db)
+
+    def ok(self, db):
+        return self.healthy
+
+    def status(self):
+        return {"source": "databento", "connected": self.healthy,
+                "session": {"quotes_ok": self.healthy}}
+
+    def push(self, db, bid, ask):
+        self.handler(db, {"symbol": db, "bid": bid, "ask": ask, "bidVolume": 3.0,
+                          "askVolume": 4.0, "info": {"ts_event": 1}})
+
+
+GC = "GC/USD:USD-261229"
+
+
+class DatabentoPricingTest(unittest.TestCase):
+    """``quote_source``: CME Group futures priced from a Databento gateway
+    (GLBX.MDP3 top of book) — no reqMktData for them, IB's own ticks for
+    them never pushed; orders and reads stay IB's."""
+
+    def setUp(self):
+        self.q = FakeDbQuotes()
+        self.up = U.IbkrUpstream({"main": ACCOUNT_ID}, [CFG.ContractSpec("GC", "COMEX")],
+                                 network="paper", quotes=self.q)
+        self.ib = FakeIB()
+        self.up.ib = self.ib
+        spec = self.up._specs[0]
+        self.up._install([(U.market_from_details(cd, spec), cd.contract)
+                          for cd in (_gc_details("20261229", 2001),)])
+        self.pushed = []
+        self.up.set_handlers(on_ticker=lambda s, t: self.pushed.append((s, t)),
+                             on_fill=lambda *a: None, on_order=lambda *a: None,
+                             on_event=lambda *a: None)
+        self.q.set_handler(self.up._on_db_ticker)
+
+    def test_cme_symbol_from_the_market(self):
+        m = self.up._markets[GC]
+        self.assertEqual(U.databento_symbol(m), "GCZ6")
+        self.assertEqual(U.databento_symbol(m, {GC: "GCZ26"}), "GCZ26")
+        self.assertEqual(U.databento_symbol(m, {"GCZ6": "X"}), "X")      # by localSymbol
+        odd = dict(m, info=dict(m["info"], localSymbol="GC   DEC 26", tradingClass="GC",
+                                contractMonth="202612"))
+        self.assertEqual(U.databento_symbol(odd), "GCZ6")
+        self.assertEqual(U.databento_symbol(dict(MARKET, info=dict(
+            MARKET["info"], exchange="COMEX"))), "MGCZ6")
+        self.assertIsNone(U.databento_symbol(dict(m, info=dict(m["info"], exchange="EUREX"))))
+        self.assertIsNone(U.databento_symbol(dict(m, future=False)))     # CMDTY, spot
+        self.assertEqual(self.up._db_of, {GC: "GCZ6"})
+
+    def test_subscribing_streams_databento_not_tws(self):
+        self.up.subscribe_ticker(GC)
+        self.assertEqual(self.q.subscribed, ["GCZ6"])
+        self.assertNotIn(GC, self.up._tickers)                           # no reqMktData
+        self.up._subscribe(GC)                                           # a reconnect
+        self.assertNotIn(GC, self.up._tickers)
+        self.assertEqual(self.up.quote_source_of(GC), "databento:GCZ6")
+
+    def test_a_databento_quote_is_the_ticker_and_its_freshness_the_health(self):
+        self.up.subscribe_ticker(GC)
+        self.assertFalse(self.up.public_ok_for(GC))                      # no quote yet
+        self.q.push("GCZ6", 4100.1, 4100.3)
+        (sym, t), = self.pushed
+        self.assertEqual((sym, t["bid"], t["ask"]), (GC, 4100.1, 4100.3))
+        self.assertEqual(t["info"]["source"], "databento")
+        self.assertTrue(self.up.public_ok_for(GC))
+        self.assertTrue(self.up.public_ok)
+        self.assertAlmostEqual(self.up._price_of(GC), 4100.2)            # the margin probe's
+        self.q.healthy = False
+        self.assertFalse(self.up.public_ok_for(GC))
+        self.q.healthy = True
+        self.up._last[GC]["timestamp"] -= int((U.DB_TICKER_STALE_S + 1) * 1000)
+        self.assertFalse(self.up.public_ok_for(GC))                      # stale
+        s = self.up.status()
+        self.assertEqual(s["quote_source"], {GC: "databento:GCZ6"})
+        self.assertEqual(s["quotes"]["source"], "databento")
+
+    def test_a_quote_for_an_unsubscribed_contract_is_not_pushed(self):
+        self.q.push("GCZ6", 1.0, 2.0)
+        self.assertEqual(self.pushed, [])
+
+    def test_ibs_own_tick_for_a_databento_symbol_is_never_pushed(self):
+        from ib_async import Ticker
+        self.up.subscribe_ticker(GC)
+        t = Ticker(contract=self.up._contracts[GC], bid=1.0, ask=2.0)
+        self.up._on_tickers([t])
+        self.assertEqual(self.pushed, [])
+
+    def test_without_a_quote_source_nothing_changes(self):
+        up = U.IbkrUpstream({"main": ACCOUNT_ID}, [CFG.ContractSpec("GC", "COMEX")],
+                            network="paper")
+        up._install([(U.market_from_details(_gc_details("20261229", 2001), up._specs[0]),
+                      _gc_details("20261229", 2001).contract)])
+        self.assertEqual(up._db_of, {})
+        self.assertEqual(up.quote_source_of(GC), "tws")
+
+
+class QuoteSourceConfigTest(unittest.TestCase):
+    def _load(self, extra: dict, env: str = ""):
+        d = Path(tempfile.mkdtemp())
+        (d / CFG.CONFIG_NAME).write_text(json.dumps(
+            {"name": "ib_gc", "venue": "ibkr", "network": "paper",
+             "contracts": [{"symbol": "GC", "exchange": "COMEX"}], **extra}), encoding="utf-8")
+        (d / CFG.ENV_NAME).write_text(env, encoding="utf-8")
+        return CFG.load(str(d))
+
+    def test_parsed_with_its_token_never_shown(self):
+        cfg = self._load({"quote_source": {"gateway": "databento_cme",
+                                           "symbols": {GC: "GCZ6"}}},
+                         "ibkr_account = DU1\ndb_gateway_token = s3cret\n")
+        self.assertEqual((cfg.quote_gateway, cfg.quote_port, cfg.quote_symbols),
+                         ("databento_cme", 0, {GC: "GCZ6"}))
+        self.assertEqual(cfg.quote_token, "s3cret")
+        st = json.dumps(cfg.status())
+        self.assertIn('"token_set": true', st)
+        self.assertNotIn("s3cret", st)
+
+    def test_absent_is_tws_and_bad_shapes_are_refused(self):
+        self.assertEqual(self._load({}).quote_gateway, "")
+        self.assertIsNone(CFG.make_quotes(self._load({})))
+        for bad in ([{"gateway": "databento_cme"}], {"gateway": "Bad Name"},
+                    {"gateway": "databento_cme", "dataset": "X"},
+                    {"gateway": "databento_cme", "symbols": ["GCZ6"]}):
+            with self.assertRaises(CFG.ConfigError, msg=bad):
+                self._load({"quote_source": bad})
+
+    def test_the_source_must_serve_cme_globex(self):
+        from atjte.gateways.databento import config as DC
+        cfg = self._load({"quote_source": {"gateway": "databento_eurex"}})
+        with mock.patch.object(DC, "dataset_of", return_value="XEUR.EOBI"), \
+                mock.patch.object(DC, "listen_port_of", return_value=5671):
+            with self.assertRaises(CFG.ConfigError):
+                CFG.make_quotes(cfg)
+        cfg = self._load({"quote_source": {"gateway": "databento_cme"}})
+        with mock.patch.object(DC, "dataset_of", return_value="GLBX.MDP3"), \
+                mock.patch.object(DC, "listen_port_of", return_value=5670):
+            q = CFG.make_quotes(cfg)
+        self.assertEqual((q.port, q.dataset, q.gateway), (5670, "GLBX.MDP3", "databento_cme"))
 
 
 if __name__ == "__main__":

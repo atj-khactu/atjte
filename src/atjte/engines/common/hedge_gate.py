@@ -8,7 +8,13 @@ many lots it silently leaves that much unhedged — measured 2026-09-28 on
 xyz:JP225: 1 unit = one index contract (~$65k), one JP225 lot hedges 0.00635
 units, so a 1-unit gate was 157 lots and a +0.0184 fill (~$1.2k) was never
 hedged: the fill hedger logged "under one lot", the reconciler "drift
-cleared". A warning, not a refusal: the operator decides."""
+cleared". A warning, not a refusal: the operator decides.
+
+No warning when the gate is no bigger than the venue's amount step (the
+smallest change a fill can make to the position, in the same units): every
+fill then reaches the gate on its own, so nothing can stay unhedged under
+it. A dated future trades whole contracts — one Mini-DAX is 5 units against
+a 1-unit gate and a 0.1-unit DE40 lot (2026-11-09, a false alarm)."""
 from __future__ import annotations
 
 from typing import Optional
@@ -19,15 +25,24 @@ HEDGE_GATE_MAX_LOTS = 2.0
 
 def hedge_gate_verdict(name: str, value: float, min_lot_units: float,
                        unit_value: Optional[float] = None, unit_label: str = "units",
-                       quote_ccy: str = "") -> Optional[str]:
+                       quote_ccy: str = "",
+                       venue_step_units: Optional[float] = None) -> Optional[str]:
     """The warning when a hedge gate is worth more than HEDGE_GATE_MAX_LOTS
     broker min lots, else None. ``unit_value`` (venue-currency value of one
-    unit) only makes the message concrete; the verdict never needs it."""
+    unit) only makes the message concrete; the verdict never needs it.
+    ``venue_step_units`` (the venue's amount step in the gate's units; None =
+    unknown) clears a gate no bigger than it: no fill can sit under it."""
     try:
         v, lot = float(value), float(min_lot_units)
     except (TypeError, ValueError):
         return None
     if not (lot > 0) or not (v > HEDGE_GATE_MAX_LOTS * lot):
+        return None
+    try:
+        step = float(venue_step_units or 0.0)
+    except (TypeError, ValueError):
+        step = 0.0
+    if step > 0 and v <= step * (1 + 1e-9):
         return None
     lots = v / lot
     worth = (f" (~{v * unit_value:,.0f} {quote_ccy or 'in venue currency'})"

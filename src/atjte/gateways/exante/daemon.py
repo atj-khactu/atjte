@@ -26,6 +26,8 @@ from atjte.gateways.hyperliquid.daemon import stop_requested, write_state
 
 from .. import shutdown as SD
 from . import config as C
+from . import fixlog as FL
+from . import quotes as Q
 
 
 def _ask_network() -> str:
@@ -194,6 +196,11 @@ def main(argv=None) -> int:
             f"{cfg.quote_gateway} refuses the quote lease if it has a token")
     # the configured instruments, plus those the bots loaded on an earlier run
     symbols = list(dict.fromkeys(cfg.symbols + remembered_symbols(cfg.dir, cfg.network)))
+    fix_log = None
+    if cfg.fix_trace:
+        fix_log = FL.FixLog(cfg.dir / "logs", log=log)
+        log(f"{cfg.name}: FIX trace ON ({cfg.fix_trace}) -> "
+            f"{fix_log.path_for(time.strftime('%Y%m%d', time.gmtime()))} (passwords redacted)")
     up = ExanteUpstream(
         network=cfg.network, account_id=account, symbols=symbols, rest=rest,
         fix_host=cfg.fix_host,
@@ -202,14 +209,16 @@ def main(argv=None) -> int:
         trade={"sender": ids["trade"][0], "target": ids["trade"][1],
                "password": cfg.trade_password, "port": cfg.trade_port},
         depth=cfg.depth, tif=C.TIFS[cfg.tif], heartbeat_s=cfg.heartbeat_s,
-        quotes=quotes, quote_symbols=cfg.quote_symbols, ca_file=cfg.fix_ca_file, log=log)
+        quotes=quotes, quote_symbols=cfg.quote_symbols, ca_file=cfg.fix_ca_file,
+        fix_trace=({role: fix_log.writer(role) for role in FL.MODES[cfg.fix_trace]}
+                   if fix_log is not None else None),
+        log=log)
     up.on_markets = lambda: write_markets(cfg.dir, cfg.network, up)
     log(f"{cfg.name}: {cfg.network.upper()} — account {account}, FIX {cfg.fix_host} "
         f"(TRADE {ids['trade'][0]}, FEED {ids['feed'][0]}), "
         + (f"{len(symbols)} instrument(s)" if symbols else
            "no instrument yet — each bot's is loaded when it attaches")
-        + (f"; CME futures priced from the Databento gateway {cfg.quote_gateway} "
-           f"(port {quotes.port})" if quotes is not None else ""))
+        + (f"; futures priced from {quotes.describe()}" if quotes is not None else ""))
     try:
         up.start()
     except Exception as e:                                  # noqa: BLE001
@@ -244,10 +253,8 @@ def main(argv=None) -> int:
         while not stop.wait(1.0):
             s = gw.status()
             u = s["upstream"]
-            q = u.get("quotes")
             # a Databento source counts once something is priced from it
-            quotes_up = (q is None or not up._db_of or
-                         bool(q.get("connected") and (q.get("session") or {}).get("quotes_ok")))
+            quotes_up = not up._db_of or Q.sources_up(u.get("quotes"))
             ready = (bool(u.get("connected")) and all((u.get("accounts") or {}).values())
                      and quotes_up)
             write_state(state, {"name": cfg.name, "pid": os.getpid(), "t": time.time(),

@@ -14,8 +14,9 @@
      "dataset": "GLBX.MDP3",              # CME Globex
      "symbols": ["GCZ6", "GC.c.0"],       # bars: raw symbols, or continuous (ROOT.c.N)
      "live": true,                        # stream 1 m bars for the live chart
-     "quote_schema": "mbp-1",             # live quotes: "mbp-1" (top of book) or
-                                          # "mbp-10" (10 levels: the order book too)
+     "quote_schema": "mbp-1",             # live quotes: "mbp-1" (top of book),
+                                          # "mbp-10" (10 levels: the order book too) or
+                                          # "cmbp-1" (top of book WITH CME's implied prices)
      "clients": []}                       # allowlist; empty = any client with the token
 
 A DATA-ONLY gateway: it serves historical bars (``fetch_ohlcv``), the cost of
@@ -62,9 +63,10 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _CONTINUOUS_RE = re.compile(r"^[A-Z0-9]+\.[cnv]\.\d+$", re.IGNORECASE)
 _KNOWN = {"name", "venue", "listen_port", "dataset", "symbols", "live", "quote_schema",
           "clients", "_comment"}
-#: the live quote schemas: top of book, or the 10-level book (a ticker that
-#: also carries the book, ``info["book"]``)
-QUOTE_SCHEMAS = ("mbp-1", "mbp-10")
+#: the live quote schemas: top of book, the 10-level book (a ticker that
+#: also carries the book, ``info["book"]``), or the consolidated top of book
+#: (direct + implied: what TWS shows for a back month)
+QUOTE_SCHEMAS = ("mbp-1", "mbp-10", "cmbp-1")
 
 
 class ConfigError(ValueError):
@@ -153,6 +155,19 @@ def listen_port_of(name_or_path: str) -> int:
         return int(raw.get("listen_port") or DEFAULT_LISTEN_PORT)
     except (TypeError, ValueError):
         raise ConfigError(f"{d / CONFIG_NAME}: listen_port is a number") from None
+
+
+def dataset_of(name_or_path: str) -> str:
+    """The dataset a Databento gateway serves, from its ``gateway.json``
+    alone (like :func:`listen_port_of`)."""
+    d = _resolve(str(name_or_path))
+    try:
+        raw = json.loads((d / CONFIG_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"{d / CONFIG_NAME}: {e}") from None
+    if (raw.get("venue") or "") != "databento":
+        raise ConfigError(f"{d.name} is not a Databento gateway")
+    return str(raw.get("dataset") or DEFAULT_DATASET).strip()
 
 
 def parse_symbols(raw) -> list[str]:

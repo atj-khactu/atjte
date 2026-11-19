@@ -605,6 +605,160 @@ def fixed_entry_exit_levels(pos: float, size: float,
     return out
 
 
+def smoothed_bands(closes: list[float], sma: int, window: int
+                   ) -> Optional[tuple[float, float, float]]:
+    """The bollinger_smooth bot's signal, on 1-min spread closes (oldest
+    first, completed minutes only): ``X`` = the ``sma``-minute simple moving
+    average of the closes, ``M`` = the ``window``-minute SMA of X and ``σ``
+    = the ``window``-minute SAMPLE standard deviation of X (ddof 1, as a
+    pandas ``rolling().std()``). Returns ``(x, m, sd)`` for the newest
+    minute, or None while fewer than ``sma + window − 1`` closes exist."""
+    sma, window = int(sma), int(window)
+    if sma < 1 or window < 2 or len(closes) < sma + window - 1:
+        return None
+    tail = closes[-(sma + window - 1):]
+    xs = [sum(tail[i:i + sma]) / sma for i in range(window)]
+    m = sum(xs) / window
+    sd = math.sqrt(sum((v - m) ** 2 for v in xs) / (window - 1))
+    return xs[-1], m, sd
+
+
+def _exit_clip(pos: float, clip: float, floor: float) -> float:
+    """One exit pair's size: a clip of the position, or the whole remainder
+    when what a clip would leave is under the venue minimum (dust)."""
+    held = abs(pos)
+    size = held if held - clip < floor else min(clip, held)
+    return round(size, 8)
+
+
+def smoothed_band_orders(pos: float, x: float, m: float, sd: float, *,
+                         ladder: list, cap: float, short_cap: Optional[float],
+                         clip: float, min_gap: float = 0.0,
+                         hold_beyond: Optional[float] = None,
+                         exit_mult: float = 0.0, zero_rule: bool = True,
+                         short: bool = True, min_size: float = 0.0,
+                         levels: bool = False) -> list[DesiredOrder]:
+    """The bollinger_smooth bot's orders on a SIGNED position, from its
+    signal (:func:`smoothed_bands`): a SIGNAL, not resting levels — an order
+    exists only while its condition holds, and the engine executes it at the
+    market (EXECUTION_MODE 'market').
+
+    ``levels``: the LIVE-price trigger (the engine's BASIS_TRIGGER) — the
+    orders are the LEVELS instead, and the engine fires each only while the
+    live side-aware basis is through it (min/max mode: the whole window):
+    the exit at ``M ± exit_mult·σ`` whenever a position is held (and ``|X|
+    <= hold_beyond``), the NEXT rung on the held side (or the first rung on
+    both sides from flat) at ``M ∓ D_i``, sized to that rung's headroom.
+    X then only gates the hold; ``zero_rule`` tests the rung's level (a
+    long rung only below 0, a short rung only above 0).
+
+    - **Ladder** ``[(cum_fraction_of_cap, k), ...]`` (fractions strictly
+      rising to 1.0): rung i's distance from M is ``D_i = max(k_i·σ,
+      k_i·min_gap)`` — never closer than ``k_i × min_gap`` spread points.
+    - **Entries, long**: the deepest rung with ``X < M − D_i`` (and, under
+      ``zero_rule``, ``X < 0``) sets the target ``frac_i × cap``; while the
+      long holds less, one BUY of ``min(clip, target − long)`` — only from
+      flat or long. Short mirrored: ``X > M + D_i`` (and ``X > 0``), capped
+      by ``short_cap`` (None = ``cap``), only from flat or short. A rung the
+      signal leaves again is NOT sold: the position waits for the exit.
+    - **Exit**: the whole position, in clips of ``clip`` (one pair each, like
+      the entries; the last clip takes any remainder), once X is back at
+      ``M ± exit_mult·σ`` (a long when ``X >= M + exit_mult·σ``, a short when
+      ``X <= M − exit_mult·σ``), and only while ``|X| <= hold_beyond`` (None
+      = no hold filter). One order of the whole position made a Blueberry
+      close of nine tickets at once (2026-11-17).
+
+    ``level`` carries the band level the rule fired on (spread points, for
+    the logs and the paper book); sizes are hard-clamped to the caps and
+    orders below ``min_size`` are dropped. A tranche target is rounded to 6
+    decimals, so a third written 0.3333333333 makes whole clips."""
+    floor = max(min_size, EPS)
+    out: list[DesiredOrder] = []
+    if levels:
+        return _smoothed_levels(pos, x, m, sd, ladder=ladder, cap=cap,
+                                short_cap=short_cap, clip=clip, min_gap=min_gap,
+                                hold_beyond=hold_beyond, exit_mult=exit_mult,
+                                zero_rule=zero_rule, short=short, floor=floor)
+    if abs(pos) >= floor:
+        long_ = pos > 0
+        lvl = m + exit_mult * sd if long_ else m - exit_mult * sd
+        back = x >= lvl if long_ else x <= lvl
+        if back and (hold_beyond is None or abs(x) <= float(hold_beyond) + EPS):
+            out.append(DesiredOrder("bsm-exit-L" if long_ else "bsm-exit-S",
+                                    "sell" if long_ else "buy", "exit", 1,
+                                    round(lvl, 4) + 0.0, _exit_clip(pos, clip, floor)))
+            return out
+
+    def _rung(sign: int) -> Optional[tuple[int, float, float]]:
+        best = None
+        for i, (frac, k) in enumerate(ladder):
+            d = max(float(k) * sd, float(k) * float(min_gap))
+            lvl = m + sign * d
+            through = x > lvl if sign > 0 else x < lvl
+            zero_ok = (not zero_rule) or (x > 0.0 if sign > 0 else x < 0.0)
+            if through and zero_ok:
+                best = (i + 1, float(frac), lvl)
+        return best
+
+    if pos > -floor:                                     # flat or long: buy side
+        r = _rung(-1)
+        if r is not None:
+            i, frac, lvl = r
+            size = min(clip, round(frac * cap, 6) - max(pos, 0.0))
+            if size >= floor:
+                out.append(DesiredOrder(f"bsm-entry-L{i}", "buy", "entry", i,
+                                        round(lvl, 4) + 0.0, round(size, 8)))
+    s_cap = cap if short_cap is None else short_cap
+    if short and s_cap > 0 and pos < floor:              # flat or short: sell side
+        r = _rung(+1)
+        if r is not None:
+            i, frac, lvl = r
+            size = min(clip, round(frac * s_cap, 6) - max(-pos, 0.0))
+            if size >= floor:
+                out.append(DesiredOrder(f"bsm-entry-S{i}", "sell", "entry", i,
+                                        round(lvl, 4) + 0.0, round(size, 8)))
+    return out
+
+
+def _smoothed_levels(pos: float, x: float, m: float, sd: float, *, ladder: list,
+                     cap: float, short_cap: Optional[float], clip: float, min_gap: float,
+                     hold_beyond: Optional[float], exit_mult: float, zero_rule: bool,
+                     short: bool, floor: float) -> list[DesiredOrder]:
+    """:func:`smoothed_band_orders` with ``levels``: the exit and the next
+    rung of each side the position may grow on, as levels for the engine's
+    live basis trigger."""
+    out: list[DesiredOrder] = []
+    if abs(pos) >= floor:
+        long_ = pos > 0
+        lvl = m + exit_mult * sd if long_ else m - exit_mult * sd
+        if hold_beyond is None or abs(x) <= float(hold_beyond) + EPS:
+            out.append(DesiredOrder("bsm-exit-L" if long_ else "bsm-exit-S",
+                                    "sell" if long_ else "buy", "exit", 1,
+                                    round(lvl, 4) + 0.0, _exit_clip(pos, clip, floor)))
+
+    def _next(sign: int, held: float, side_cap: float) -> None:
+        for i, (frac, k) in enumerate(ladder):
+            target = round(float(frac) * side_cap, 6)
+            if held + floor > target:
+                continue                                 # this rung is full
+            lvl = m + sign * max(float(k) * sd, float(k) * float(min_gap))
+            if zero_rule and not (lvl > 0.0 if sign > 0 else lvl < 0.0):
+                return
+            size = min(clip, target - held)
+            if size >= floor:
+                out.append(DesiredOrder(f"bsm-entry-{'S' if sign > 0 else 'L'}{i + 1}",
+                                        "sell" if sign > 0 else "buy", "entry", i + 1,
+                                        round(lvl, 4) + 0.0, round(size, 8)))
+            return
+
+    if pos > -floor:                                     # flat or long
+        _next(-1, max(pos, 0.0), cap)
+    s_cap = cap if short_cap is None else short_cap
+    if short and s_cap > 0 and pos < floor:              # flat or short
+        _next(+1, max(-pos, 0.0), s_cap)
+    return out
+
+
 def one_per_side(orders: list[DesiredOrder]) -> list[DesiredOrder]:
     """At most ONE buy and ONE sell: keep only the order nearest the market
     on each side (highest buy level, lowest sell level; ties keep the first

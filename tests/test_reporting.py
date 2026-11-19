@@ -769,5 +769,19 @@ class BookBlockTest(unittest.TestCase):
         self.assertIs(v["book"], b)
 
 
+
+class VenueSwapTest(unittest.TestCase):
+    """An MT5 quote leg's swap terms ride in the venue block (the panel's
+    Open Positions annualizes them); every other venue writes none."""
+
+    def test_carried_only_when_given(self):
+        terms = {"mode": 1, "long": -60.0, "short": 10.0, "point": 0.01}
+        b = R.venue_block(venue_id="mt5", symbol="XAUUSD247.i", market_kind="swap",
+                          unit_label="oz", contract_size=100.0, swap=terms)
+        self.assertEqual(b["swap"], terms)
+        b = R.venue_block(venue_id="hyperliquid", symbol="X", market_kind="swap",
+                          unit_label="oz")
+        self.assertNotIn("swap", b)
+
 if __name__ == "__main__":
     unittest.main()

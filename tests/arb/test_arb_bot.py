@@ -110,6 +110,8 @@ class StubVenue:
         self._order = order
         self._get_order_error = get_order_error
         self._can_amend = can_amend
+        self.amend_replaces = False
+        self.edited = []
         # live figures
         self.position_units = None
         self.entry_px = self.upnl = self.ufunding = self.liq_px = None
@@ -233,6 +235,8 @@ class StubVenue:
         return StubOrder(0.0, order_id=f"o{len(self.placed)}")
 
     def edit_limit(self, order_id, side, price, units=None):
+        self.edited.append({"order_id": order_id, "side": side,
+                            "price": price, "units": units})
         return self.exchange.edit_order(order_id, self.symbol, "limit", side,
                                         None, price)
 
@@ -369,6 +373,94 @@ def resting(key="boll-exit", amount=1.0, booked=0.0, side="sell", purpose="exit"
     return OrderRec(key=key, side=side, purpose=purpose, level_index=1, level=0.5,
                     order_id="o1", price=4450.0, amount=amount, booked=booked)
 
+
+
+class AmendSizeTest(unittest.TestCase):
+    """A venue whose amend REPLACES the order is sent what is still UNFILLED.
+
+    Hyperliquid's modify re-issues the order, so the original size rests a
+    whole new order beside the part that already filled. Reported by a client
+    on atjte 0.2.22: 69.46 placed, 0.53 + 0.12 filled, amended at 69.46 ->
+    70.11 actually bought while booking stayed capped at 69.46. The size was
+    added on 2026-09-13 (6c6c089); before that no size was sent at all.
+    """
+
+    def _bot(self, replaces):
+        bot = make_bot([])
+        v = StubVenue(StubExchange())
+        v.amend_replaces = replaces
+        bot.venue = v
+        return bot, v
+
+    def test_a_replacing_venue_is_sent_only_what_is_unfilled(self):
+        bot, v = self._bot(True)
+        rec = resting(amount=69.46, booked=0.65)
+        rec.ws_cum = 0.65
+        bot.orders[rec.key] = rec
+        self.assertEqual(bot._amend(rec, {"price": 4460.0, "level": 1.5}), "amended")
+        self.assertAlmostEqual(v.edited[-1]["units"], 68.81)
+
+    def test_an_in_place_venue_still_gets_the_order_size(self):
+        bot, v = self._bot(False)
+        rec = resting(amount=69.46, booked=0.65)
+        rec.ws_cum = 0.65
+        bot.orders[rec.key] = rec
+        bot._amend(rec, {"price": 4460.0, "level": 1.5})
+        self.assertAlmostEqual(v.edited[-1]["units"], 69.46)
+
+    def test_a_fill_that_arrived_but_is_not_booked_yet_still_counts(self):
+        """The window an amend lands in: ws_cum runs ahead of booked, and
+        remaining (booked-only) would re-rest the fill still in flight."""
+        bot, v = self._bot(True)
+        rec = resting(amount=69.46, booked=0.0)
+        rec.ws_cum = 0.65
+        bot.orders[rec.key] = rec
+        self.assertAlmostEqual(rec.remaining, 69.46)      # stale by the fill
+        self.assertAlmostEqual(rec.unfilled, 68.81)       # what we send
+        bot._amend(rec, {"price": 4460.0, "level": 1.5})
+        self.assertAlmostEqual(v.edited[-1]["units"], 68.81)
+
+    def test_nothing_unfilled_settles_instead_of_sending_a_zero_amend(self):
+        bot, v = self._bot(True)
+        rec = resting(amount=1.0, booked=1.0)
+        bot.orders[rec.key] = rec
+        self.assertEqual(bot._amend(rec, {"price": 4460.0, "level": 1.5}), "settled")
+        self.assertEqual(v.edited, [])
+
+    def test_the_whole_amend_chain_can_still_only_fill_the_order_size(self):
+        """The invariant the cap relies on: filled + what rests == amount."""
+        bot, v = self._bot(True)
+        rec = resting(amount=69.46, booked=0.0)
+        bot.orders[rec.key] = rec
+        rec.ws_cum = 0.53
+        bot._amend(rec, {"price": 4460.0, "level": 1.5})
+        rec.ws_cum = 0.65
+        bot._amend(rec, {"price": 4461.0, "level": 1.6})
+        self.assertAlmostEqual(rec.ws_cum + v.edited[-1]["units"], rec.amount)
+
+
+class OverfillNoticeTest(unittest.TestCase):
+    """A venue reporting more filled than the order was placed for is capped,
+    but no longer silently: the cap is what hid this for two months."""
+
+    def test_an_overfill_is_counted_and_still_capped(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange())
+        rec = resting(amount=1.0)
+        rec.rest_cum = 1.25
+        bot.orders[rec.key] = rec
+        bot._book(rec, source="poll")
+        self.assertAlmostEqual(bot.counters.get("overfilled_units"), 0.25)
+        self.assertAlmostEqual(rec.booked, 1.0)
+
+    def test_an_order_filled_to_its_size_is_not_an_overfill(self):
+        bot = make_bot([])
+        bot.venue = StubVenue(StubExchange())
+        rec = resting(amount=1.0)
+        rec.rest_cum = 1.0
+        bot.orders[rec.key] = rec
+        bot._book(rec, source="poll")
+        self.assertIsNone(bot.counters.get("overfilled_units"))
 
 
 class ClassifyTest(unittest.TestCase):
@@ -1490,6 +1582,109 @@ class MinOrderIntervalTest(unittest.TestCase):
         self.assertEqual(len(bot._order_interval_gate(self._orders(), now=1000.5)), 2)
 
 
+class TobOnlyAndLiveTriggerTest(unittest.TestCase):
+    """QUOTE_AT_TOB_ONLY: a maker quote rests only AT the top of the book
+    (the best bid / ask, or pinned at the MIN_TOB_SPREAD edge); behind it it
+    is held off. BASIS_TRIGGER_LIVE: an order armed on the average quotes
+    only while the live limit + market basis is through its level too
+    (GC, 2026-11-17)."""
+
+    def setUp(self):
+        self._orig = (pb.MIN_TOB_SPREAD, pb.HEDGE_RATIO, pb.BASIS_TRIGGER,
+                      pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE, pb.BASIS_TRIGGER_LIVE)
+        pb.HEDGE_RATIO, pb.MIN_TOB_SPREAD = 1.0, 0.2
+
+    def tearDown(self):
+        (pb.MIN_TOB_SPREAD, pb.HEDGE_RATIO, pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE,
+         pb.BASIS_RELEASE, pb.BASIS_TRIGGER_LIVE) = self._orig
+
+    def _bot(self, logs=None):
+        bot = make_bot(logs if logs is not None else [])
+        bot.xau_bid, bot.xau_ask, bot.xau_mid = 3474.0, 3474.1, 3474.05
+        # the CME book: best bid 3550.0, best ask 3550.5
+        bot.venue_ticker = types.SimpleNamespace(mid=3550.25, bid=3550.0, ask=3550.5)
+        return bot
+
+    def test_a_quote_behind_the_touch_is_held_and_at_it_is_kept(self):
+        logs = []
+        bot = self._bot(logs)
+        self.assertTrue(bot._at_tob("b", "buy", 3550.0))     # joins the best bid
+        self.assertTrue(bot._at_tob("b", "buy", 3550.2))     # improves it
+        self.assertTrue(bot._at_tob("b", "buy", 3550.3))     # the MIN_TOB edge (ask - 0.2)
+        self.assertFalse(bot._at_tob("b", "buy", 3549.9))    # behind the bid
+        self.assertTrue(any("held off the book" in m for m in logs))
+        self.assertTrue(bot._at_tob("s", "sell", 3550.5))
+        self.assertTrue(bot._at_tob("s", "sell", 3550.2))    # the edge (bid + 0.2)
+        self.assertFalse(bot._at_tob("s", "sell", 3550.6))   # behind the ask
+        self.assertTrue(bot._at_tob("b", "buy", 3550.0))
+        self.assertTrue(any("top of book again" in m for m in logs))
+
+    def test_the_live_basis_must_be_through_the_level_too(self):
+        bot = self._bot()
+        # live buy basis = 3550.0 - 3474.0 = 76.0, sell basis = 3550.5 - 3474.1 = 76.4
+        buy = DesiredOrder(key="b", side="buy", purpose="entry", level_index=1,
+                           level=76.0, size=1.0)
+        sell = DesiredOrder(key="s", side="sell", purpose="entry", level_index=1,
+                            level=76.4, size=1.0)
+        self.assertTrue(bot._live_basis_through(buy))
+        self.assertTrue(bot._live_basis_through(sell))
+        bot.venue_ticker = types.SimpleNamespace(mid=3550.35, bid=3550.2, ask=3550.5)
+        self.assertFalse(bot._live_basis_through(buy))        # 76.2 > 76.0
+
+    def test_armed_on_the_average_but_not_live_rests_nothing(self):
+        pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE = True, "avg", 0.1
+        bot = self._bot()
+        bot.basis_avg_bid, bot.basis_avg_ask = 75.0, 80.0   # the average: armed
+        buy = DesiredOrder(key="b", side="buy", purpose="entry", level_index=1,
+                           level=75.5, size=1.0)
+        pb.BASIS_TRIGGER_LIVE = False
+        self.assertEqual(len(bot._basis_gate([buy])), 1)
+        pb.BASIS_TRIGGER_LIVE = True                         # live 76.0 > 75.5
+        self.assertEqual(bot._basis_gate([buy]), [])
+        self.assertTrue(bot._basis_armed["b"])               # still armed on the average
+        bot.venue_ticker = types.SimpleNamespace(mid=3549.6, bid=3549.4, ask=3549.8)
+        self.assertEqual(len(bot._basis_gate([buy])), 1)     # live 75.4 <= 75.5
+
+
+class LiveTriggerReleaseTest(TobOnlyAndLiveTriggerTest):
+    """An order the live check put up stays up until the live basis is back
+    inside by more than BASIS_RELEASE (GC, 2026-11-17: strictly at the level
+    it was pulled and re-placed 23 times in 16 s)."""
+
+    def test_up_when_through_held_within_the_release_off_past_it(self):
+        pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE = True, "avg", 0.1
+        pb.BASIS_TRIGGER_LIVE = True
+        bot = self._bot()
+        bot.basis_avg_bid, bot.basis_avg_ask = 75.0, 80.0
+        buy = DesiredOrder(key="b", side="buy", purpose="exit", level_index=1,
+                           level=75.5, size=1.0)
+
+        def live(bid):            # live buy basis = bid - MT5 bid 3474.0
+            bot.venue_ticker = types.SimpleNamespace(mid=bid + 0.25, bid=bid, ask=bid + 0.5)
+            return len(bot._basis_gate([buy]))
+        self.assertEqual(live(3549.55), 0)       # 75.55: not through, not up yet
+        self.assertEqual(live(3549.45), 1)       # 75.45: through -> up
+        self.assertEqual(live(3549.55), 1)       # 75.55: within the 0.1 release -> held
+        self.assertEqual(live(3549.59), 1)       # 75.59
+        self.assertEqual(live(3549.65), 0)       # 75.65: back by more than 0.1 -> off
+        self.assertEqual(live(3549.55), 0)       # and needs to be through again
+        self.assertEqual(live(3549.50), 1)
+
+
+class LiveBasisHeartbeatTest(TobOnlyAndLiveTriggerTest):
+    """The heartbeat's ``live_basis``: venue bid - ref bid / venue ask - ref
+    ask whatever BASIS_MODE the average uses (the panel's chart tags)."""
+
+    def test_bid_bid_and_ask_ask(self):
+        bot = self._bot()
+        bot.venue_ticker = types.SimpleNamespace(mid=3549.75, bid=3549.5, ask=3550.0)
+        lb = bot._live_basis_now()
+        self.assertAlmostEqual(lb["bid"], 3549.5 - bot.ref_bid)
+        self.assertAlmostEqual(lb["ask"], 3550.0 - bot.ref_ask)
+        bot.venue_ticker = None
+        self.assertIsNone(bot._live_basis_now())
+
+
 class MinTobSpreadTest(unittest.TestCase):
     """MIN_TOB_SPREAD: a maker quote keeps at least that PRICE distance from
     the opposite top of book (a sell from the best bid, a buy from the best
@@ -1689,6 +1884,18 @@ class HedgeGateTest(unittest.TestCase):
         self.assertIsNone(self.v(2.0, 1.0))                    # exactly the limit
         self.assertIsNotNone(self.v(2.01, 1.0))
         self.assertIsNone(self.v(1.0, 0.0))                    # no lot size: not judged
+
+    def test_a_gate_under_the_venue_step_passes(self):
+        """Mini-DAX: one contract = 5 units, a DE40 lot 0.1 unit — every fill is
+        at least the 1-unit gate, so nothing can sit unhedged under it."""
+        def v(value, step):
+            return pb.hedge_gate_verdict("HEDGE_THRESHOLD_UNITS", value, 0.1,
+                                         venue_step_units=step)
+        self.assertIsNone(v(1.0, 5.0))
+        self.assertIsNone(v(5.0, 5.0))                         # exactly one contract
+        self.assertIsNotNone(v(6.0, 5.0))                      # above it: warned
+        self.assertIsNotNone(v(1.0, 0.001))                    # crypto step: warned
+        self.assertIsNotNone(v(1.0, None))                     # step unknown: warned
 
     def test_startup_warns_and_starts(self):
         """A warning (log + the report), never a refusal: the operator decides."""
@@ -2856,6 +3063,75 @@ class EntryGateTest(unittest.TestCase):
         bot.basis_avg_bid, bot.basis_avg_ask = -1.0, 1.0   # exits at 0: buy-x armed (−1<=0), sell-x armed (1>=0)
         self.assertEqual({d.key for d in bot._desired_orders()}, {'buy-x', 'sell-x'})
 
+    def test_the_mt5_ticks_seen_are_kept_for_an_hour_and_written(self):
+        """mt5_ticks.json (the panel's tick analysis): every tick the bot
+        saw, pruned to MT5_TICKS_KEEP_S, written every MT5_TICKS_PERSIST_S."""
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "mt5_ticks.json"
+            self.addCleanup(setattr, pb, "MT5_TICKS_FILE", pb.MT5_TICKS_FILE)
+            pb.MT5_TICKS_FILE = f
+            bot = make_bot([])
+            bot._mt5_ticks, bot._mt5_ticks_persist_t = deque(), 0.0
+            now = time.time()
+            bot._record_mt5_tick(now - pb.MT5_TICKS_KEEP_S - 10, 1.0, 1.1, None)
+            bot._record_mt5_tick(now, 3860.58, 3860.67, 1794927558831)
+            rows = json.loads(f.read_text(encoding="utf-8"))["ticks"]
+            self.assertEqual(rows, [[round(now, 3), 3860.58, 3860.67, 1794927558831]])
+            bot._record_mt5_tick(now + 1, 3860.5, 3860.6, None)     # kept, not yet written
+            self.assertEqual(len(bot._mt5_ticks), 2)
+            self.assertEqual(len(json.loads(f.read_text(encoding="utf-8"))["ticks"]), 1)
+
+    def test_a_quote_past_its_max_age_is_pulled_and_rearms_on_a_fresh_window(self):
+        """MAX_QUOTE_AGE_S (GC, 2026-11-17): an order resting longer than the
+        limit is held off the book and disarmed; it is wanted again only
+        after BASIS_WINDOW_S, and the other side is not touched."""
+        orig = pb.MAX_QUOTE_AGE_S
+        self.addCleanup(setattr, pb, "MAX_QUOTE_AGE_S", orig)
+        logs = []
+        bot = make_bot(logs)
+        bot._basis_armed = {"buy-e": True}
+        buy, sell = _orders()[0], _orders()[2]
+        now = 1000.0
+        bot.orders = {"buy-e": pb.OrderRec(key="buy-e", side="buy", purpose="entry",
+                                           level_index=1, level=-1.0, order_id="1",
+                                           price=1.0, amount=1.0, placed_t=now - 16.0)}
+        pb.MAX_QUOTE_AGE_S = None
+        self.assertEqual(len(bot._quote_age_gate([buy, sell], now)), 2)
+        pb.MAX_QUOTE_AGE_S = 15.0
+        kept = bot._quote_age_gate([buy, sell], now)
+        self.assertEqual([d.key for d in kept], [sell.key])
+        self.assertNotIn("buy-e", bot._basis_armed)
+        self.assertTrue(any("MAX_QUOTE_AGE_S" in m for m in logs))
+        bot.orders = {}                                   # the cancel went through
+        self.assertEqual([d.key for d in bot._quote_age_gate([buy, sell], now + 1.0)],
+                         [sell.key])                     # still held: the window is not fresh
+        later = now + pb.BASIS_WINDOW_S
+        self.assertEqual(len(bot._quote_age_gate([buy, sell], later)), 2)
+
+    def test_a_stale_mt5_quote_rests_nothing(self):
+        """MT5_QUOTE_MAX_AGE_S (MGC, 2026-11-17 13:00 UTC: IC Markets froze
+        ~5 s and two bids priced off the frozen quote were filled 0.3-0.7
+        through their level): older than the limit, no order rests — exits
+        too — and it is said once; fresh again, everything is back."""
+        orig = pb.MT5_QUOTE_MAX_AGE_S
+        self.addCleanup(setattr, pb, "MT5_QUOTE_MAX_AGE_S", orig)
+        logs = []
+        bot = make_bot(logs)
+        bot._target_orders = lambda: [_orders()[0], _orders()[2]]   # buy-e, sell-x
+        now = time.time()
+        bot._mt5_change_t = now - 1.5
+        pb.MT5_QUOTE_MAX_AGE_S = None                    # off: the old behaviour
+        self.assertEqual({d.key for d in bot._desired_orders()}, {"buy-e", "sell-x"})
+        pb.MT5_QUOTE_MAX_AGE_S = 1.0
+        self.assertEqual(bot._desired_orders(), [])
+        self.assertTrue(bot.mt5_quote_stale)
+        self.assertEqual(bot._desired_orders(), [])
+        self.assertEqual(sum("MT5 quote" in m and "old" in m for m in logs), 1)
+        bot._mt5_change_t = time.time()                  # it ticks again
+        self.assertEqual({d.key for d in bot._desired_orders()}, {"buy-e", "sell-x"})
+        self.assertFalse(bot.mt5_quote_stale)
+        self.assertTrue(any("quoting resumes" in m for m in logs))
+
     def test_diverged_position_gates_entries_keeps_exits(self):
         bot = make_bot([])
         # one entry + one exit on opposite sides, so one_per_side keeps both
@@ -3310,6 +3586,894 @@ class SamePlatformTest(unittest.TestCase):
         pb.MT5_CLIENT_OPTIONS = {"gateway_port": 5621}
         pb.VENUE_CLIENT_OPTIONS = {"gateway_port": 5623, "magic": 77015}
         self._bot()._check_same_platform()
+
+
+class InferredFillTimeTest(unittest.TestCase):
+    """An inferred fill is recorded at the time it was BOOKED, not when the
+    record is written: a venue with no trade stream (an MT5 quote leg) never
+    confirms it, so it was written INFERRED_FILL_WAIT_S later and stamped
+    then - 30 s after its own hedge, which no chart could pair (2026-11-18:
+    deal 09:32:50.1, hedge 09:32:49.99, fill record 09:33:21)."""
+
+    def _bot(self):
+        bot = make_bot([])
+        rows = []
+        bot.reporter = types.SimpleNamespace(record_fill=lambda r: rows.append(r) or False)
+        rec = OrderRec(key="bsm-entry-L1", side="buy", purpose="entry", level_index=1,
+                       level=-9.67, order_id="63195324", price=3760.37, amount=5.0,
+                       taker=True)
+        return bot, rec, rows
+
+    def test_stamped_at_the_booking(self):
+        bot, rec, rows = self._bot()
+        rec.inferred_t = 1_794_992_196.9
+        bot._report_fill(rec, 5.0, "place")
+        self.assertEqual(rows[0]["ts"], 1_794_992_196.9)
+        self.assertTrue(rows[0]["inferred"])
+
+    def test_no_booking_time_is_now(self):
+        bot, rec, rows = self._bot()
+        t0 = time.time()
+        bot._report_fill(rec, 5.0, "settle")
+        self.assertGreaterEqual(rows[0]["ts"], t0)
+
+
+class EntryWaitsForThePositionTest(unittest.TestCase):
+    """No entry pair while the position figure is unconfirmed - a fill
+    landed by a position read, so the anchor may not hold it yet (2026-11-18
+    09:56:42: L1 sized from +5 oz while +10 was held). Exits still go."""
+
+    def _bot(self):
+        bot = make_bot([])
+        bot._pair_latched = None
+        bot._anchor_uncertain = True
+        bot.hedger = None
+        bot.venue = types.SimpleNamespace(
+            place_market=lambda *a, **k: (_ for _ in ()).throw(AssertionError("sent")))
+        bot._basis_armed["k"] = True
+        return bot
+
+    def test_an_entry_waits_and_is_disarmed(self):
+        bot = self._bot()
+        bot._fire_pair("k", {"side": "buy", "purpose": "entry", "amount": 1.0,
+                             "price": 3760.0, "level": -9.8})
+        self.assertNotIn("k", bot._basis_armed)
+        self.assertIn("entry_unconfirmed", bot._last_msgs)
+
+    def test_a_dry_run_exit_is_not_held_back(self):
+        bot = self._bot()
+        bot._placeable_amount = lambda key, t: None      # stop right after the guard
+        bot._fire_pair("k", {"side": "sell", "purpose": "exit", "amount": 1.0,
+                             "price": 3760.0, "level": -8.9})
+        self.assertNotIn("entry_unconfirmed", bot._last_msgs)
+        self.assertNotIn("exit_unconfirmed", bot._last_msgs)
+
+    def test_a_live_exit_waits_too(self):
+        """2026-11-18 19:02:08: the fill of 19:02:03 was left out of the
+        position (it landed by a read), the forced exit sold the +1 that was
+        already gone and opened -1. Live, an exit waits for the read."""
+        bot = self._bot()
+        bot._placeable_amount = lambda key, t: self.fail("sized")
+        with mock.patch.object(pb, "LIVE_TRADING", True):
+            bot._fire_pair("k", {"side": "sell", "purpose": "exit", "amount": 1.0,
+                                 "price": 3760.0, "level": -8.9})
+        self.assertIn("exit_unconfirmed", bot._last_msgs)
+        self.assertTrue(bot._bal_dirty)
+
+    def test_a_live_exit_closes_nothing_the_venue_reads_flat(self):
+        bot = self._bot()
+        bot._anchor_uncertain = False
+        bot._venue_read_units, bot._venue_read_t, bot._last_fill_t = 0.0, 200.0, 100.0
+        bot._position_units = lambda: 1.0                 # the bot's own figure
+        bot._placeable_amount = lambda key, t: self.fail("sized")
+        with mock.patch.object(pb, "LIVE_TRADING", True):
+            bot._fire_pair("k", {"side": "sell", "purpose": "exit", "amount": 1.0,
+                                 "price": 3760.0, "level": -8.9})
+        self.assertTrue(any(k.startswith("exit_contra_k") for k in bot._last_msgs))
+
+
+class DeriskConfirmTest(unittest.TestCase):
+    """One threshold reading arms nothing: a balance read at least
+    DERISK_CONFIRM_S later must still breach it (2026-11-18 18:59:56: the IC
+    account's margin level read 138% while its figures said ~54,000%)."""
+
+    def setUp(self):
+        self._orig = (pb.DERISK_MT5_MARGIN_LEVEL, pb.DERISK_VENUE_AVAILABLE_MARGIN_USD,
+                      pb.DERISK_VENUE_LIQ_DISTANCE_PCT, pb.DERISK_MT5_FREE_MARGIN, pb._log)
+        pb.DERISK_VENUE_AVAILABLE_MARGIN_USD = pb.DERISK_VENUE_LIQ_DISTANCE_PCT = None
+        pb.DERISK_MT5_FREE_MARGIN = None
+        pb.DERISK_MT5_MARGIN_LEVEL = 150.0
+
+    def tearDown(self):
+        (pb.DERISK_MT5_MARGIN_LEVEL, pb.DERISK_VENUE_AVAILABLE_MARGIN_USD,
+         pb.DERISK_VENUE_LIQ_DISTANCE_PCT, pb.DERISK_MT5_FREE_MARGIN, pb._log) = self._orig
+
+    def _bot(self, logs):
+        bot = DeriskWiringTest._armed(26.0)
+        pb._log = lambda m, _a=logs: _a.append(m)
+        bot._bal_t = 1000.0
+        bot.mt5_margin_level = 138.0
+        return bot
+
+    def test_a_second_read_later_arms_it(self):
+        logs = []
+        bot = self._bot(logs)
+        bot._update_derisk()
+        self.assertFalse(bot.derisk_active)
+        self.assertTrue(any("re-reading before acting" in m for m in logs))
+        bot._bal_t = 1002.0                  # a read too soon confirms nothing
+        bot._update_derisk()
+        self.assertFalse(bot.derisk_active)
+        bot._bal_t = 1006.0
+        bot._update_derisk()
+        self.assertTrue(bot.derisk_active)
+        self.assertEqual((bot.derisk_side, bot.derisk_total_units), ("sell", 26.0))
+        self.assertTrue(any("hedge: level 138.00%" in m for m in logs))
+
+    def test_a_reading_not_repeated_arms_nothing(self):
+        logs = []
+        bot = self._bot(logs)
+        bot._update_derisk()
+        bot._bal_t, bot.mt5_margin_level = 1006.0, 54000.0
+        bot._update_derisk()
+        self.assertFalse(bot.derisk_active)
+        self.assertTrue(any("not confirmed" in m for m in logs))
+        self.assertIsNone(bot._derisk_seen)
+
+
+class DeriskDirectionTest(unittest.TestCase):
+    """The forced exit trades one way, at most what it set out to close
+    (+ one order of slack); anything else STOPS it (2026-11-18 19:02-19:39:
+    it sold 26 oz, then flip-flopped 1 oz for 40 minutes)."""
+
+    def setUp(self):
+        self._log = pb._log
+
+    def tearDown(self):
+        pb._log = self._log
+
+    def _bot(self, logs, pos=26.0):
+        bot = DeriskWiringTest._armed(pos)
+        pb._log = lambda m, _a=logs: _a.append(m)
+        bot.derisk_active, bot.derisk_side = True, "sell"
+        bot.derisk_total_units, bot.derisk_done_units = 26.0, 0.0
+        bot.derisk_stopped = None
+        bot.feed = types.SimpleNamespace(get_book=lambda: None)
+        return bot
+
+    def test_a_reversal_stops_it(self):
+        logs = []
+        bot = self._bot(logs, pos=-1.0)          # the figure says short: a buy
+        with mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "LIVE_TRADING", True):
+            self.assertEqual(bot._flatten_orders(), [])
+        self.assertIn("reverse", bot.derisk_stopped)
+        self.assertTrue(any("ERROR: LIQUIDATION THRESHOLD exit STOPPED" in m for m in logs))
+        bot.venue_pos_units = 5.0                # stopped stays stopped
+        bot._exit_chunk_t = None
+        with mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "LIVE_TRADING", True):
+            self.assertEqual(bot._flatten_orders(), [])
+
+    def test_past_its_total_stops_it(self):
+        bot = self._bot([], pos=1.0)
+        bot.derisk_done_units = 27.0             # 26 + one order of slack, all sold
+        with mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "LIVE_TRADING", True):
+            self.assertEqual(bot._flatten_orders(), [])
+        self.assertIn("still reads +1", bot.derisk_stopped)
+
+    def test_within_its_total_it_goes(self):
+        bot = self._bot([], pos=3.0)
+        bot.derisk_done_units = 23.0
+        with mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "LIVE_TRADING", True):
+            (o,) = bot._flatten_orders()
+        self.assertEqual((o.side, o.size), ("sell", 1.0))
+        self.assertIsNone(bot.derisk_stopped)
+
+    def test_the_maker_exit_is_guarded_too(self):
+        bot = self._bot([], pos=-2.0)
+        with mock.patch.object(pb, "MARKET_PAIR", False), \
+                mock.patch.object(pb, "LIQUIDATION_EXIT_MODE", "maker-pegged"):
+            self.assertEqual(bot._flatten_orders(), [])
+        self.assertIn("reverse", bot.derisk_stopped)
+
+    def test_no_chunk_while_the_last_fill_is_unconfirmed(self):
+        """19:02:03: the fill landed by a read and was left out of the
+        position; the next chunk must wait for the read, not sell again."""
+        bot = self._bot([], pos=1.0)
+        bot._anchor_uncertain = True
+        with mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "LIVE_TRADING", True):
+            self.assertEqual(bot._flatten_orders(), [])
+        self.assertTrue(bot._bal_dirty)
+        self.assertIsNone(bot.derisk_stopped)
+
+
+class PositionReadOwedTest(unittest.TestCase):
+    """A position read skipped in a market pair's settle is OWED, not
+    dropped (2026-11-18 19:02: the fill's re-read was spent on the skip and
+    the position went 18 s unread), and the position is synced at least
+    every POSITION_SYNC_S."""
+
+    def test_a_skipped_read_is_owed(self):
+        bot = make_bot([])
+        bot.venue = types.SimpleNamespace(read_position=lambda: self.fail("read"))
+        with mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "_is_paper", lambda: False), \
+                mock.patch.object(pb.time, "time", return_value=1001.0):
+            bot._last_fire_t = 1000.0
+            bot._read_venue_position()
+        self.assertTrue(bot._pos_read_owed)
+
+    @staticmethod
+    def _refresh_ran(bot, now):
+        ran = []
+
+        def margin():
+            ran.append(1)
+            raise ConnectionError("stop here")
+        bot.mt5 = types.SimpleNamespace(get_margin=margin)
+        bot._read_venue_position = lambda: None
+        bot._parity_watch = lambda now: None
+        try:
+            bot._refresh_balances(now)
+        except Exception:                                   # noqa: BLE001
+            pass
+        return bool(ran)
+
+    def test_the_owed_read_is_made_once_the_settle_is_over(self):
+        bot = make_bot([])
+        bot._bal_dirty, bot._bal_t = False, 1000.0
+        bot._last_fire_t, bot._pos_read_owed = 1000.0, True
+        bot._venue_read_t = 1000.0
+        with mock.patch.object(pb, "MARKET_PAIR", True):
+            self.assertFalse(self._refresh_ran(bot, 1002.0))     # still settling
+            self.assertTrue(self._refresh_ran(bot, 1003.5))
+
+    def test_the_position_is_synced_every_few_seconds(self):
+        bot = make_bot([])
+        bot._bal_dirty, bot._bal_t, bot._venue_read_t = False, 1000.0, 1000.0
+        with mock.patch.object(pb, "LIVE_TRADING", True), \
+                mock.patch.object(pb, "MARKET_PAIR", True), \
+                mock.patch.object(pb, "_is_paper", lambda: False):
+            self.assertFalse(self._refresh_ran(bot, 1005.0))
+            self.assertTrue(self._refresh_ran(bot, 1000.0 + pb.POSITION_SYNC_S + 0.1))
+
+    def test_a_resting_quote_bot_reads_as_before(self):
+        """Hyperliquid & co: no extra reads (request weight) - fills and
+        BALANCE_REFRESH_S drive them, as before."""
+        bot = make_bot([])
+        bot._bal_dirty, bot._bal_t, bot._venue_read_t = False, 1000.0, 1000.0
+        with mock.patch.object(pb, "LIVE_TRADING", True), \
+                mock.patch.object(pb, "MARKET_PAIR", False), \
+                mock.patch.object(pb, "_is_paper", lambda: False):
+            self.assertFalse(self._refresh_ran(bot, 1000.0 + pb.POSITION_SYNC_S + 0.1))
+
+    def test_a_threshold_reading_is_re_read_once_after_the_confirm_delay(self):
+        bot = make_bot([])
+        bot._bal_dirty, bot._bal_t = False, 1000.0
+        bot._derisk_seen = (1000.0, ["x"])
+        bot.derisk_active = False
+        self.assertFalse(self._refresh_ran(bot, 1002.0))
+        self.assertTrue(self._refresh_ran(bot, 1000.0 + pb.DERISK_CONFIRM_S + 0.1))
+
+
+class DirectionLockTest(unittest.TestCase):
+    """Close-only is ONE direction, and under it the exposure may only go
+    down: an order the other way is refused, a read that shows the position
+    grown or crossed zero HALTS the bot (2026-11-18 19:02-19:39: the forced
+    exit flip-flopped 1 oz for 40 minutes)."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = (pb.LIVE_TRADING, pb._log)
+        pb.LIVE_TRADING = True
+        self.logs = []
+        pb._log = lambda m, _a=self.logs: _a.append(m)
+
+    def tearDown(self):
+        pb.LIVE_TRADING, pb._log = self._orig
+        self._tmp.cleanup()
+
+    def _bot(self, pos=26.0):
+        bot = make_bot([])
+        pb._log = lambda m, _a=self.logs: _a.append(m)     # make_bot takes _log over
+        bot.venue_pos_units = pos
+        bot._anchor_uncertain = False
+        bot.risk_reasons = []
+        bot.derisk_active = False
+        bot._pair_latched = None
+        bot.venue = types.SimpleNamespace(cost_min=0.0, amount_min=1.0)
+        return bot
+
+    def test_close_only_takes_the_reducing_side(self):
+        bot = self._bot(26.0)
+        out = bot._update_direction_lock(["MT5 margin level 120% < 150%"])
+        self.assertEqual(bot.dir_lock["side"], "sell")
+        self.assertEqual(out, ["MT5 margin level 120% < 150%"])
+        self.assertTrue(bot._direction_blocked("k", "buy"))
+        self.assertFalse(bot._direction_blocked("k", "sell"))
+        self.assertTrue(any("SELL-ONLY" in m for m in self.logs))
+        short = self._bot(-3.0)
+        short._update_direction_lock(["x"])
+        self.assertEqual(short.dir_lock["side"], "buy")
+
+    def test_a_flat_or_unconfirmed_position_decides_nothing_yet(self):
+        bot = self._bot(0.0)
+        bot._update_direction_lock(["x"])
+        self.assertIsNone(bot.dir_lock["side"])
+        self.assertFalse(bot._direction_blocked("k", "buy"))
+        bot.venue_pos_units, bot._anchor_uncertain = 5.0, True
+        bot._update_direction_lock(["x"])
+        self.assertIsNone(bot.dir_lock["side"])
+        bot._anchor_uncertain = False
+        bot._update_direction_lock(["x"])
+        self.assertEqual(bot.dir_lock["side"], "sell")
+
+    def test_an_ordinary_lock_releases_with_close_only(self):
+        bot = self._bot(26.0)
+        bot._update_direction_lock(["MT5 margin read failed (x)"])
+        self.assertEqual(bot._update_direction_lock([]), [])
+        self.assertIsNone(bot.dir_lock)
+
+    def test_a_volume_cap_makes_it_sticky_until_restart(self):
+        bot = self._bot(26.0)
+        bot.day = pb.DayBook(date=pb._day())
+        bot.day.venue_volume_latched = True
+        bot._update_direction_lock(["daily the quote exchange volume limit hit (x)"])
+        self.assertTrue(bot.dir_lock["sticky"])
+        bot.day = pb.DayBook(date="2099-01-01")          # the day roll clears the cap...
+        out = bot._update_direction_lock([])
+        self.assertEqual(bot.dir_lock["side"], "sell")   # ... the lock holds
+        self.assertTrue(any("close-only until restart" in r for r in out))
+        for latch in ("derisk_active", "_pair_latched"):
+            b = self._bot(2.0)
+            setattr(b, latch, True)
+            b._update_direction_lock(["x"])
+            self.assertTrue(b.dir_lock["sticky"], latch)
+
+    def test_the_loss_limit_lock_releases_when_the_pnl_recovers(self):
+        """2026-11-18, the operator's rule: the max daily loss follows the
+        CURRENT PnL - close-only (one direction) while the loss stands,
+        trading normally again once it is back inside the limit."""
+        bot = self._bot(26.0)
+        bot.day = pb.DayBook(date=pb._day())
+        bot.risk_reasons = ["daily loss limit hit (today -510.00 USD <= -500)"]
+        bot._update_direction_lock(list(bot.risk_reasons))
+        self.assertEqual(bot.dir_lock["side"], "sell")
+        self.assertFalse(bot.dir_lock["sticky"])
+        bot.risk_reasons = []
+        self.assertEqual(bot._update_direction_lock([]), [])
+        self.assertIsNone(bot.dir_lock)
+
+    def test_twice_the_max_daily_loss_pauses_until_it_recovers(self):
+        """The operator's choice (2026-11-18): past 2x the max daily loss the
+        bot keeps running but sends nothing - exits included - and resumes
+        by itself once the loss is back above 2x."""
+        bot = self._bot(1.0)
+        bot._loss_hard_stop(-999.0, 500.0)
+        self.assertIsNone(getattr(bot, "_loss_paused", None))
+        bot._loss_hard_stop(-1000.0, 500.0)
+        self.assertIn("2x the max daily loss", bot._loss_paused)
+        self.assertIsNone(getattr(bot, "_halt_reason", None))       # not a halt
+        self.assertTrue(bot._direction_blocked("k", "sell"))        # exits too
+        self.assertEqual(bot._desired_orders(), [])
+        self.assertTrue(any("CRITICAL: PAUSED" in m for m in self.logs))
+        bot._loss_hard_stop(-990.0, 500.0)
+        self.assertIsNone(bot._loss_paused)
+        self.assertFalse(bot._direction_blocked("k", "sell"))
+        self.assertTrue(any("PAUSE lifted" in m for m in self.logs))
+
+    def _locked(self, pos=26.0):
+        bot = self._bot(pos)
+        bot._update_direction_lock(["x"])
+        bot.dir_lock["settle_until"] = 0.0          # the settle is over
+        return bot
+
+    def test_crossing_zero_halts(self):
+        bot = self._locked(26.0)
+        bot._check_exposure(-1.0, "test read")
+        self.assertIn("crossed zero", bot._halt_reason)
+        self.assertTrue(any("CRITICAL: TRADING HALTED" in m for m in self.logs))
+        self.assertTrue(bot._direction_blocked("k", "sell"))   # nothing more at all
+
+    def test_exposure_growing_halts_and_shrinking_ratchets(self):
+        bot = self._locked(26.0)
+        bot._check_exposure(20.0, "read")
+        bot._check_exposure(20.3, "read")           # within the tolerance (0.5 here)
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+        bot._check_exposure(10.0, "read")
+        self.assertEqual(bot.dir_lock["floor"], 10.0)
+        bot._check_exposure(12.0, "read")
+        self.assertIn("GREW from 10", bot._halt_reason)
+
+    def test_orders_in_flight_may_fill_in_the_settle(self):
+        bot = self._bot(26.0)
+        bot._update_direction_lock(["x"])           # settle_until = now + LOCK_SETTLE_S
+        bot._check_exposure(27.0, "read")           # an entry already on its way
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+        self.assertEqual(bot.dir_lock["floor"], 27.0)
+
+    def test_a_dry_run_never_halts(self):
+        bot = self._locked(26.0)
+        pb.LIVE_TRADING = False
+        bot._check_exposure(-5.0, "read")
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+
+    def test_a_halt_keeps_the_bot_running_with_trading_off(self):
+        """The operator's rule (2026-11-18): a halt never stops the bot - it
+        keeps running, nothing rests, nothing is sent or amended."""
+        bot = self._locked(26.0)
+        bot._check_exposure(-1.0, "read")
+        self.assertEqual(bot._desired_orders(), [])
+        self.assertEqual(bot._amend(types.SimpleNamespace(key="k", side="sell"), {}), "resting")
+        self.assertTrue(bot._direction_blocked("k", "sell"))
+        out = bot._update_direction_lock(["x"])
+        bot._margin_reasons, bot.risk_reasons = [], []
+        bot._update_gate_reasons()
+        self.assertTrue(any("TRADING HALTED" in r for r in bot.close_only_reasons))
+
+    def test_both_send_paths_refuse_the_wrong_side(self):
+        bot = self._locked(26.0)
+        bot._placeable_amount = lambda key, t: self.fail("sized")
+        bot._place("k", {"side": "buy", "purpose": "exit", "amount": 1.0, "price": 1.0})
+        bot._fire_pair("k", {"side": "buy", "purpose": "exit", "amount": 1.0, "price": 1.0,
+                             "level": 0.0})
+        self.assertIn("dir_lock_k_buy", bot._last_msgs)
+
+    def test_a_wrong_side_fill_halts_at_once(self):
+        bot = self._locked(26.0)
+        bot._check_fill_side("sell", 1.0, "risk-flatten")          # the right way
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+        bot._check_fill_side("buy", 1.0, "risk-flatten")
+        self.assertIn("FILLED a buy", bot._halt_reason)
+
+    def test_a_fill_past_what_the_read_left_halts_at_that_fill(self):
+        """19:02:08 replayed per fill: the read said +1, a 1 oz sell took it
+        to 0, the next 1 oz sell crossed zero - halted on that fill."""
+        bot = self._locked(26.0)
+        bot._check_exposure(1.0, "read")
+        bot._check_fill_side("sell", 1.0, "risk-flatten")
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+        bot._check_fill_side("sell", 1.0, "risk-flatten")
+        self.assertIn("crossed zero", bot._halt_reason)
+
+    def test_a_fill_by_a_read_is_not_counted_twice(self):
+        bot = self._locked(26.0)
+        bot._check_exposure(1.0, "read")       # may already hold the next fill
+        bot._anchor_uncertain = True
+        bot._check_fill_side("sell", 1.0, "risk-flatten")
+        bot._check_fill_side("sell", 1.0, "risk-flatten")
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+
+    def test_a_wrong_side_fill_in_the_settle_is_an_order_in_flight(self):
+        bot = self._bot(26.0)
+        bot._update_direction_lock(["x"])
+        bot._check_fill_side("buy", 1.0, "bsm-entry-L1")
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+
+    def test_the_19_02_sequence_halts_at_the_first_overshoot(self):
+        """The replay: the forced exit armed on +26, sold down; the read after
+        19:02:08 showed -1. The bot halts there instead of buying it back."""
+        bot = self._bot(26.0)
+        bot.derisk_active = True
+        bot._update_direction_lock(["liquidation threshold hit (sticky until restart): x"])
+        bot.dir_lock["settle_until"] = 0.0
+        for read in (25.0, 12.0, 3.0, 1.0, 0.0):
+            bot._check_exposure(read, "mt5's position read")
+        self.assertIsNone(getattr(bot, "_halt_reason", None))
+        bot._check_exposure(-1.0, "mt5's position read")
+        self.assertIn("crossed zero under the SELL-ONLY lock", bot._halt_reason)
+
+
+class VolumeCapTest(unittest.TestCase):
+    """The daily volume caps, per order: a market order RESERVES its notional
+    before it is sent, a limit entry is placed only while everything resting
+    could fill under the cap, the cap is checked on every fill, and the
+    broker's deals are the floor of the count (a reject that filled anyway
+    is never uncounted)."""
+
+    def setUp(self):
+        self._orig = (pb.MAX_DAILY_VENUE_VOLUME_USD, pb.MAX_DAILY_MT5_VOLUME_USD, pb._log,
+                      pb.VOL_RES_SETTLE_S)
+        pb.MAX_DAILY_VENUE_VOLUME_USD = pb.MAX_DAILY_MT5_VOLUME_USD = 10_000.0
+
+    def tearDown(self):
+        (pb.MAX_DAILY_VENUE_VOLUME_USD, pb.MAX_DAILY_MT5_VOLUME_USD, pb._log,
+         pb.VOL_RES_SETTLE_S) = self._orig
+
+    def _bot(self):
+        bot = make_bot([])
+        self.logs = []
+        pb._log = lambda m, _a=self.logs: _a.append(m)
+        bot._limit = lambda name, value: value
+        bot.day = pb.DayBook(date=pb._day())
+        return bot
+
+    def test_an_entry_is_refused_past_the_cap_an_exit_never(self):
+        bot = self._bot()
+        bot.day.venue_volume_usd = 9_000.0
+        self.assertIsNotNone(bot._vol_reserve("venue", 900.0, "entry", "L1"))
+        self.assertIsNone(bot._vol_reserve("venue", 200.0, "entry", "L1"))   # 10,100
+        self.assertIn("venue", bot._vol()["hit"])
+        self.assertTrue(any("CLOSE-ONLY" in m for m in self.logs))
+        self.assertIsNotNone(bot._vol_reserve("venue", 5_000.0, "exit", "x"))
+        self.assertIsNotNone(bot._vol_reserve("mt5", 50_000.0, "hedge", "hedge"))
+
+    def test_the_count_is_the_larger_of_bot_and_broker_plus_reservations(self):
+        bot = self._bot()
+        bot.day.mt5_volume_usd = 3_000.0
+        v = bot._vol()
+        v["broker"]["mt5"], v["broker_day"] = 4_000.0, bot.day.date
+        bot._vol_reserve("mt5", 500.0, "hedge", "hedge")
+        self.assertEqual(bot._vol_counted("mt5"), 4_500.0)
+        v["broker_day"] = "1999-01-01"                       # yesterday's deals: no floor
+        self.assertEqual(bot._vol_counted("mt5"), 3_500.0)
+
+    def test_a_fill_settles_the_reservation_a_reject_keeps_it(self):
+        bot = self._bot()
+        full = bot._vol_reserve("venue", 1_000.0, "entry", "L1")
+        bot._vol_settle(full, 1_000.0)
+        part = bot._vol_reserve("venue", 1_000.0, "entry", "L1")
+        bot._vol_settle(part, 400.0)
+        rej = bot._vol_reserve("venue", 1_000.0, "entry", "L1")
+        bot._vol_settle(rej, 0.0)
+        res = bot._vol()["res"]
+        self.assertNotIn(full, res)
+        self.assertAlmostEqual(res[part]["usd"], 600.0)
+        self.assertEqual(res[rej]["usd"], 1_000.0)
+
+    def test_a_filled_hedge_is_released_when_it_is_booked(self):
+        bot = self._bot()
+        tok = bot._vol_reserve("mt5", 3_700.0, "hedge", "hedge")
+        bot._vol_settle(tok, 3_700.0, order_id=77)
+        self.assertIn(tok, bot._vol()["res"])                # booked yet? not yet
+        bot._vol_booked("mt5", 77)
+        self.assertNotIn(tok, bot._vol()["res"])
+
+    def test_an_unsettled_reservation_waits_for_a_broker_read(self):
+        bot = self._bot()
+        tok = bot._vol_reserve("mt5", 3_700.0, "hedge", "hedge")
+        v = bot._vol()
+        v["res"][tok]["t"] = 1000.0
+        v["broker"]["mt5"], v["broker_t"]["mt5"] = 0.0, 1003.0   # read too soon after
+        bot._vol_expire(1000.0 + pb.VOL_RES_SETTLE_S + 1)
+        self.assertIn(tok, v["res"])
+        v["broker_t"]["mt5"] = 1010.0                         # a read that would show it
+        bot._vol_expire(1000.0 + pb.VOL_RES_SETTLE_S + 1)
+        self.assertNotIn(tok, v["res"])
+
+    def test_every_fill_checks_the_cap(self):
+        bot = self._bot()
+        bot.day.venue_volume_usd = 10_000.0
+        bot._vol_after_fill("venue")
+        self.assertTrue(any("daily the quote exchange volume cap" in r
+                            for r in bot._vol_reasons()))
+
+    def test_a_limit_entry_needs_room_for_everything_resting(self):
+        bot = self._bot()
+        bot.day.venue_volume_usd = 5_000.0
+        bot._resting_entry_units = lambda side: 2.0 if side == "buy" else 0.0
+        # 5,000 + 4,000 resting + 2,000 = 11,000 > 10,000: held, not close-only
+        self.assertTrue(bot._vol_entry_blocked("L2", 1.0, 2_000.0, resting=True))
+        self.assertNotIn("venue", bot._vol()["hit"])
+        self.assertFalse(bot._vol_entry_blocked("L2", 1.0, 900.0, resting=True))
+        # the entry alone passes the cap: close-only
+        self.assertTrue(bot._vol_entry_blocked("L2", 3.0, 2_000.0, resting=False))
+        self.assertIn("venue", bot._vol()["hit"])
+
+    def test_twice_the_cap_halts(self):
+        import tempfile
+        with mock.patch.object(pb, "LIVE_TRADING", True):
+            bot = self._bot()
+            bot.day.mt5_volume_usd = 19_000.0
+            bot._vol_after_fill("mt5")
+            self.assertIsNone(getattr(bot, "_halt_reason", None))   # close-only only
+            bot.day.mt5_volume_usd = 20_000.0
+            bot._vol_after_fill("mt5")
+            self.assertIn("the hard stop", bot._halt_reason)
+
+    def test_the_broker_floor_and_a_mismatch(self):
+        bot = self._bot()
+        bot.contract_size = 100.0
+        bot._clip_units = lambda: 1.0
+        bot.mark_px = 3700.0
+        bot._mt5_quote_client = lambda: None
+        now = time.time()
+        deal = lambda lots, price, **k: {"kind": "deal", "symbol": pb.SYMBOL_MT5,
+                                         "magic": pb.MT5_MAGIC, "ts": now, "lots": lots,
+                                         "price": price, "entry": 0, **k}
+        deals = [deal(0.01, 3700.0), deal(0.01, 3700.0),
+                 deal(0.01, 3700.0, entry=3),                  # close-by: not traded
+                 deal(0.0, 0.0, adjust="swap"),
+                 deal(0.01, 3700.0, magic=1),                  # another magic
+                 deal(0.01, 3700.0, ts=now - 3 * 86400)]       # another day
+        rep = types.SimpleNamespace(deals=lambda: deals, venue_deals=lambda: [])
+        bot.day.mt5_volume_usd = 7_400.0
+        bot._sync_broker_volume(rep)
+        self.assertAlmostEqual(bot._vol()["broker"]["mt5"], 7_400.0)
+        self.assertEqual(bot._vol_reasons(), [])
+        bot.day.mt5_volume_usd = 0.0                           # the bot booked none
+        bot._sync_broker_volume(rep)
+        self.assertTrue(any("VOLUME MISMATCH" in m for m in self.logs))
+        self.assertTrue(any("never counted" in r for r in bot._vol_reasons()))
+
+    def test_a_hedge_is_reserved_before_it_is_sent(self):
+        bot = self._bot()
+        bot.contract_size, bot.xau_ask, bot.xau_bid = 100.0, 3700.0, 3699.0
+        seen = []
+
+        def place_order(*a, **k):
+            seen.append(bot._vol_counted("mt5"))              # counted BEFORE the send
+            return types.SimpleNamespace(filled=0.0, order_id=None, raw={"retcode": 10006})
+        bot.mt5 = types.SimpleNamespace(place_order=place_order)
+        bot._mt5_market(pb.OrderSide.BUY, 0.01)
+        self.assertAlmostEqual(seen[0], 3_700.0)
+        self.assertAlmostEqual(bot._vol_counted("mt5"), 3_700.0)  # a reject stays counted
+
+
+class VenueSwapTermsTest(unittest.TestCase):
+    """An MT5 quote leg's own swap terms are read for the report (2026-11-18:
+    XAUUSD247.i's annualized rate was blank); a failed read keeps the last."""
+
+    def _bot(self, raw):
+        bot = make_bot([])
+        gw = types.SimpleNamespace(get_symbol_specs=lambda sym: {"raw": raw})
+        bot._mt5_quote_client = lambda: types.SimpleNamespace(gateway=gw)
+        return bot
+
+    def test_read_from_the_quote_terminal(self):
+        bot = self._bot({"swap_mode": 1, "swap_long": -60.0, "swap_short": 10.0,
+                         "point": 0.01})
+        bot._refresh_venue_swap()
+        self.assertEqual((bot.venue_swap["mode"], bot.venue_swap["long"]), (1, -60.0))
+
+    def test_a_failed_read_keeps_the_last(self):
+        bot = self._bot({})
+        bot.venue_swap = {"mode": 1, "long": -1.0}
+        def boom(sym):
+            raise ConnectionError("down")
+        bot._mt5_quote_client().gateway.get_symbol_specs = boom
+        bot._mt5_quote_client = (lambda gw=types.SimpleNamespace(get_symbol_specs=boom):
+                                 types.SimpleNamespace(gateway=gw))
+        bot._refresh_venue_swap()
+        self.assertEqual(bot.venue_swap, {"mode": 1, "long": -1.0})
+
+
+class OneOrderPerPairTest(unittest.TestCase):
+    """A pair that REDUCES the position is at most the oldest ticket it
+    closes, so its quote leg is one broker order (2026-11-17 20:24: each
+    10 oz exit closed two 5 oz tickets, two orders ~0.2 s apart)."""
+
+    def _bot(self, pos, ticket):
+        bot = make_bot([])
+        bot._position_units = lambda: pos
+        bot.venue = types.SimpleNamespace(
+            amount_min=1.0, single_close_units=lambda side: ticket,
+            amount_to_precision=lambda x: round(x, 2))
+        return bot
+
+    def test_an_exit_is_cut_to_the_oldest_ticket(self):
+        self.assertEqual(self._bot(90.0, 5.0)._one_order_amount("k", "sell", 10.0), 5.0)
+        self.assertEqual(self._bot(-90.0, 5.0)._one_order_amount("k", "buy", 10.0), 5.0)
+
+    def test_a_ticket_as_large_as_the_order_leaves_it(self):
+        self.assertEqual(self._bot(90.0, 10.0)._one_order_amount("k", "sell", 10.0), 10.0)
+        self.assertEqual(self._bot(90.0, 30.0)._one_order_amount("k", "sell", 10.0), 10.0)
+
+    def test_an_entry_and_other_connectors_are_untouched(self):
+        self.assertEqual(self._bot(90.0, 5.0)._one_order_amount("k", "buy", 10.0), 10.0)   # adds
+        self.assertEqual(self._bot(0.0, 5.0)._one_order_amount("k", "sell", 10.0), 10.0)   # flat
+        self.assertEqual(self._bot(90.0, None)._one_order_amount("k", "sell", 10.0), 10.0) # no tickets
+
+    def test_a_dust_ticket_does_not_shrink_the_order(self):
+        self.assertEqual(self._bot(90.0, 0.5)._one_order_amount("k", "sell", 10.0), 10.0)
+
+    def test_no_ticket_to_close_is_not_sent(self):
+        """2026-11-18 19:02: the bot counted +1, Blueberry held nothing; the
+        'exit' sell opened a -1 short. No opposite ticket = it would open
+        a position, so it is not sent."""
+        bot = self._bot(1.0, 0.0)
+        self.assertIsNone(bot._one_order_amount("k", "sell", 1.0))
+        self.assertIn("no_ticket_k_sell", bot._last_msgs)
+        self.assertTrue(bot._bal_dirty)
+        # an entry is not a reducing order: it goes
+        self.assertEqual(self._bot(1.0, 0.0)._one_order_amount("k", "buy", 1.0), 1.0)
+
+
+class FiredLevelHoldTest(unittest.TestCase):
+    """A level that fired a market pair is HELD - not judged, so not armed -
+    until MIN_ORDER_INTERVAL_S has passed and the trigger reads only samples
+    taken after the fire; then it arms on the strict test alone (2026-11-17
+    17:26: re-armed in the same second on the samples that had just fired,
+    the 5 s pause held only the order, and the next clip went out on the
+    release slack at -13.21 against a -13.2161 level)."""
+
+    T = 1000.0
+
+    def setUp(self):
+        self._orig = (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE,
+                      pb.MIN_ORDER_INTERVAL_S, pb.BASIS_WINDOW_S, pb.BASIS_MID_WINDOW_S)
+        pb.BASIS_TRIGGER, pb.BASIS_RELEASE, pb.MIN_ORDER_INTERVAL_S = True, 0.1, 5.0
+        pb.BASIS_WINDOW_S, pb.BASIS_MID_WINDOW_S = 3.0, 60.0
+
+    def tearDown(self):
+        (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE, pb.MIN_ORDER_INTERVAL_S,
+         pb.BASIS_WINDOW_S, pb.BASIS_MID_WINDOW_S) = self._orig
+
+    @staticmethod
+    def _buy():
+        return DesiredOrder(key="b", side="buy", purpose="entry", level_index=1,
+                            level=-13.0, size=1.0)
+
+    def _bot(self, buy_basis, t_from, t_to):
+        bot = make_bot([])
+        bot._basis_samples = deque()
+        t = t_from
+        while t <= t_to + 1e-9:
+            bot._push_basis(t, buy_basis, buy_basis - 0.4)
+            t += 0.5
+        bot._basis_hold = {"b": self.T}            # "b" fired at T
+        return bot
+
+    def _gate(self, bot, now):
+        with mock.patch("time.time", return_value=now):
+            return [d.key for d in bot._basis_gate([self._buy()])]
+
+    def test_min_max_held_through_the_pause_and_the_fired_window(self):
+        pb.BASIS_TRIGGER_MODE = "min/max"
+        bot = self._bot(-13.3, self.T - 70.0, self.T + 1.0)   # through the level all along
+        self.assertEqual(self._gate(bot, self.T + 1.0), [])    # inside the 5 s pause
+        self.assertFalse(bot._basis_armed.get("b"))
+        bot = self._bot(-13.3, self.T - 70.0, self.T + 2.0)
+        # past the pause, but the window still reaches back to the fire
+        bot._basis_samples = deque(s for s in bot._basis_samples)
+        bot._basis_samples.appendleft((self.T - 1.0, -13.3, -13.7))
+        self.assertEqual(self._gate(bot, self.T + 6.0), [])
+        # a whole window after the fire: arms and goes
+        bot = self._bot(-13.3, self.T + 2.0, self.T + 6.0)
+        self.assertEqual(self._gate(bot, self.T + 6.0), ["b"])
+        self.assertNotIn("b", bot._basis_hold)
+
+    def test_after_the_hold_only_the_strict_test_arms(self):
+        pb.BASIS_TRIGGER_MODE = "min/max"
+        # within the 0.1 release of the level but not through it: an ARMED
+        # level would stay live; a held one, released, must not arm
+        bot = self._bot(-12.95, self.T + 2.0, self.T + 6.0)
+        bot._basis_armed["b"] = True
+        self.assertEqual(self._gate(bot, self.T + 6.0), [])
+        self.assertFalse(bot._basis_armed.get("b"))
+
+    def test_mid_live_waits_for_a_sample_after_the_pause(self):
+        pb.BASIS_TRIGGER_MODE = "mid+live"
+        bot = self._bot(-13.3, self.T - 70.0, self.T + 4.5)   # 60 s mid through
+        self.assertEqual(self._gate(bot, self.T + 4.9), [])    # in the pause
+        self.assertEqual(self._gate(bot, self.T + 5.2), [])    # newest sample before T+5
+        bot._push_basis(self.T + 5.5, -13.3, -13.7)
+        self.assertEqual(self._gate(bot, self.T + 5.5), ["b"])
+
+    def test_a_market_pair_reuses_the_active_window_after_the_pause(self):
+        # market + market: held for MIN_ORDER_INTERVAL_S only, then judged on
+        # the SAME active window - no wait for a fully refreshed one
+        pb.BASIS_TRIGGER_MODE = "min/max"
+        with mock.patch.object(pb, "MARKET_PAIR", True):
+            bot = self._bot(-13.3, self.T - 70.0, self.T + 1.0)   # through all along
+            self.assertEqual(self._gate(bot, self.T + 1.0), [])    # inside the pause
+            # past the pause, the window still reaching back before the fire
+            bot._basis_samples.appendleft((self.T - 1.0, -13.3, -13.7))
+            self.assertEqual(self._gate(bot, self.T + 5.5), ["b"])
+            self.assertNotIn("b", bot._basis_hold)
+
+    def test_a_market_pair_rearms_only_on_the_strict_test(self):
+        # within the 0.1 release but not through the level: no clip, even
+        # though the level was armed when it fired (2026-11-17 17:26)
+        pb.BASIS_TRIGGER_MODE = "min/max"
+        with mock.patch.object(pb, "MARKET_PAIR", True):
+            bot = self._bot(-12.95, self.T - 70.0, self.T + 6.0)
+            bot._basis_armed["b"] = True
+            self.assertEqual(self._gate(bot, self.T + 6.0), [])
+            self.assertFalse(bot._basis_armed.get("b"))
+
+    def test_a_level_never_fired_is_not_held(self):
+        pb.BASIS_TRIGGER_MODE = "min/max"
+        bot = self._bot(-13.3, self.T - 70.0, self.T + 1.0)
+        bot._basis_hold = {}
+        self.assertEqual(self._gate(bot, self.T + 1.0), ["b"])
+
+
+class BasisMidLiveTest(unittest.TestCase):
+    """BASIS_TRIGGER_MODE 'mid+live': an order arms only while BOTH the
+    BASIS_MID_WINDOW_S average of the mid-mid basis AND the latest sample's
+    side basis are through its level; held within BASIS_RELEASE of it."""
+
+    def setUp(self):
+        self._orig = (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE,
+                      pb.BASIS_MID_WINDOW_S)
+        pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE = True, "mid+live", 0.1
+        pb.BASIS_MID_WINDOW_S = 60.0
+
+    def tearDown(self):
+        (pb.BASIS_TRIGGER, pb.BASIS_TRIGGER_MODE, pb.BASIS_RELEASE,
+         pb.BASIS_MID_WINDOW_S) = self._orig
+
+    @staticmethod
+    def _buy(level=-13.0):
+        return DesiredOrder(key="b", side="buy", purpose="entry", level_index=1,
+                            level=level, size=1.0)
+
+    @staticmethod
+    def _sell(level=-11.0):
+        return DesiredOrder(key="s", side="sell", purpose="entry", level_index=1,
+                            level=level, size=1.0)
+
+    def _bot(self, mid, half=0.2, seconds=61, t0=100.0):
+        """A bot fed one sample a second for ``seconds``: buy basis =
+        mid + half (venue ask - hedge bid), sell basis = mid - half."""
+        bot = make_bot([])
+        bot._basis_samples = deque()
+        for i in range(seconds):
+            bot._push_basis(t0 + i, mid + half, mid - half)
+        return bot
+
+    def _push(self, bot, mid, half=0.2):
+        t = bot._mid_samples[-1][0] + 1.0
+        bot._push_basis(t, mid + half, mid - half)
+
+    def test_the_mid_average_is_the_mean_of_buy_and_sell_basis(self):
+        bot = self._bot(-13.5)
+        self.assertAlmostEqual(bot.basis_mid_avg, -13.5)
+
+    def test_no_mid_average_before_a_full_window(self):
+        bot = self._bot(-14.0, seconds=30)
+        self.assertIsNone(bot.basis_mid_avg)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+
+    def test_both_through_arms(self):
+        bot = self._bot(-13.5)                  # mid -13.5, buy basis -13.3
+        self.assertEqual([d.key for d in bot._basis_gate([self._buy()])], ["b"])
+
+    def test_the_mid_average_through_but_the_buy_basis_not(self):
+        # mid -13.1 (through -13.0), but the buy basis pays the spread: -12.9
+        bot = self._bot(-13.1)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+
+    def test_the_live_basis_through_but_the_mid_average_not(self):
+        # a minute at -12.5, then one sample far through: the average is not
+        bot = self._bot(-12.5)
+        self._push(bot, -15.0)
+        self.assertGreater(bot.basis_mid_avg, -13.0)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+
+    def test_a_sell_mirrors(self):
+        bot = self._bot(-10.5)                  # mid -10.5, sell basis -10.7 >= -11
+        self.assertEqual([d.key for d in bot._basis_gate([self._sell()])], ["s"])
+        bot = self._bot(-10.9)                  # sell basis -11.1 < -11
+        self.assertEqual(bot._basis_gate([self._sell()]), [])
+
+    def test_held_within_the_release_then_released(self):
+        bot = self._bot(-13.5)
+        self.assertEqual(len(bot._basis_gate([self._buy()])), 1)      # armed
+        self._push(bot, -13.15)        # buy basis -12.95: past the level, within 0.1
+        self.assertEqual(len(bot._basis_gate([self._buy()])), 1)
+        self._push(bot, -12.95)        # buy basis -12.75: 0.25 back inside
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+        self.assertFalse(bot._basis_armed.get("b"))
+
+    def test_a_sampling_gap_restarts_the_mid_window(self):
+        bot = self._bot(-14.0)
+        self.assertIsNotNone(bot.basis_mid_avg)
+        t = bot._mid_samples[-1][0] + pb.BASIS_MID_GAP_S + 5.0
+        bot._push_basis(t, -13.8, -14.2)
+        self.assertIsNone(bot.basis_mid_avg)
+        self.assertEqual(bot._basis_gate([self._buy()]), [])
+
+    def test_the_heartbeat_names_the_mid_average(self):
+        bot = self._bot(-13.5)
+        self.assertAlmostEqual(bot.basis_mid_avg, -13.5)
+        self.assertEqual(pb.BASIS_MID_WINDOW_S, 60.0)
 
 
 class BasisTriggerModeTest(unittest.TestCase):
@@ -3999,9 +5163,10 @@ class DailyLimitWiringTest(unittest.TestCase):
         self.assertAlmostEqual(bot.risk_pnl_usd, -110.0)
         self.assertTrue(bot.day.loss_latched)
         self.assertTrue(any("daily loss" in r for r in bot.close_only_reasons))
-        bot.mark_px = 4900.0                                      # a recovery never re-opens
-        bot._refresh_risk(time.time())
-        self.assertTrue(bot.day.loss_latched)
+        bot.mark_px = 4900.0                                      # a recovery re-opens
+        bot._refresh_risk(time.time())                            # (2026-11-18: it follows
+        self.assertFalse(bot.day.loss_latched)                    #  the current PnL)
+        self.assertFalse(any("daily loss" in r for r in bot.close_only_reasons))
 
     def test_the_day_roll_takes_the_baseline_and_a_lost_mark_keeps_the_move(self):
         pb.MAX_DAILY_LOSS_USD = 1000.0
@@ -4859,11 +6024,15 @@ class DeriskWiringTest(unittest.TestCase):
         pb.BASIS_TRIGGER = False
         pb.OPTIMIZE_LIMIT_OFFSET = None
         pb.LIVE_TRADING = False
+        # one reading arms it here; DeriskConfirmTest has the second read
+        self._confirm = pb.DERISK_CONFIRM_S
+        pb.DERISK_CONFIRM_S = 0.0
 
     def tearDown(self):
         (pb.DERISK_VENUE_AVAILABLE_MARGIN_USD, pb.DERISK_VENUE_LIQ_DISTANCE_PCT,
          pb.DERISK_MT5_MARGIN_LEVEL, pb.DERISK_MT5_FREE_MARGIN, pb.BASIS_TRIGGER,
          pb.OPTIMIZE_LIMIT_OFFSET, pb.LIVE_TRADING) = self._orig
+        pb.DERISK_CONFIRM_S = self._confirm
 
     @staticmethod
     def _armed(pos):
@@ -5283,11 +6452,51 @@ class HedgeRatioTest(unittest.TestCase):
             self.assertIn(hint, str(cm.exception))
             self.assertIn("refusing to start", str(cm.exception))
 
-    def test_startup_refuses_when_it_cannot_read_the_prices(self):
-        bot = self._guard_bot(venue_mid=None)     # no ws ticker, REST fails
+    def _unpriced_then(self, bot, polls_without):
+        """The venue leg reads as unpriced for *polls_without* reads (a
+        market's daily break), then 400."""
+        n = {"reads": 0}
+
+        def tk():
+            n["reads"] += 1
+            return None if n["reads"] <= polls_without else types.SimpleNamespace(mid=400.0)
+        bot.feed = types.SimpleNamespace(get_ticker=tk)
+        bot.RATIO_WAIT_POLL_S = 0.0
+        return n
+
+    def test_startup_waits_for_an_unpriced_leg_then_verifies(self):
+        logs = []
+        bot = self._guard_bot(logs=logs)
+        n = self._unpriced_then(bot, polls_without=3)
+        bot._verify_hedge_ratio()                 # no raise: it waited
+        self.assertEqual(n["reads"], 4)
+        self.assertAlmostEqual(bot.ratio_implied, 0.1)
+        self.assertTrue(any("waiting for prices" in m for m in logs), logs)
+        self.assertTrue(any("both legs priced" in m for m in logs), logs)
+        self.assertTrue(any("hedge ratio verified" in m for m in logs), logs)
+        # the REST failure behind each unpriced read is said once, not per poll
+        self.assertEqual(sum("REST ticker failed" in m for m in logs), 1, logs)
+
+    def test_a_wrong_ratio_still_refuses_once_the_leg_is_priced(self):
+        pb.HEDGE_RATIO = 1.0                      # 10x off the prices
+        bot = self._guard_bot()
+        self._unpriced_then(bot, polls_without=2)
         with self.assertRaises(RuntimeError) as cm:
             bot._verify_hedge_ratio()
-        self.assertIn("cannot verify HEDGE_RATIO", str(cm.exception))
+        self.assertIn("refusing to start", str(cm.exception))
+
+    def test_a_stop_signal_ends_the_wait_for_prices(self):
+        logs = []
+        bot = self._guard_bot(venue_mid=None, logs=logs)   # never priced
+        bot.RATIO_WAIT_POLL_S = 0.0
+        with tempfile.TemporaryDirectory() as d:
+            stop = Path(d) / "stop.signal"
+            stop.write_text("", encoding="utf-8")
+            with mock.patch.object(pb, "STOP_FILE", stop):
+                with self.assertRaises(pb._StartupStopped):
+                    bot._verify_hedge_ratio()
+            self.assertFalse(stop.exists())       # consumed, as the run loop does
+        self.assertTrue(any("while waiting for prices" in m for m in logs), logs)
 
     def test_an_override_for_this_exact_k_starts_with_a_warning(self):
         logs = []
@@ -5580,8 +6789,10 @@ class QuoteBookAndPaperTest(unittest.TestCase):
         bot.paper_pos_units = 63.0
         self.assertEqual(bot._position_units(), 63.0)        # the grid still walks on it
         self.assertEqual(bot._reported_position_units(), 0.0)
+        # nor the account's: a paper run is read-only and the account's
+        # position is a live sibling's (2026-11-17)
         bot.venue_pos_units = 1.0
-        self.assertEqual(bot._reported_position_units(), 1.0)  # the account's own figure
+        self.assertEqual(bot._reported_position_units(), 0.0)
 
     def test_a_paper_book_off_the_order_size_warns(self):
         bot = make_bot()
@@ -6148,6 +7359,162 @@ class PositionDisagreementGuardsTest(unittest.TestCase):
         self.assertAlmostEqual(bot._reported_position_units(), -0.02823)
         bot.pos_fault = None
         self.assertAlmostEqual(bot._reported_position_units(), 0.021)
+
+
+class LedgerReseedTest(unittest.TestCase):
+    """GC Feb-27, 2026-11-18: a crash lost a 1-lot hedge from the saved
+    ledger; the restart's check allowed a gap up to the venue's minimum
+    order (one 100 oz contract), kept the phantom lot, and its mark drove
+    the daily loss limit for the rest of the day."""
+
+    def _gc_bot(self, logs):
+        bot = make_bot(logs)
+        bot.venue.amount_step = bot.venue.amount_min = 100.0   # one GC contract
+        bot.contract_size, bot.volume_step = 100.0, 0.01        # XAUUSD: 100 oz a lot
+        bot.xau_mid = 3730.0
+        bot.venue_pos_units = 100.0
+        bot.venue_ledger.seed(100.0, 3770.0)
+        return bot
+
+    def test_a_ledger_one_contract_off_the_mt5_book_is_reseeded(self):
+        logs = []
+        bot = self._gc_bot(logs)
+        bot.mt5_ledger.seed(0.0, None)                  # the lost sell: ledger flat
+        bot._read_mt5_book = lambda: (-100.0, 3732.49)  # MT5 holds the hedge
+        bot._seed_ledgers()
+        self.assertAlmostEqual(bot.mt5_ledger.inv_units, -100.0)
+        self.assertTrue(any("re-seeded" in m for m in logs), logs)
+
+    def test_a_ledger_on_the_book_is_kept(self):
+        logs = []
+        bot = self._gc_bot(logs)
+        bot.mt5_ledger.seed(-100.0, 3740.0)
+        bot._read_mt5_book = lambda: (-100.0, 3732.49)
+        bot._seed_ledgers()
+        self.assertAlmostEqual(bot.mt5_ledger.avg_cost, 3740.0)   # its basis kept
+        self.assertFalse(any("re-seeded" in m for m in logs), logs)
+
+    def test_a_venue_ledger_one_contract_off_is_reseeded(self):
+        bot = self._gc_bot([])
+        bot.venue_ledger.seed(200.0, 3770.0)
+        bot.mt5_ledger.seed(-100.0, 3740.0)
+        bot._read_mt5_book = lambda: (-100.0, 3732.49)
+        bot._seed_ledgers()
+        self.assertAlmostEqual(bot.venue_ledger.inv_units, 100.0)
+
+    def test_a_booked_hedge_is_saved_by_the_next_housekeeping_pass(self):
+        bot = make_bot([])
+        bot.contract_size = 100.0
+        saved = []
+        bot._persist_position = lambda: saved.append(bot.mt5_ledger.inv_units)
+        bot._book_hedge(pb.OrderSide.SELL, 1.0,
+                        types.SimpleNamespace(raw={"price": 3732.49}, order_id="m1"))
+        self.assertEqual(saved, [], "written from the hedger's thread")
+        self.assertTrue(bot._hedge_book_dirty)
+        bot._check_mt5_health = lambda now: (_ for _ in ()).throw(StopIteration())
+        try:
+            bot.tick(0.0)
+        except Exception:
+            pass        # only the first phase of the pass matters here
+        self.assertEqual(saved, [-100.0])
+        self.assertFalse(bot._hedge_book_dirty)
+
+
+class DeriskPartialTest(unittest.TestCase):
+    """DERISK_PARTIAL (2026-11-19, GC): close one order, re-read the margin
+    DERISK_CONFIRM_S after its fill, stop the forced exit once it recovers -
+    and stay close-only until restart, so nothing re-opens."""
+
+    def setUp(self):
+        self._orig = (pb.DERISK_PARTIAL, pb.DERISK_MT5_MARGIN_LEVEL, pb._log)
+        self._wiring = DeriskWiringTest()
+        self._wiring.setUp()
+        pb.DERISK_PARTIAL = True
+        pb.DERISK_MT5_MARGIN_LEVEL = 200.0
+        self.logs = []
+        pb._log = lambda m, _a=self.logs: _a.append(m)
+
+    def tearDown(self):
+        self._wiring.tearDown()
+        pb.DERISK_PARTIAL, pb.DERISK_MT5_MARGIN_LEVEL, pb._log = self._orig
+
+    def _breached(self, pos=2.0):
+        bot = DeriskWiringTest._armed(pos)
+        pb._log = lambda m, _a=self.logs: _a.append(m)   # make_bot sets its own
+        bot._bal_t = 1000.0
+        bot.mt5_margin_level = 150.0
+        bot._update_derisk()                 # armed on one read (DERISK_CONFIRM_S 0) ...
+        self.assertTrue(bot.derisk_active)
+        pb.DERISK_CONFIRM_S = 5.0            # ... the re-read after a fill waits 5 s
+        return bot
+
+    def _fill_one(self, bot, t):
+        bot.venue_pos_units = round(bot.venue_pos_units - 1.0, 8)
+        bot.derisk_done_units += 1.0
+        bot._derisk_fill_t = t
+
+    def test_it_holds_the_next_order_until_a_read_after_the_fill(self):
+        bot = self._breached()
+        (o,) = bot._flatten_orders()                     # the first order goes
+        self.assertEqual((o.side, o.size), ("sell", 1.0))
+        now = time.time()
+        self._fill_one(bot, now)
+        bot._bal_dirty = False
+        self.assertEqual(bot._flatten_orders(), [])      # held: no read since
+        self.assertFalse(bot._bal_dirty)                 # not before DERISK_CONFIRM_S
+        bot._derisk_fill_t = now - 10.0
+        self.assertEqual(bot._flatten_orders(), [])
+        self.assertTrue(bot._bal_dirty)                  # ... then it asks for the read
+        bot._bal_t = now                                 # the read came; still breached
+        bot._update_derisk()
+        self.assertTrue(bot.derisk_active)
+        (o,) = bot._flatten_orders()                     # so the next order goes
+        self.assertEqual(o.size, 1.0)
+
+    def test_recovered_after_a_fill_it_stops_and_stays_close_only(self):
+        bot = self._breached()
+        self._fill_one(bot, 1001.0)
+        bot.mt5_margin_level = 900.0
+        bot._bal_t = 1003.0                              # too soon after the fill
+        bot._update_derisk()
+        self.assertTrue(bot.derisk_active)
+        bot._bal_t = 1006.5
+        bot._update_derisk()
+        self.assertFalse(bot.derisk_active)              # the forced exit stopped
+        self.assertEqual(bot.derisk_released, ["Hedge margin level 150% < 200%"])
+        self.assertAlmostEqual(bot.venue_pos_units, 1.0)  # the rest stays on
+        self.assertTrue(any("(partial)" in m for m in self.logs))
+        bot._update_gate_reasons()
+        self.assertTrue(any("close-only until restart" in r for r in bot.close_only_reasons))
+        bot._target_orders = _orders
+        purposes = {d.purpose for d in bot._desired_orders()}
+        self.assertNotIn("entry", purposes)              # no entry re-opens it
+        bot._update_derisk()                             # recovered: nothing re-arms
+        self.assertFalse(bot.derisk_active)
+        bot.mt5_margin_level = 150.0                     # a new breach arms it again,
+        bot._update_derisk()                             # after the usual second read
+        self.assertFalse(bot.derisk_active)
+        bot._bal_t = 1012.0
+        bot._update_derisk()
+        self.assertTrue(bot.derisk_active)
+
+    def test_no_release_before_anything_was_closed(self):
+        bot = self._breached()
+        bot.mt5_margin_level = 900.0
+        bot._bal_t = 1010.0
+        bot._update_derisk()
+        self.assertTrue(bot.derisk_active)               # one order must go first
+
+    def test_off_it_closes_everything_as_before(self):
+        pb.DERISK_PARTIAL = False
+        bot = self._breached()
+        self._fill_one(bot, 1001.0)
+        bot.mt5_margin_level = 900.0
+        bot._bal_t = 1010.0
+        bot._update_derisk()
+        self.assertTrue(bot.derisk_active)
+        (o,) = bot._flatten_orders()
+        self.assertEqual(o.size, 1.0)
 
 
 if __name__ == "__main__":

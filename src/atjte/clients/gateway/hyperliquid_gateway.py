@@ -65,6 +65,11 @@ class HyperliquidGatewayClient(GatewayConnector):
     #: Hyperliquid modify re-issues the order under a new id; the engine
     #: adopts the id the amend returns
     supports_amend = True
+    #: ... and because it re-issues rather than edits, the amend must carry
+    #: the UNFILLED size. Sent the original size, the venue rests a whole new
+    #: order beside what already filled: 69.46 placed, 0.65 filled, amended
+    #: at 69.46 -> 70.11 actually bought (client report, 2026-11-11).
+    amend_replaces = True
     #: an order read's ``filled`` is ccxt's ``origSz - sz``, and Hyperliquid
     #: lowers ``sz`` with no trade when a reduce-only order is bigger than the
     #: position: the engine books only what the account's trades confirm

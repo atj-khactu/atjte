@@ -14,7 +14,7 @@ still left to it.
 
 The first delivery day is taken as the first weekday of the contract month,
 New Year's Day skipped. Other exchange holidays are not known here — the
-setting ``CARRY_DELIVERY`` overrides the date when one matters.
+setting ``CONVERGENCE_DATE`` overrides the date when one matters.
 """
 
 from __future__ import annotations

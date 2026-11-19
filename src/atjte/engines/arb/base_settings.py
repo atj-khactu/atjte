@@ -397,6 +397,13 @@ BASIS_RELEASE = 0.25    # pull the quote once avg is this far back inside
 # back inside — 0.25 = a quarter step. It follows the step, also a bps step
 # re-anchored daily. None = BASIS_RELEASE in spread points.
 BASIS_RELEASE_STEP_RATIO = None
+# The longest one order may rest (s, from when it was placed; re-pricing it
+# by amend does not restart the clock). Past it the order is cancelled and
+# disarmed, and it comes back only once a FRESH basis window - every sample
+# taken after the cancel, BASIS_WINDOW_S of them - is through its level
+# again: a quote that sat on the book while the market drifted is not left
+# there to be picked off. The margin de-risk exit is not affected. None = off.
+MAX_QUOTE_AGE_S = None
 # What ARMS an order: 'avg' = the window's average is through the level (as
 # above); 'min/max' = the WHOLE window is - a buy only when the HIGHEST bid
 # basis of the last BASIS_WINDOW_S is at/below its level, a sell only when
@@ -406,6 +413,24 @@ BASIS_RELEASE_STEP_RATIO = None
 # fills. Once armed, the order is released on the AVERAGE as before
 # (BASIS_RELEASE back inside), so it does not flicker on one tick.
 BASIS_TRIGGER_MODE = 'avg'
+# 'mid+live' = the trend AND the price: an order arms only while BOTH the
+# BASIS_MID_WINDOW_S average of the MID-MID basis (venue mid - k x hedge mid)
+# AND the current side basis of the latest sample (what the order trades
+# at, BASIS_MODE's buy / sell basis) are at/through its level - a buy while
+# both are at/below it, a sell while both are at/above it. Held while both
+# stay within BASIS_RELEASE of the level. The short BASIS_WINDOW_S window
+# still has to be live (fail-safe); its average and extremes are not used.
+BASIS_MID_WINDOW_S = 60.0   # 'mid+live': the mid-mid basis average's window (s)
+# The LIVE check on top of the basis average: an order arms (and stays up)
+# only while the venue's touch, hedged at market, is ALSO through its level
+# right now - buy: venue bid - k x hedge bid <= level, sell: venue ask -
+# k x hedge ask >= level (the limit + market basis, whatever BASIS_MODE the
+# average uses). It goes up only with the live basis THROUGH the level and
+# stays up until the live basis is back inside by more than the release
+# (BASIS_RELEASE / BASIS_RELEASE_STEP_RATIO, as the average's): strictly at
+# the level, a live basis wobbling across it pulled and re-placed one order
+# 23 times in 16 s (GC, 2026-11-17). False = off.
+BASIS_TRIGGER_LIVE = False
 # Which prices the basis trigger's samples are made of — what the trigger
 # compares with each level (k = HEDGE_RATIO, "hedge" = the MT5 leg):
 #   'limit-market'  (the default) a resting LIMIT quote hedged at market:
@@ -449,6 +474,14 @@ OPTIMIZE_LIMIT_TAKER = True
 # than this is left where it is. Taker orders and the de-risk exit (priced
 # at the touch) are not affected. None = one tick (the old behaviour).
 MIN_TOB_SPREAD = None
+# Rest only AT the top of the venue's book: a buy only while its price is
+# at or above the best bid (it is the best bid, alone or joined) or pinned
+# at the MIN_TOB_SPREAD edge (best ask - that gap, as close as it may go);
+# a sell mirrored. An order that would sit BEHIND the touch - filled only
+# once the market has moved through it, the fills most exposed to adverse
+# selection - is cancelled / not placed. Taker orders and the margin
+# de-risk exit are not affected. False = off.
+QUOTE_AT_TOB_ONLY = False
 # Seconds after ANY fill during which NO order is quoted - entries and exits
 # alike (resting ones are cancelled, none placed); the margin de-risk exit is
 # exempt. Stops the bot re-offering into the sweep that just filled it (GC
@@ -545,6 +578,16 @@ ALLOCATION_REFRESH_S = 60.0
 # idles (no reference price -> no quotes, and no new exposure while the hedge
 # venue is closed).
 MT5_STALE_S = 300.0
+# The PRICING gate: while the MT5 quote has not changed for longer than
+# this (s), nothing rests on the venue — entries and exits alike, resting
+# ones cancelled — since every level is priced off that quote. A terminal
+# or broker that freezes for seconds while the venue moves would otherwise
+# leave bids priced off a stale reference to be picked off (MGC,
+# 2026-11-17 13:00 UTC: IC Markets froze ~5 s, two entries filled 0.3-0.7
+# through their level). Hedging is not affected, nor the margin de-risk
+# exit. A quiet CFD may not tick for a second: set it above its normal
+# tick gap. None = off (MT5_STALE_S alone: the closed-market idle).
+MT5_QUOTE_MAX_AGE_S = None
 # The MT5 HEALTH gate: every MT5_HEALTH_INTERVAL_S the terminal is asked
 # whether it can take a hedge — connected to the broker, Algo Trading on, the
 # account allowed to trade by expert advisors, still the SAME account — and
@@ -768,6 +811,16 @@ DERISK_MT5_FREE_MARGIN = None             # account ccy — MT5 free margin floo
 # overnight futures requirement, a stock's Reg T step). USD; RISK_UNIT pct = %
 # of the account's net liquidation. None = off.
 DERISK_VENUE_EXCESS_LIQUIDITY_USD = None
+# PARTIAL de-risk: False (the default) = a threshold hit closes the WHOLE
+# position, as above. True = close ONE order of the strategy's order size,
+# then re-read the margin figures DERISK_CONFIRM_S (5 s) after that fill
+# before the next one: still breached -> the next order, and so on; recovered
+# -> the forced exit stops and what is left stays on, its strategy exits
+# quoting as normal. Either way the bot stays CLOSE-ONLY until it is
+# restarted (no new entry), so it cannot re-open into the risk. A breach
+# later on arms the exit again (after the usual confirmation). A delivery
+# close (CLOSE_BEFORE_DELIVERY_*) is never partial.
+DERISK_PARTIAL = False
 # --- How the liquidation-threshold exit closes (and close before delivery) ---
 # LIQUIDATION_EXIT_MODE, one of:
 # "maker-pegged": ONE reduce-only post-only order of the strategy's order

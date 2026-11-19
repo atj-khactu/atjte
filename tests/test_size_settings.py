@@ -52,8 +52,29 @@ class SizeSettingsTest(unittest.TestCase):
                 seen += 1
                 missing = [n for n in sizes if n not in names]
                 self.assertEqual(missing, [], f"{f.parent.name}.{cls}")
-        # grid, bollinger, fixed, fixed entry / exit (grid futures inherits grid's)
-        self.assertEqual(seen, 4)
+        # grid, bollinger, bollinger smooth, fixed, fixed entry / exit (grid futures
+        # inherits grid's)
+        self.assertEqual(seen, 5)
+
+
+    def test_every_fast_pass_override_takes_the_engines_arguments(self):
+        # the engine's loop calls fast_pass(now, xau): an override taking only
+        # ``now`` raised TypeError on every pass (bollinger_bot, found 2026-11-17)
+        engine = ast.parse((TYPES.parents[1] / "engines" / "arb" / "arb_bot.py")
+                           .read_text(encoding="utf-8"))
+        want = None
+        for node in ast.walk(engine):
+            if isinstance(node, ast.FunctionDef) and node.name == "fast_pass":
+                want = [a.arg for a in node.args.args]
+        self.assertEqual(want, ["self", "now", "xau"])
+        seen = 0
+        for f in sorted(TYPES.glob("*/*.py")):
+            for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+                if isinstance(node, ast.FunctionDef) and node.name == "fast_pass":
+                    seen += 1
+                    self.assertEqual([a.arg for a in node.args.args], want, f.name)
+                    self.assertEqual(len(node.args.defaults), 1, f.name)
+        self.assertGreaterEqual(seen, 2)       # bollinger, bollinger smooth
 
 
 if __name__ == "__main__":

@@ -121,7 +121,7 @@ class CarryWiringTest(unittest.TestCase):
                 "MAX_POSITION_UNITS": 30.0, "MAX_SHORT_EFFECTIVE": 30.0,
                 "GRID_TAKE_PROFIT": None, "TAKE_PROFIT_EFFECTIVE": 1.0,
                 "ORDER_VOLUME_EFFECTIVE": 10.0}
-    CARRY = {"CARRY_ANNUAL_PCT": 3.65, "CARRY_EXPIRY": None, "CARRY_DELIVERY": None,
+    CARRY = {"CARRY_ANNUAL_PCT": 3.65, "CARRY_EXPIRY": None, "CONVERGENCE_DATE": None,
              "CARRY_UPDATE_UTC": "00:05",
              "CARRY_LAST_ENTRY_DTE": 1.0}
 
@@ -322,12 +322,12 @@ class CarryWiringTest(unittest.TestCase):
         bot._desired_orders()
         self.assertAlmostEqual(bot.center, 2600.0 * 0.0365 * 5.5 / 365, places=4)
 
-    def test_carry_delivery_overrides_and_no_month_means_the_expiry(self):
-        gc.CARRY_DELIVERY = "2026-11-02"
+    def test_convergence_date_overrides_and_no_month_means_the_expiry(self):
+        gc.CONVERGENCE_DATE = "2026-11-02"
         bot = make_bot(0.0, info={"contractMonth": "202612"})
         bot._desired_orders()
         self.assertAlmostEqual(bot.center, 2600.0 * 0.0365 * 42.5 / 365, places=4)
-        gc.CARRY_DELIVERY = None
+        gc.CONVERGENCE_DATE = None
         plain = make_bot(0.0)                                     # a CCXT future: no month
         plain._desired_orders()
         self.assertAlmostEqual(plain.center, 26.13)

@@ -184,6 +184,15 @@ def main(argv=None) -> int:
         cfg.listen_port = args.port
     if args.check:
         print(json.dumps(cfg.status(), indent=1))
+        try:
+            q = C.make_quotes(cfg)          # resolves the source; connects to nothing
+        except C.ConfigError as e:
+            print(f"{cfg.name}: {e}")
+            return 2
+        if q is not None:
+            print(f"quotes: CME Group futures priced from {q.describe()}"
+                  + ("" if cfg.quote_token else f" — WARNING: no {C.DB_TOKEN_NAME} in "
+                                                f"{C.ENV_NAME}"))
         return 0 if cfg.complete else 2
     if not cfg.complete:
         print(f"{cfg.name} is not ready — missing {', '.join(cfg.missing)} in "
@@ -206,12 +215,24 @@ def main(argv=None) -> int:
     journal = ExecutionJournal(cfg.dir / JOURNAL_NAME, log=log)
     log(f"{cfg.name}: {len(journal)} execution(s) in {JOURNAL_NAME}; TWS's own are merged "
         f"in at connect")
+    try:
+        quotes = C.make_quotes(cfg, log=log)
+    except C.ConfigError as e:
+        print(f"{cfg.name}: {e}")
+        return 2
+    if quotes is not None and not cfg.quote_token:
+        log(f"WARNING: no {C.DB_TOKEN_NAME} in {C.ENV_NAME} — the Databento gateway "
+            f"{cfg.quote_gateway} refuses the quote lease if it has a token")
     up = IbkrUpstream(dict(cfg.account_ids), cfg.contracts, host=cfg.host, port=cfg.port,
                       client_id=cfg.client_id, network=cfg.network,
-                      reject_pause_s=cfg.reject_pause_s, journal=journal, log=log)
+                      reject_pause_s=cfg.reject_pause_s,
+                      manual_fills_poll_s=cfg.manual_fills_poll_s, journal=journal,
+                      quotes=quotes, quote_symbols=cfg.quote_symbols, log=log)
     log(f"{cfg.name}: {cfg.network.upper()} — connecting to TWS at {cfg.host}:{cfg.port} "
         f"(client id {cfg.client_id}) for account(s) {', '.join(cfg.accounts)}; listing "
-        f"{', '.join(f'{c.symbol}@{c.exchange}' for c in cfg.contracts)}")
+        f"{', '.join(f'{c.symbol}@{c.exchange}' for c in cfg.contracts)}"
+        + (f"; CME Group futures priced from {quotes.describe()}" if quotes is not None
+           else ""))
     up.start()
     write_markets(cfg.dir, cfg.network, up)
     gw = IbkrGateway(up, port=cfg.listen_port, token=cfg.token,
@@ -271,7 +292,9 @@ def main(argv=None) -> int:
                                             "reason": ("" if ready else
                                                        "the session to TWS is down"
                                                        if not s["upstream"]["connected"]
-                                                       else "market data refused for a symbol"),
+                                                       else "market data refused for a "
+                                                       "symbol, or its Databento quotes "
+                                                       "are down or stale"),
                                             "last_error": s["upstream"].get("last_error", "")},
                                 **s,
                                 "hedge": (None if cfg.hedge is None else

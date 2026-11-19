@@ -41,6 +41,8 @@ CLOSE_ONLY = False
 BB_PERIOD_MIN = 60           # band window: 60 minutes
 BB_STD_MULT = 1.0            # entry band: buy at mean − this many σ / sell at mean + this many σ
 BB_EXIT_STD_MULT = 1       # exit band: long exits at mean + this many σ / short covers at mean − this many σ
+BB_MIN_STD = None           # floor under σ (spread points; None = off): a quiet window's bands never sit closer
+                            # than this many points per σ to the mean (0.35 -> a 1σ band >= 0.35, 2σ >= 0.70)
 ORDER_SIZE_UNITS = 1.0          # entry AND exit clip (base units); >= one MT5 min lot so every fill can be hedged
 
 # Hard caps on the position (base units), each side: the entry clip is trimmed

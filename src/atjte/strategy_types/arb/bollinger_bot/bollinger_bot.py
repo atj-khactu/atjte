@@ -63,6 +63,7 @@ to start while any strategy folder's heartbeat is fresh.
 from __future__ import annotations
 
 import math
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -96,6 +97,12 @@ BB_SHORT = bool(getattr(_S, "BB_SHORT", True))
 MAX_SHORT_UNITS = getattr(_S, "MAX_SHORT_UNITS", None)
 MAX_SHORT_EFFECTIVE = MAX_POSITION_UNITS if MAX_SHORT_UNITS is None else MAX_SHORT_UNITS
 BB_ZERO_RULE = bool(getattr(_S, "BB_ZERO_RULE", False))
+# A floor under sigma (spread points; None / 0 = off). A quiet window gives a
+# tiny sigma and bands that hug the mean: a thin venue's round trip then
+# cannot clear its costs (2026-11-16, QO: an exit 1 sigma away was cents).
+# Below the floor the bands are drawn at the floor: at 0.35, a 1 sigma band
+# sits at least 0.35 from the mean, a 2 sigma band at least 0.70.
+BB_MIN_STD = getattr(_S, "BB_MIN_STD", None)
 
 
 def _check_ladder(name: str, ladder) -> None:
@@ -138,6 +145,12 @@ class BollingerBot(ArbBot):
     # what SIZE_UNIT = 'contracts' multiplies by the contract size
     SIZE_SETTINGS = ("ORDER_SIZE_UNITS", "MAX_POSITION_UNITS", "MAX_SHORT_UNITS")
 
+    def _size_module(self):
+        # this module's, also for a subclass defined elsewhere (the fair-basis
+        # Bollinger): its own module holds none of the sizes, so contracts
+        # were never converted and 5 contracts quoted as 5 oz
+        return sys.modules[__name__]
+
     def _sizes_derived(self) -> None:
         global MAX_SHORT_EFFECTIVE
         MAX_SHORT_EFFECTIVE = (MAX_POSITION_UNITS if MAX_SHORT_UNITS is None
@@ -158,6 +171,7 @@ class BollingerBot(ArbBot):
         # window of them exists — live in the ENGINE: self._samples)
         self.bb_mean: Optional[float] = None
         self.bb_std: Optional[float] = None
+        self.bb_std_raw: Optional[float] = None   # sigma before the BB_MIN_STD floor
         self.bb_source: Optional[str] = None   # '1s' | '1m' | None (warm-up)
 
     # ── startup ──────────────────────────────────────────────────────────────
@@ -186,6 +200,9 @@ class BollingerBot(ArbBot):
                  + (f"; short: sell at mean + {BB_STD_MULT:g}*sigma, cover at mean - "
                     f"{BB_EXIT_STD_MULT:g}*sigma" if BB_SHORT else "; short side off")
                  + f" ({cap}{scap}); {rule}")
+        if BB_MIN_STD:
+            _log(f"bands: sigma floored at {float(BB_MIN_STD):g} (BB_MIN_STD) — a quieter "
+                 f"window's bands sit no closer to the mean than that per sigma")
 
     def startup(self) -> None:
         super().startup()           # single-bot guard first; engine reloads
@@ -216,8 +233,10 @@ class BollingerBot(ArbBot):
             _log(f"WARNING: bollinger backfill failed ({e}) — warming up from "
                  f"live samples (~{BB_PERIOD_MIN} min)")
 
-    def fast_pass(self, now: float) -> None:
-        super().fast_pass(now)      # (also feeds the engine's 1 s samples)
+    def fast_pass(self, now: float, xau=None) -> None:
+        # ``xau``: the MT5 tick the loop already polled (the engine's own
+        # signature; without it every pass raised TypeError, 2026-11-16)
+        super().fast_pass(now, xau)  # (also feeds the engine's 1 s samples)
         if self.session_open and self.spread_now is not None:
             minute = float(int(now // 60) * 60)
             if self._bars and self._bars[-1][0] == minute:
@@ -244,6 +263,9 @@ class BollingerBot(ArbBot):
             self.bb_source = "1m"
         mean = sum(vals) / len(vals)
         std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+        self.bb_std_raw = std
+        if BB_MIN_STD and std < float(BB_MIN_STD):
+            std = float(BB_MIN_STD)             # the floor: bands never closer
         self.bb_mean, self.bb_std = mean, std
         return mean, std
 
@@ -307,6 +329,9 @@ class BollingerBot(ArbBot):
             "samples_1s_need": SAMPLES_PER_WINDOW,
             "mean": None if m is None else round(m, 4),
             "std": None if s is None else round(s, 4),
+            "std_raw": (None if getattr(self, "bb_std_raw", None) is None
+                        else round(self.bb_std_raw, 4)),
+            "min_std": BB_MIN_STD,
             "entry_level": None if m is None else round(m - BB_STD_MULT * s, 4),
             "exit_level": None if m is None else round(m + BB_EXIT_STD_MULT * s, 4),
             "short_entry_level": None if (m is None or not BB_SHORT)

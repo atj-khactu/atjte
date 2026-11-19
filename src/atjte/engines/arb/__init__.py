@@ -32,6 +32,6 @@ literals still run it (:data:`atjte.templates.LEGACY_ENGINES`):
   ``EXCHANGE_ID``, ``SYMBOL_VENUE``, ``SYMBOL_MT5``, ``MT5_MAGIC``).
 
 Strategy types: :mod:`atjte.strategy_types.arb` (``grid_bot``,
-``grid_futures_bot``, ``bollinger_bot``, ``fixed_bot``, ``fixed_entry_exit``). Run one: ``python -m atjte bot
+``grid_futures_bot``, ``bollinger_bot``, ``bollinger_smooth_bot``, ``fixed_bot``, ``fixed_entry_exit``). Run one: ``python -m atjte bot
 <project>/strategies/<type>``.
 """

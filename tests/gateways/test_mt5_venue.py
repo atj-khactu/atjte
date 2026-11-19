@@ -44,6 +44,12 @@ class FakeLease:
                      status=OrderStatus.FILLED if self.fill else OrderStatus.OPEN,
                      raw={"price": 4101.23, "retcode": 10009 if self.fill else 10006})
 
+    deals: list = []               # what history_deals answers
+
+    def history_deals(self, frm, to, symbol=None):
+        self.asked_deals = (frm, to, symbol)
+        return list(self.deals)
+
     def close_by(self, a, b):
         self.closed.append((a, b))
         self.positions = [p for p in self.positions if p.position_id not in (a, b)]
@@ -114,6 +120,24 @@ class OrderTest(unittest.TestCase):
         self.assertEqual((sym, lots, otype), ("XAUUSD247.i", 0.01, OrderType.MARKET))
         self.assertEqual(kw["deviation"], 20)
         self.assertEqual(kw["comment"], "atjte quote")   # no comment option given
+
+    def test_the_fill_is_the_brokers_deal_not_order_sends_price(self):
+        """2026-11-17, Blueberry: order_send answered the REQUEST price
+        (3852.26), the deal was 3853.02 — the day's loss was understated by
+        the slippage. The deal (by the order, or by the deal ticket) is the
+        fill; without one the answered price stays."""
+        lease = FakeLease()
+        lease.deals = [{"ticket": 77, "order": 9001, "volume": 0.006, "price": 4102.00},
+                       {"ticket": 78, "order": 9001, "volume": 0.004, "price": 4103.00},
+                       {"ticket": 79, "order": 1234, "volume": 1.0, "price": 9999.0}]
+        o = _client(lease).place_order("XAUUSD247.i", OrderSide.BUY, 0.01, OrderType.MARKET)
+        self.assertAlmostEqual(o.price, 4102.40)                   # volume-weighted
+        self.assertEqual(o.raw["request_price"], 4101.23)
+        self.assertEqual(o.raw["price_from"], "deal")
+        self.assertEqual(lease.asked_deals[2], "XAUUSD247.i")
+        lease.deals = []                                          # not listed: keep
+        o = _client(lease).place_order("XAUUSD247.i", OrderSide.BUY, 0.01, OrderType.MARKET)
+        self.assertEqual(o.price, 4101.23)
 
     def test_an_empty_comment_is_sent_empty(self):
         c = _client()
@@ -224,6 +248,36 @@ class AdoptedBookTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             MT5VenueClient(symbol="XAUUSD247.i", magic=77020, gateway_port=5623,
                            gateway_token="t", adopt_magics=[77020])
+
+
+class NextCloseTest(unittest.TestCase):
+    """The ticket a reducing order closes first - this magic's OLDEST
+    opposite ticket, the gateway's order - so the engine can size a pair to
+    ONE broker order (2026-11-17 20:24: 10 oz exits went as two 5 oz closes
+    ~0.2 s apart, the second lower)."""
+
+    def test_the_oldest_own_opposite_ticket(self):
+        lease = FakeLease()
+        lease.positions = [_pos(12, PositionSide.LONG, 0.05, 77020),
+                           _pos(11, PositionSide.LONG, 0.03, 77020),      # oldest of ours
+                           _pos(10, PositionSide.LONG, 0.10, 77016),      # another magic
+                           _pos(9, PositionSide.SHORT, 0.02, 77020)]      # same side as a sell
+        c = _client(lease)
+        self.assertEqual(c.next_close_lots(OrderSide.SELL), 0.03)
+        self.assertEqual(c.next_close_lots(OrderSide.BUY), 0.02)
+
+    def test_nothing_to_close_is_zero(self):
+        # 0.0, not None: an order of that side would OPEN a position
+        # (2026-11-18 19:02, the forced-exit loop)
+        self.assertEqual(_client().next_close_lots(OrderSide.SELL), 0.0)
+
+    def test_an_unreadable_book_is_none(self):
+        lease = FakeLease()
+
+        def boom(*a, **k):
+            raise ConnectionError("down")
+        lease.get_positions = boom
+        self.assertIsNone(_client(lease).next_close_lots(OrderSide.SELL))
 
 
 class DealHistoryTest(unittest.TestCase):

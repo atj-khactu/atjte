@@ -150,7 +150,8 @@ class FixSession:
                  connect_timeout_s: float = 10.0, logon_timeout_s: float = 15.0,
                  rollover_utc: str = "22:00", rollover_grace_s: float = 120.0,
                  tls_verify: bool = True, client_id: str = "",
-                 trace: bool = False) -> None:
+                 trace: bool = False,
+                 trace_log: Optional[Callable[[str], None]] = None) -> None:
         self.host, self.port = host, int(port)
         self.sender, self.target = sender, target
         self._key, self._secret = api_key, api_secret
@@ -177,6 +178,9 @@ class FixSession:
         #: on one SenderCompID evict each other.
         self.client_id = client_id
         self.trace = bool(trace)
+        #: where ``trace`` lines go (every frame in and out, via ``repr_safe``);
+        #: None = the session's ``log``
+        self._trace_log = trace_log or self._log
 
         self._wire = None
         self._parser: Optional[Parser] = None
@@ -448,7 +452,7 @@ class FixSession:
             self._out_seq = seq + 1
             self._last_out_t = self._clock()
         if self.trace:
-            self._log(f"FIX > {repr_safe(frame)}")
+            self._trace_log(f"FIX > {repr_safe(frame)}")
         return seq
 
     def _housekeep(self) -> None:
@@ -477,7 +481,7 @@ class FixSession:
         self._last_in_t = self._clock()
         self._test_req_sent = None
         if self.trace:
-            self._log(f"FIX < {repr_safe(msg)}")
+            self._trace_log(f"FIX < {repr_safe(msg)}")
         mtype = msg.msg_type
         seq = msg.seq
 

@@ -308,6 +308,22 @@ class Venue:
         """The venue's amount unit -> base units."""
         return amount * self.contract_size
 
+    def single_close_units(self, side: str) -> Optional[float]:
+        """Base units ONE broker order of ``side`` ('buy' / 'sell') can
+        reduce by - the oldest opposite ticket on a hedging MT5 quote leg
+        (its connector's ``next_close_lots``) - or None where an order is
+        never split across positions (every other connector). 0.0 = there is
+        NO opposite ticket, or the tickets could not be read: an order of
+        ``side`` would open a position there, so it is not a reducing order."""
+        fn = getattr(self.client, "next_close_lots", None)
+        if fn is None:
+            return None
+        try:
+            lots = fn(OrderSide.BUY if side == "buy" else OrderSide.SELL)
+        except Exception:                                   # noqa: BLE001
+            return 0.0
+        return 0.0 if lots is None else self.to_units(float(lots))
+
     def amount_to_precision(self, units: float) -> float:
         """Round base units to what the venue will accept, in base units."""
         raw = self.exchange.amount_to_precision(self.symbol, self.to_contracts(units))
@@ -644,6 +660,13 @@ class Venue:
         """Whether the gateway amends this bot's orders in place (the
         connector says: its gateway's order path for this account + symbol)."""
         return bool(getattr(self.client, "supports_amend", False))
+
+    @property
+    def amend_replaces(self) -> bool:
+        """Whether :meth:`edit_limit` REPLACES the resting order (cancel +
+        a fresh one) instead of editing it. The engine then sizes the amend
+        by what is still unfilled, not by the order's original amount."""
+        return bool(getattr(self.client, "amend_replaces", False))
 
     # ── the order transport: the gateway lease ───────────────────────────────
     # ONE transport owns order operations: the connector's gateway lease. It

@@ -860,6 +860,11 @@ class FakeQuotes:
     def set_handler(self, fn):
         self.handler = fn
 
+    def symbol_for(self, exante_id, exchange="", symbol_type="", expiry_ms=None,
+                   overrides=None):
+        from atjte.gateways.exante import quotes as Q
+        return Q.symbol_in(Q.DATASET, exante_id, exchange, symbol_type, expiry_ms, overrides)
+
     def ohlcv(self, db, timeframe, since=None, limit=None):
         self.ohlcv_calls.append((db, timeframe, since, limit))
         if self.ohlcv_error:
@@ -1141,6 +1146,85 @@ class DatabentoSymbolTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Q.databento_symbol("GC.COMEX")
 
+    def test_eurex_futures_map_to_databento_s_eobi_symbol(self):
+        """Read from Databento's XEUR.EOBI symbology, 2026-11-09."""
+        from atjte.gateways.exante import quotes as Q
+        dec18 = 1797595200000                   # 2026-12-18T12:00Z, EXANTE's expiry
+        self.assertEqual(Q.eurex_symbol("FDXM.EUREX.Z2026", dec18), "FDXM SI 20261218 CS")
+        self.assertEqual(Q.symbol_in(Q.EUREX_DATASET, "FDXS.EUREX.Z2026", "EUREX", "FUTURE",
+                                     dec18), "FDXS SI 20261218 CS")
+        ov = {"FGBL.EUREX.Z2026": "FGBL SI 20261208 PS"}
+        self.assertEqual(Q.symbol_in(Q.EUREX_DATASET, "FGBL.EUREX.Z2026", "", "", None, ov),
+                         "FGBL SI 20261208 PS")
+        # each dataset carries only its own exchanges
+        self.assertIsNone(Q.symbol_in(Q.DATASET, "FDXM.EUREX.Z2026", "", "", dec18))
+        self.assertIsNone(Q.symbol_in(Q.EUREX_DATASET, "GC.COMEX.Z2026"))
+        self.assertIsNone(Q.symbol_in(Q.EUREX_DATASET, "FDXM.EUREX.Z2026", "EUREX", "OPTION",
+                                      dec18))
+        with self.assertRaises(ValueError):             # no expiry, no override
+            Q.symbol_in(Q.EUREX_DATASET, "FDXM.EUREX.Z2026")
+
+    def test_a_router_sends_each_contract_to_its_dataset_s_source(self):
+        from atjte.gateways.exante import quotes as Q
+
+        class Lease:
+            connected, reason = True, ""
+
+            def __init__(self, dataset):
+                self.session = {"dataset": dataset, "quotes_ok": True}
+                self.subs = []
+
+            def subscribe(self, s):
+                self.subs.append(s)
+
+            def start(self, wait_s=0.0):
+                pass
+
+            def stop(self):
+                pass
+
+        leases = {}
+
+        def src(name, dataset, port):
+            def mk(**kw):
+                leases[name] = Lease(dataset)
+                return leases[name]
+            return Q.DatabentoQuotes(port=port, token="", client="t", gateway=name,
+                                     dataset=dataset, lease_factory=mk)
+        r = Q.QuoteRouter([src("databento", Q.DATASET, 5670),
+                           src("databento_eurex", Q.EUREX_DATASET, 5671)])
+        fdxm = r.symbol_for("FDXM.EUREX.Z2026", "EUREX", "FUTURE", 1797595200000)
+        mgc = r.symbol_for("MGC.COMEX.Z2026", "COMEX", "FUTURE", None)
+        self.assertEqual((fdxm, mgc), ("FDXM SI 20261218 CS", "MGCZ6"))
+        self.assertIsNone(r.symbol_for(XAU_ID, "E", "FX_SPOT"))
+        r.subscribe(fdxm)
+        r.subscribe(mgc)
+        self.assertEqual(leases["databento_eurex"].subs, [fdxm])
+        self.assertEqual(leases["databento"].subs, [mgc])
+        self.assertTrue(r.ok(fdxm) and r.ok(mgc))
+        # a source on the wrong dataset is not trusted
+        leases["databento_eurex"].session["dataset"] = Q.DATASET
+        self.assertIn("not XEUR.EOBI", r.problem(fdxm))
+        self.assertIn("no Databento source", r.problem("UNKNOWN"))
+        self.assertEqual(len(r.status()["sources"]), 2)
+
+    def test_the_gateway_s_health_reads_every_source(self):
+        """2026-11-09: with two sources the daemon read the router's status as
+        one source, found no ``connected`` and showed the gateway degraded."""
+        from atjte.gateways.exante import quotes as Q
+
+        def src(ok, symbols):
+            return {"connected": True, "session": {"quotes_ok": ok}, "symbols": symbols}
+        both = {"sources": [src(True, {"MGCZ6": "ok"}), src(True, {"FDXM SI 20261218 CS": "ok"})]}
+        self.assertTrue(Q.sources_up(both))
+        self.assertTrue(Q.sources_up(None))
+        idle_eurex = {"sources": [src(True, {"MGCZ6": "ok"}), src(False, {})]}
+        self.assertTrue(Q.sources_up(idle_eurex))            # nothing priced there yet
+        down = {"sources": [src(True, {"MGCZ6": "ok"}), src(False, {"FDXM SI 20261218 CS": "x"})]}
+        self.assertFalse(Q.sources_up(down))
+        self.assertTrue(Q.sources_up(src(True, {})))          # one source, as before
+        self.assertFalse(Q.sources_up(src(False, {"MGCZ6": "ok"})))
+
 
 class DatabentoPricedTest(unittest.TestCase):
     def setUp(self):
@@ -1265,10 +1349,43 @@ class QuoteSourceConfigTest(ConfigTest):
         self.assertEqual((q.port, q.gateway), (5677, "databento_cme"))
         q.stop()
 
+    def test_a_list_of_sources_routes_each_dataset_to_its_gateway(self):
+        d = CFG.scaffold("exante_demo", "demo")
+        raw = json.loads((d / CFG.CONFIG_NAME).read_text(encoding="utf-8"))
+        raw["quote_source"] = [{"gateway": "databento"},
+                               {"gateway": "databento_eurex",
+                                "symbols": {"FGBL.EUREX.Z2026": "FGBL SI 20261208 PS"}}]
+        (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")
+        (d / CFG.ENV_NAME).write_text(
+            "exante_application_id = A\nexante_access_key = K\n"
+            "exante_fix_trade_password = T\ndb_gateway_token = DB\n", encoding="utf-8")
+        cfg = CFG.load("exante_demo")
+        self.assertEqual(cfg.quote_gateway, "databento")
+        self.assertEqual([g for g, _p, _s in cfg.quote_sources],
+                         ["databento", "databento_eurex"])
+        self.assertEqual(cfg.quote_symbols, {"FGBL.EUREX.Z2026": "FGBL SI 20261208 PS"})
+        db_root = self.root / "db"
+        for name, port, dataset in (("databento", 5670, "GLBX.MDP3"),
+                                    ("databento_eurex", 5671, "XEUR.EOBI")):
+            (db_root / name).mkdir(parents=True)
+            (db_root / name / "gateway.json").write_text(json.dumps(
+                {"venue": "databento", "listen_port": port, "dataset": dataset}),
+                encoding="utf-8")
+        from atjte.gateways.databento import config as DC
+        from atjte.gateways.exante import quotes as Q
+        with mock.patch.object(DC, "gateways_dir", return_value=db_root):
+            q = CFG.make_quotes(cfg)
+        self.assertIsInstance(q, Q.QuoteRouter)
+        self.assertEqual([(s.gateway, s.port, s.dataset) for s in q.sources],
+                         [("databento", 5670, "GLBX.MDP3"),
+                          ("databento_eurex", 5671, "XEUR.EOBI")])
+        q.stop()
+
     def test_a_bad_quote_source_is_refused(self):
         d = CFG.scaffold("exante_demo", "demo")
         for bad in ("databento_cme", {"gateway": "Bad Name"}, {"gateway": "db", "x": 1},
-                    {"gateway": "db", "symbols": ["GCZ6"]}):
+                    {"gateway": "db", "symbols": ["GCZ6"]},
+                    [{"gateway": "db"}, {"gateway": "db"}], ["db"]):
             raw = json.loads((d / CFG.CONFIG_NAME).read_text(encoding="utf-8"))
             raw["quote_source"] = bad
             (d / CFG.CONFIG_NAME).write_text(json.dumps(raw), encoding="utf-8")

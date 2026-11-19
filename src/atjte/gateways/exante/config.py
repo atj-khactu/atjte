@@ -28,7 +28,12 @@ gateway instead of the FIX FEED (:mod:`.quotes`)::
 
 with that gateway's loopback token as ``db_gateway_token`` in THIS
 ``gateway.env``; the FIX FEED password is then needed only for instruments
-that are not CME Group futures.
+that are not CME Group futures. A Databento gateway serves one dataset (read
+from its own ``gateway.json``), so Eurex futures take a second one on
+``XEUR.EOBI``: ``quote_source`` is then a LIST of such objects, all on the
+one ``db_gateway_token``::
+
+    "quote_source": [{"gateway": "databento"}, {"gateway": "databento_eurex"}]
 
 Optional: ``feed_port`` / ``trade_port`` (default 8100 / 8101 demo, 27000 /
 27001 live), ``feed_sender`` / ``trade_sender`` (default
@@ -39,7 +44,10 @@ what EXANTE documents; the demo TRADE login came suffixed,
 ``heartbeat_s`` (30), ``fix_ca_file`` (live: EXANTE's own CA certificate,
 PEM, in this folder — EXANTE signs its live bridges with a private CA no
 public store holds; trusted for this gateway's FIX connections only, with
-hostname checking unchanged).
+hostname checking unchanged), ``fix_trace`` (false; true / "trade" writes
+every TRADE-session FIX message, "all" the FEED's too, to
+``logs/fix_<YYYYMMDD>.log`` with millisecond UTC times, the password
+redacted — :mod:`.fixlog`; read at start).
 
 ``gateway.env`` (read from this file only — never the process environment
 or the workspace's ``env/.env``)::
@@ -70,6 +78,7 @@ from atjte.credentials import parse_env_text
 from atjte.gateways import accounts as _A
 
 from ...fix import exante as X
+from . import fixlog as FL
 
 CONFIG_NAME = "gateway.json"
 ENV_NAME = "gateway.env"
@@ -104,7 +113,7 @@ MAX_MSGS_PER_MIN = 6000.0
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _ACCOUNT_RE = re.compile(r"^[A-Z0-9]{3,20}\.\d{3}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "fix_host", "feed_port", "trade_port",
-          "feed_sender", "trade_sender", "feed_target", "trade_target", "fix_ca_file",
+          "feed_sender", "trade_sender", "feed_target", "trade_target", "fix_ca_file", "fix_trace",
           "symbols", "depth", "tif", "heartbeat_s",
           "msgs_per_min", "max_inflight", "clients", "quote_source",
           "_comment"} | _A.KEYS
@@ -131,6 +140,8 @@ class GatewayConfig:
     #: EXANTE's own CA certificate (PEM) the live bridges chain to — a path in
     #: this gateway's folder (or absolute); "" = the OS store + certifi only
     fix_ca_file: str = ""
+    #: ``fix_trace``: "" (off), "trade" or "all" — :mod:`.fixlog`
+    fix_trace: str = ""
     symbols: list = field(default_factory=list)
     depth: int = 10
     tif: str = "DAY"
@@ -144,6 +155,9 @@ class GatewayConfig:
     quote_gateway: str = ""
     quote_port: int = 0
     quote_symbols: dict = field(default_factory=dict)
+    #: every source of a LIST ``quote_source`` (the first is the fields above;
+    #: ``quote_symbols`` merges all their overrides): [(gateway, port, symbols)]
+    quote_sources: list = field(default_factory=list)
     publish_accounts: bool = True
     accounts_every_s: float = _A.EVERY_S
     # gateway.env (raw text; never returned in a message)
@@ -215,9 +229,11 @@ class GatewayConfig:
                 "complete": self.complete, "missing": self.missing,
                 "token_set": bool(self.token), "clients_allowed": list(self.clients),
                 "fix_ca_file": Path(self.fix_ca_file).name if self.fix_ca_file else None,
+                "fix_trace": self.fix_trace or None,
                 "quote_source": ({"gateway": self.quote_gateway, "port": self.quote_port or None,
                                   "token_set": bool(self.quote_token),
-                                  "symbols": dict(self.quote_symbols)}
+                                  "symbols": dict(self.quote_symbols),
+                                  "gateways": [g for g, _p, _s in self.quote_sources]}
                                  if self.quote_gateway else None),
                 "msgs_per_min": self.msgs_per_min,
                 "over_exante_limit": self.msgs_per_min > EXANTE_MSGS_PER_MIN}
@@ -322,8 +338,15 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         raise ConfigError(f"{CONFIG_NAME}: msgs_per_min is above 0 and at most "
                           f"{MAX_MSGS_PER_MIN:g} (EXANTE publishes 25 order requests per "
                           f"10 s = {EXANTE_MSGS_PER_MIN:g} / min)")
-    cfg.quote_gateway, cfg.quote_port, cfg.quote_symbols = parse_quote_source(
-        raw.get("quote_source"))
+    try:
+        cfg.fix_trace = FL.parse_mode(raw.get("fix_trace"))
+    except ValueError as e:
+        raise ConfigError(f"{CONFIG_NAME}: {e}") from None
+    cfg.quote_sources = parse_quote_sources(raw.get("quote_source"))
+    if cfg.quote_sources:
+        cfg.quote_gateway, cfg.quote_port, _first = cfg.quote_sources[0]
+        cfg.quote_symbols = {k: v for _g, _p, syms in cfg.quote_sources
+                             for k, v in syms.items()}
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
@@ -368,25 +391,52 @@ def parse_quote_source(raw) -> tuple[str, int, dict]:
     return name, port, {str(k): str(v).strip() for k, v in syms.items() if str(v).strip()}
 
 
-def quote_port(cfg: GatewayConfig) -> int:
-    """The Databento gateway's port: ``quote_source.port``, else its own
-    ``gateway.json`` (never its gateway.env)."""
-    if cfg.quote_port:
-        return cfg.quote_port
+def parse_quote_sources(raw) -> list[tuple[str, int, dict]]:
+    """``quote_source`` -> [(gateway, port or 0, overrides)]: one object, or a
+    list of them (one Databento gateway per dataset); absent -> []."""
+    if raw in (None, "", {}, []):
+        return []
+    items = raw if isinstance(raw, list) else [raw]
+    out = [parse_quote_source(r) for r in items]
+    names = [g for g, _p, _s in out]
+    if len(set(names)) != len(names):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source names a Databento gateway twice")
+    return out
+
+
+def quote_port(cfg: GatewayConfig, gateway: str = "", port: int = 0) -> int:
+    """A Databento gateway's port (the first source's by default):
+    ``quote_source.port``, else its own ``gateway.json`` (never its
+    gateway.env)."""
+    if not gateway:
+        gateway, port = cfg.quote_gateway, cfg.quote_port
+    if port:
+        return port
     from atjte.gateways.databento import config as DC
     try:
-        return DC.listen_port_of(cfg.quote_gateway)
+        return DC.listen_port_of(gateway)
     except DC.ConfigError as e:
         raise ConfigError(f"quote_source: {e}") from None
 
 
 def make_quotes(cfg: GatewayConfig, *, log=None):
-    """The Databento lease of a gateway with a ``quote_source`` (else None)."""
+    """The Databento lease(s) of a gateway with a ``quote_source`` (else
+    None): one :class:`DatabentoQuotes` per source, on the dataset its
+    Databento gateway serves; several behind a :class:`QuoteRouter`."""
     if not cfg.quote_gateway:
         return None
-    from .quotes import DatabentoQuotes
-    return DatabentoQuotes(port=quote_port(cfg), token=cfg.quote_token,
-                           client=f"exante:{cfg.name}", gateway=cfg.quote_gateway, log=log)
+    from atjte.gateways.databento import config as DC
+    from .quotes import DatabentoQuotes, QuoteRouter
+    srcs = []
+    for gw, port, _syms in (cfg.quote_sources or [(cfg.quote_gateway, cfg.quote_port, {})]):
+        try:
+            dataset = DC.dataset_of(gw)
+        except DC.ConfigError as e:
+            raise ConfigError(f"quote_source: {e}") from None
+        srcs.append(DatabentoQuotes(port=quote_port(cfg, gw, port), token=cfg.quote_token,
+                                    client=f"exante:{cfg.name}", gateway=gw,
+                                    dataset=dataset, log=log))
+    return srcs[0] if len(srcs) == 1 else QuoteRouter(srcs)
 
 
 def scaffold(name: str, network: str = "demo") -> Path:

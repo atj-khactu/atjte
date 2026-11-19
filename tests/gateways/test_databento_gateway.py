@@ -347,7 +347,7 @@ class BookDepthTest(unittest.TestCase):
         lv.cb(_mbp1(4124.1, 4124.3))
         self.assertNotIn("book", got[-1]["info"])
         from atjte.gateways.databento import config as DC
-        self.assertEqual(DC.QUOTE_SCHEMAS, ("mbp-1", "mbp-10"))
+        self.assertEqual(DC.QUOTE_SCHEMAS, ("mbp-1", "mbp-10", "cmbp-1"))
 
 
 class RefusingLive(FakeLive):
@@ -467,6 +467,108 @@ class QuoteUpstreamTest(unittest.TestCase):
         with self.assertRaises(ccxt.ExchangeNotAvailable):
             up.subscribe_quotes("BAD")
         self.assertEqual(up.status()["quote_symbols"], ["GCZ6"])
+
+
+class ConsolidatedTopTest(unittest.TestCase):
+    """``quote_schema`` cmbp-1: the top of book WITH CME's implied prices
+    (2026-11-18: GCG7's direct book was 2.6 wide, TWS's market far tighter)."""
+
+    def _up(self):
+        lv = FakeLive()
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", [], historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=lambda k: lv, clock=lambda: NOW,
+                                 quote_schema="cmbp-1")
+        up.start()
+        got = []
+        up.set_quote_handler(lambda s, q: got.append(q))
+        up.subscribe_quotes("GCG7")
+        lv.cb(NS(stype_in_symbol="GCG7", instrument_id=7))
+        return up, lv, got
+
+    def test_cmbp1_records_are_quotes(self):
+        up, lv, got = self._up()
+        self.assertEqual(lv.subs, [("GLBX.MDP3", "cmbp-1", ("GCG7",), "raw_symbol")])
+        rec = _mbp1(3795.6, 3795.8)
+        rec.rtype = U.RTYPE_CMBP_1
+        lv.cb(rec)
+        self.assertEqual((got[-1]["bid"], got[-1]["ask"]), (3795.6, 3795.8))
+        self.assertNotIn("book", got[-1]["info"])
+
+    def test_a_refused_cmbp1_falls_back_to_the_direct_book(self):
+        up, lv, got = self._up()
+        lv.cb(NS(err="Not authorized for cmbp-1 schema"))
+        self.assertTrue(wait_for(lambda: ("GLBX.MDP3", "mbp-1", ("GCG7",), "raw_symbol")
+                                 in lv.subs))
+        self.assertEqual(up.quote_schema, "mbp-1")
+        self.assertIn("cmbp-1 refused", up.status()["quote_fallback"])
+        lv.cb(_mbp1(3794.4, 3797.0))
+        self.assertEqual(got[-1]["bid"], 3794.4)
+
+    def test_config_takes_cmbp1(self):
+        from atjte.gateways.databento import config as DC
+        self.assertIn("cmbp-1", DC.QUOTE_SCHEMAS)
+
+
+class SilentSessionTest(unittest.TestCase):
+    """A live session that died without a disconnect (2026-11-18: silent
+    from 06:36 UTC, no error, no reconnect) is reopened with everything."""
+
+    def _up(self, symbols=("GCZ6",)):
+        self.now = [float(NOW)]
+        self.made = []
+
+        def factory(k):
+            lv = FakeLive()
+            self.made.append(lv)
+            return lv
+        up = U.DatabentoUpstream("k", "GLBX.MDP3", list(symbols),
+                                 historical_factory=lambda k: FakeHistorical(),
+                                 live_factory=factory, clock=lambda: self.now[0])
+        up.start()
+        return up
+
+    def test_silent_session_is_reopened_with_bars_and_quotes(self):
+        up = self._up()
+        up.subscribe_quotes("GCX6")
+        self.assertEqual(len(self.made), 1)
+        self.now[0] += U.LIVE_REOPEN_S - 1
+        self.assertFalse(up.check_live())               # not silent long enough
+        self.now[0] += 2
+        self.assertTrue(up.check_live())
+        self.assertEqual(len(self.made), 2)
+        new = self.made[1]
+        self.assertTrue(new.started)
+        schemas = {(sc, syms) for _ds, sc, syms, _st in new.subs}
+        self.assertIn(("ohlcv-1m", ("GCZ6",)), schemas)
+        self.assertIn((U.MID_SCHEMA, ("GCZ6",)), schemas)
+        self.assertIn((up.quote_schema, ("GCX6",)), schemas)
+        self.assertTrue(up.live_alive())                # the window starts afresh
+        self.assertEqual(up.counters["reopens"], 1)
+
+    def test_heartbeats_keep_it_and_reopens_are_spaced(self):
+        up = self._up(symbols=())
+        up.subscribe_quotes("GCZ6")
+        for _ in range(5):                              # a heartbeat every 10 s
+            self.now[0] += U.HEARTBEAT_S
+            self.made[0].cb(NS(is_heartbeat=True, msg="Heartbeat", instrument_id=0))
+            self.assertFalse(up.check_live())
+        self.now[0] += U.LIVE_REOPEN_S + 1
+        self.assertTrue(up.check_live())
+        self.now[0] += U.LIVE_REOPEN_S - 1               # the new one silent too: wait
+        self.assertFalse(up.check_live())
+        self.now[0] += 2
+        self.assertTrue(up.check_live())
+        self.assertEqual(len(self.made), 3)
+
+    def test_nothing_subscribed_or_stopped_reopens_nothing(self):
+        up = self._up(symbols=())
+        self.now[0] += 10 * U.LIVE_REOPEN_S
+        self.assertFalse(up.check_live())               # no session wanted yet
+        up.subscribe_quotes("GCZ6")
+        up.stop()
+        self.now[0] += 10 * U.LIVE_REOPEN_S
+        self.assertFalse(up.check_live())
+        self.assertEqual(len(self.made), 1)
 
 
 class QuoteGatewayTest(unittest.TestCase):

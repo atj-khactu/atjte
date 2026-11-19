@@ -96,7 +96,7 @@ GRID_CENTER = 0.0
 # CFD by its financing to expiry, and that basis melts by a day's worth
 # every day. The center of the grid is therefore
 #     center = GRID_CENTER + reference price x CARRY_ANNUAL_PCT / 100 x DTE / 365
-# with DTE the (fractional) days to the DELIVERY date (CARRY_DELIVERY: when
+# with DTE the (fractional) days to the DELIVERY date (CONVERGENCE_DATE: when
 # a physically delivered future starts trading as spot) and the
 # reference the MT5 mid the engine quotes off, taken at the moment of the
 # update. It is recomputed at startup and then ONCE A DAY, at
@@ -108,7 +108,7 @@ CARRY_ANNUAL_PCT = 4.4       # % of the reference price per YEAR (one day = this
 CARRY_EXPIRY = None          # "YYYY-MM-DD" = the contract's last trade date;
                              # None = the venue market's own expiry (a dated
                              # CCXT future / the IBKR gateway's markets carry it)
-CARRY_DELIVERY = None        # "YYYY-MM-DD" = the day the basis reaches spot (what
+CONVERGENCE_DATE = None      # "YYYY-MM-DD" = the day the basis reaches spot (what
                              # the days above count to); None = the first delivery
                              # day of the contract's delivery month (the IBKR
                              # gateway's markets carry it), else the expiry
@@ -121,7 +121,7 @@ CARRY_LAST_ENTRY_DTE = 1.0
 # Close the position on this date and enter nothing from then on:
 # 'YYYY-MM-DD' (00:00 UTC) or 'YYYY-MM-DD HH:MM' (UTC), closed through the
 # LIQUIDATION_EXIT_MODE, the Hedge following. Set it ahead of the contract's
-# first delivery day (CARRY_DELIVERY) — IBKR closes a delivering future itself
+# first delivery day (CONVERGENCE_DATE) — IBKR closes a delivering future itself
 # ahead of delivery, at a time of its choosing. None = off.
 CLOSE_BEFORE_DELIVERY_DATE = None
 

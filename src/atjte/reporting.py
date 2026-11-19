@@ -568,7 +568,8 @@ def venue_block(*, venue_id: str, symbol: str, market_kind: str, unit_label: str
                 funding: Optional[dict] = None,
                 open_orders: Iterable[dict] = (),
                 book: Optional[dict] = None,
-                magic: Optional[int] = None) -> dict:
+                magic: Optional[int] = None,
+                swap: Optional[dict] = None) -> dict:
     """The snapshot's ``venue`` block. A leg that has NOT been read is
     ``None`` (the reader shows "not read", never a flat 0). ``magic``: the
     bot's magic on an MT5 quote leg's terminal (its venue deals are
@@ -581,6 +582,10 @@ def venue_block(*, venue_id: str, symbol: str, market_kind: str, unit_label: str
            "open_orders": list(open_orders)}
     if magic is not None:
         out["magic"] = int(magic)
+    if swap:
+        # an MT5 quote leg's overnight swap terms (:func:`swap_terms`): the
+        # panel annualizes them as it does the hedge's
+        out["swap"] = dict(swap)
     return out
 
 

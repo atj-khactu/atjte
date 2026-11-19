@@ -28,6 +28,17 @@
 
 ``contracts`` may be empty when the gateway only hedges.
 
+Optional: ``quote_source`` — CME Group futures (GC, MGC, ES …) priced from a
+Databento gateway on ``GLBX.MDP3`` instead of TWS's market data (orders,
+fills and reads stay IB's; :mod:`.upstream`)::
+
+    "quote_source": {"gateway": "databento_cme",     # a Databento gateway's name
+                     "port": 5670,                    # optional: read from its gateway.json
+                     "symbols": {"GC/USD:USD-261229": "GCZ6"}}   # optional overrides
+
+The Databento gateway's loopback token goes in THIS gateway's
+``gateway.env`` as ``db_gateway_token`` (the same value as there).
+
 ``network`` is ``live`` or ``paper`` — which TWS login this gateway is for.
 Nothing on the API socket says which one it is (a paper account id merely
 starts with ``D``), so the gateway CHECKS: a ``paper`` gateway refuses an
@@ -41,6 +52,7 @@ the workspace's ``env/.env``: the gateway's account is the gateway's). Account
     ibkr_account = DU1234567          # the account this gateway trades as 'main'
     ibkr_account_sub1 = U7654321      # ... one per other account listed
     ib_gateway_token = ...            # the loopback handshake secret
+    db_gateway_token = ...            # with quote_source: the Databento gateway's
 
 TWS itself holds the login (the gateway never sees a password): TWS or IB
 Gateway must be running, logged in, with the API enabled (Configure → API →
@@ -77,6 +89,10 @@ NETWORKS = ("live", "paper")
 TWS_PORTS = {"live": 7496, "paper": 7497}
 DEFAULT_CLIENT_ID = 7
 TOKEN_NAME = "ib_gateway_token"
+#: the Databento gateway's loopback token (with ``quote_source``)
+DB_TOKEN_NAME = "db_gateway_token"
+#: the one dataset a quote source may serve: CME Globex (GC, MGC, ...)
+QUOTE_DATASET = "GLBX.MDP3"
 ACCOUNT_NAME = "ibkr_account"
 #: what a contract spec may be: futures (every expiry TWS lists becomes a
 #: market) and CMDTY — IBKR's spot commodities (XAUUSD on SMART), one market
@@ -101,7 +117,8 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 _HEDGE_NAME_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]{0,29}$")
 _KNOWN = {"name", "venue", "network", "listen_port", "host", "port", "client_id",
           "accounts", "contracts", "msgs_per_min", "max_inflight", "clients", "_comment",
-          "reject_pause_s", "hedge"}
+          "reject_pause_s", "manual_fills_poll_s", "hedge", "quote_source"}
+_QUOTE_KEYS = {"gateway", "port", "symbols", "_comment"}
 _HEDGE_KEYS = {"listen_port", "account", "symbols", "fill_timeout_s", "_comment"}
 _HEDGE_SYMBOL_KEYS = {"name", "sec_type", "symbol", "exchange", "currency",
                       "primary_exchange", "expiry", "contract_size", "qty_per_lot",
@@ -297,6 +314,11 @@ class GatewayConfig:
     #: after IBKR rejects an order (201 / 203), new orders on that symbol are
     #: refused this long (0 = off) — see upstream.ORDER_REJECT_CODES
     reject_pause_s: float = 60.0
+    #: how often TWS's executions are read for trades NOT placed by this
+    #: gateway (by hand in TWS, another API client), pushed to the bot on
+    #: that account + symbol so it hedges them (0 = off) — see
+    #: upstream.MANUAL_POLL_S
+    manual_fills_poll_s: float = 5.0
     clients: list = field(default_factory=list)
     #: account_state.json (:mod:`atjte.gateways.accounts`)
     publish_accounts: bool = True
@@ -306,6 +328,13 @@ class GatewayConfig:
     token: str = ""
     #: the hedge side (``hedge`` in gateway.json), None = venue side only
     hedge: Optional[HedgeConfig] = None
+    #: ``quote_source``: the Databento gateway CME Group futures are priced
+    #: from ("" = TWS's market data), its port (0 = its gateway.json's),
+    #: per-symbol overrides, and its loopback token (gateway.env)
+    quote_gateway: str = ""
+    quote_port: int = 0
+    quote_symbols: dict = field(default_factory=dict)
+    quote_token: str = ""
 
     @property
     def missing(self) -> list[str]:
@@ -336,7 +365,12 @@ class GatewayConfig:
                 "complete": self.complete, "missing": self.missing,
                 "token_set": bool(self.token), "clients_allowed": list(self.clients),
                 "msgs_per_min": self.msgs_per_min,
-                "hedge": self.hedge.status() if self.hedge is not None else None}
+                "hedge": self.hedge.status() if self.hedge is not None else None,
+                "quote_source": ({"gateway": self.quote_gateway,
+                                  "port": self.quote_port or None,
+                                  "token_set": bool(self.quote_token),
+                                  "symbols": dict(self.quote_symbols)}
+                                 if self.quote_gateway else None)}
 
 
 def gateways_dir() -> Path:
@@ -428,18 +462,72 @@ def load(name_or_path: str, env_file: Optional[Path] = None) -> GatewayConfig:
         max_inflight=int(raw.get("max_inflight") or 20),
         reject_pause_s=float(60.0 if raw.get("reject_pause_s") is None
                              else raw["reject_pause_s"]),
+        manual_fills_poll_s=float(5.0 if raw.get("manual_fills_poll_s") is None
+                                  else raw["manual_fills_poll_s"]),
         clients=[str(c) for c in (raw.get("clients") or [])])
     cfg.hedge = parse_hedge(raw.get("hedge"), network=network, accounts=accounts,
                             listen_port=cfg.listen_port)
     cfg.publish_accounts, cfg.accounts_every_s = _A.settings(raw, ConfigError)
+    cfg.quote_gateway, cfg.quote_port, cfg.quote_symbols = parse_quote_source(
+        raw.get("quote_source"))
     envp = Path(env_file) if env_file else d / ENV_NAME
     try:
         env = {k.lower(): v for k, v in parse_env_text(envp.read_text(encoding="utf-8")).items()}
     except OSError:
         env = {}
     cfg.token = env.get(TOKEN_NAME, "")
+    cfg.quote_token = env.get(DB_TOKEN_NAME, "")
     cfg.account_ids = {a: env.get(env_name(a), "") for a in accounts}
     return cfg
+
+
+def parse_quote_source(raw) -> tuple[str, int, dict]:
+    """``quote_source`` -> (Databento gateway name, port or 0, overrides);
+    absent / null -> ("", 0, {}). ONE source: an IBKR gateway's futures are
+    CME Group's, all on ``GLBX.MDP3``."""
+    if raw in (None, "", {}):
+        return "", 0, {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source is one object: "
+                          f'{{"gateway": "<a Databento gateway on {QUOTE_DATASET}>"}}')
+    unknown = sorted(set(raw) - _QUOTE_KEYS)
+    if unknown:
+        raise ConfigError(f"{CONFIG_NAME}: quote_source: unknown key(s) {', '.join(unknown)}")
+    name = str(raw.get("gateway") or "").strip()
+    if not _NAME_RE.match(name):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source.gateway names a Databento gateway "
+                          f"(lower-case letters, digits and _)")
+    try:
+        port = int(raw.get("port") or 0)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source.port is a number") from None
+    syms = raw.get("symbols") or {}
+    if not isinstance(syms, dict):
+        raise ConfigError(f"{CONFIG_NAME}: quote_source.symbols maps a market (or IB's local "
+                          f'symbol) to its Databento symbol: {{"GC/USD:USD-261229": "GCZ6"}}')
+    return name, port, {str(k): str(v).strip() for k, v in syms.items() if str(v).strip()}
+
+
+def make_quotes(cfg: GatewayConfig, *, log=None):
+    """The Databento lease of a gateway with a ``quote_source`` (else None):
+    the EXANTE gateway's :class:`~atjte.gateways.exante.quotes.DatabentoQuotes`,
+    on the Databento gateway's port (``quote_source.port``, else its own
+    gateway.json — never its gateway.env). Refuses a source that does not
+    serve :data:`QUOTE_DATASET`."""
+    if not cfg.quote_gateway:
+        return None
+    from atjte.gateways.databento import config as DC
+    from atjte.gateways.exante.quotes import DatabentoQuotes
+    try:
+        dataset = DC.dataset_of(cfg.quote_gateway)
+        port = cfg.quote_port or DC.listen_port_of(cfg.quote_gateway)
+    except DC.ConfigError as e:
+        raise ConfigError(f"quote_source: {e}") from None
+    if dataset != QUOTE_DATASET:
+        raise ConfigError(f"quote_source: the Databento gateway {cfg.quote_gateway} serves "
+                          f"{dataset}, not {QUOTE_DATASET} (CME Globex)")
+    return DatabentoQuotes(port=port, token=cfg.quote_token, client=f"ibkr:{cfg.name}",
+                           gateway=cfg.quote_gateway, dataset=dataset, log=log)
 
 
 def scaffold(name: str, network: str = "paper") -> Path:

@@ -47,6 +47,15 @@ class CanonicaliseTest(unittest.TestCase):
         self.assertEqual(A.canonical("GRID_LEVELS"), "GRID_LEVELS")       # canonical: itself
         self.assertEqual(A.canonical("GRID_STEP_USD"), "GRID_STEP")         # the unit left the name
         self.assertEqual(A.canonical("DAILY_BLACKOUTS"), "DAILY_BREAKS")    # renamed 2026-10-27
+        self.assertEqual(A.canonical("CARRY_DELIVERY"), "CONVERGENCE_DATE")  # renamed 2026-11-16
+
+    def test_an_old_carry_delivery_is_read_and_migrated_as_the_convergence_date(self):
+        m = _mod(CARRY_DELIVERY="2026-12-01")
+        self.assertEqual(A.canonicalise(m), ["CONVERGENCE_DATE"])
+        self.assertEqual(m.CONVERGENCE_DATE, "2026-12-01")
+        text, renamed = A.rename_lines('CARRY_DELIVERY = "2026-12-01"   # pinned\n')
+        self.assertEqual(text, 'CONVERGENCE_DATE = "2026-12-01"   # pinned\n')
+        self.assertEqual(renamed, ["CARRY_DELIVERY"])
 
 
 class IdentityDefaultsTest(unittest.TestCase):

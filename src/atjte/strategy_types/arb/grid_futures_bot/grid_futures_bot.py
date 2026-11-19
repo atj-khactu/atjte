@@ -13,7 +13,7 @@ CFD is structurally
 
 with ``days`` the calendar days to the DELIVERY date — when the basis
 reaches spot: the first delivery day of the contract's delivery month for a
-physically delivered future (``CARRY_DELIVERY`` overrides; see
+physically delivered future (``CONVERGENCE_DATE`` overrides; see
 :mod:`atjte.engines.common.delivery`), not its last trade date. GC trades as
 spot from its delivery month on, weeks before its last trade date; 1OZ
 stops trading before its delivery month and keeps a few days of carry to
@@ -81,7 +81,8 @@ CARRY_EXPIRY = getattr(_S, "CARRY_EXPIRY", None)
 #: (the IBKR gateway's markets carry it: a physically delivered future
 #: trades as spot from then on, before its last trade date for GC, after it
 #: for 1OZ), else — a market with no delivery month — the expiry
-CARRY_DELIVERY = getattr(_S, "CARRY_DELIVERY", None)
+#: (a file from before 2026-11-16 says CARRY_DELIVERY: read the same)
+CONVERGENCE_DATE = getattr(_S, "CONVERGENCE_DATE", getattr(_S, "CARRY_DELIVERY", None))
 #: when the center is recomputed, once a day: "HH:MM" = UTC wall clock, or
 #: "HH:MM Area/City" = that zone's (daylight saving followed), e.g.
 #: "23:05 Europe/Prague"
@@ -103,12 +104,12 @@ def _check_settings() -> None:
         except ValueError as e:
             raise RuntimeError(f"CARRY_EXPIRY must be None (the venue's expiry) or "
                                f"'YYYY-MM-DD' — got {CARRY_EXPIRY!r} ({e})") from None
-    if CARRY_DELIVERY is not None:
+    if CONVERGENCE_DATE is not None:
         try:
-            parse_day_start(CARRY_DELIVERY)
+            parse_day_start(CONVERGENCE_DATE)
         except ValueError as e:
-            raise RuntimeError(f"CARRY_DELIVERY must be None (the contract's first delivery "
-                               f"day) or 'YYYY-MM-DD' — got {CARRY_DELIVERY!r} ({e})") from None
+            raise RuntimeError(f"CONVERGENCE_DATE must be None (the contract's first delivery "
+                               f"day) or 'YYYY-MM-DD' — got {CONVERGENCE_DATE!r} ({e})") from None
     try:
         parse_update(CARRY_UPDATE_UTC)
     except ValueError as e:
@@ -218,7 +219,7 @@ class GridFuturesBot(GridBot):
 
     def _delivery_date(self) -> Optional[datetime]:
         """The engine's close-before-delivery date: the carry's own
-        (``CARRY_DELIVERY``, else the first delivery day, else the expiry)."""
+        (``CONVERGENCE_DATE``, else the first delivery day, else the expiry)."""
         try:
             return self._delivery()[0]
         except Exception:                                   # noqa: BLE001
@@ -250,13 +251,13 @@ class GridFuturesBot(GridBot):
 
     def _delivery(self) -> tuple[datetime, str]:
         """``(when the basis reaches spot, where that came from)``:
-        ``CARRY_DELIVERY``; else the market's first delivery day (the IBKR
+        ``CONVERGENCE_DATE``; else the market's first delivery day (the IBKR
         gateway's ``info.firstDeliveryDate``, or its ``contractMonth``);
         else the expiry — a future with no delivery month settles at it."""
         if self._delivery_cached is not None:
             return self._delivery_cached
-        if CARRY_DELIVERY is not None:
-            self._delivery_cached = (parse_day_start(CARRY_DELIVERY), "CARRY_DELIVERY")
+        if CONVERGENCE_DATE is not None:
+            self._delivery_cached = (parse_day_start(CONVERGENCE_DATE), "CONVERGENCE_DATE")
             return self._delivery_cached
         info = (self.venue.exchange.market(self.venue.symbol) or {}).get("info") or {}
         first = info.get("firstDeliveryDate")
@@ -271,7 +272,7 @@ class GridFuturesBot(GridBot):
             # contracts HAVE a delivery month, so the expiry would be wrong
             raise RuntimeError(f"{self.venue.symbol}: the IBKR gateway lists no delivery month "
                                f"for it — restart the gateway (it publishes them since "
-                               f"0.1.4), or set CARRY_DELIVERY = 'YYYY-MM-DD'")
+                               f"0.1.4), or set CONVERGENCE_DATE = 'YYYY-MM-DD'")
         else:
             self._delivery_cached = (self._expiry(), "the expiry (no delivery month)")
         return self._delivery_cached

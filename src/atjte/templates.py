@@ -68,6 +68,13 @@ _TYPE_LABELS: dict[str, tuple[str, str]] = {
     "bollinger": ("Bollinger bands",
                   "Quotes off the rolling mean ± kσ of the spread, so the bands "
                   "widen and narrow with the spread's own volatility."),
+    "bollinger_fair_basis": ("Bollinger Ladder - Fair Basis Filter",
+                             "The Bollinger ladder kept on the right side of a dated future's fair basis (reference x cost of carry x days to convergence): longs enter only below it, shorts only above it, and exits wait while the spread is far from it."),
+    "bollinger_smooth": ("Bollinger smooth (ladder)",
+                         "Mean reversion of the 5-minute average of the spread: up to "
+                         "three tranches at max(kσ, k × a floor) from its 120-minute "
+                         "mean, all closed together back at the mean, executed as "
+                         "market pairs."),
     "fixed": ("Fixed levels",
               "One buy resting at BUY_SPREAD and one sell at SELL_SPREAD, "
               "whatever the position — no ladder; each round trip captures the "

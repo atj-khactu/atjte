@@ -172,11 +172,15 @@ class ExanteUpstream:
                  tif: str = X.TIF_DAY, heartbeat_s: int = 30,
                  quotes: Any = None, quote_symbols: Optional[dict] = None,
                  ca_file: str = "",
+                 fix_trace: Optional[dict] = None,
                  clock: Callable[[], float] = time.time,
                  log: Optional[Callable[[str], None]] = None) -> None:
         self.network = network
         #: EXANTE's own CA (PEM) the live FIX bridges' certificates chain to
         self.ca_file = str(ca_file or "")
+        #: role ("trade" / "feed") -> where that session's every FIX frame is
+        #: written (``fixlog.FixLog.writer``); a role not here is not traced
+        self.fix_trace = dict(fix_trace or {})
         self.account_id = account_id
         self.symbols = list(symbols)
         self.rest = rest
@@ -184,8 +188,9 @@ class ExanteUpstream:
         self._feed_cfg = dict(feed or {})        # {"sender", "target", "password", "port"}
         self._trade_cfg = dict(trade or {})
         self._factory = session_factory
-        #: a :class:`~atjte.gateways.exante.quotes.DatabentoQuotes` (or None:
-        #: everything on the FEED), and its per-id symbol overrides
+        #: a :class:`~atjte.gateways.exante.quotes.DatabentoQuotes` or a
+        #: :class:`~atjte.gateways.exante.quotes.QuoteRouter` over several (or
+        #: None: everything on the FEED), and the per-id symbol overrides
         self.quotes = quotes
         self._quote_overrides = dict(quote_symbols or {})
         self._db_of: dict[str, str] = {}             # ccxt symbol -> Databento symbol
@@ -272,13 +277,11 @@ class ExanteUpstream:
         """The Databento contract a market is priced from, or None (FEED)."""
         if self.quotes is None:
             return None
-        from . import quotes as Q
         info = m["info"]
-        if not Q.is_cme_future(m["id"], str(info.get("exchange") or ""),
-                               str(info.get("symbolType") or "")):
-            return None
         try:
-            return Q.databento_symbol(m["id"], self._quote_overrides)
+            return self.quotes.symbol_for(m["id"], str(info.get("exchange") or ""),
+                                          str(info.get("symbolType") or ""),
+                                          m.get("expiry"), self._quote_overrides)
         except ValueError as e:
             self._log(f"exante: {e} — priced from the FIX FEED")
             return None
@@ -317,11 +320,14 @@ class ExanteUpstream:
         or not a CME Group future)."""
         return any(s not in self._db_of for s in self._markets)
 
-    def _common(self) -> dict:
+    def _common(self, role: str) -> dict:
         out = {"host": self.fix_host, "network": self.network,
                "heartbeat_s": self.heartbeat_s, "log": self._log, "clock": self._clock}
         if self.ca_file:
             out["ca_file"] = self.ca_file
+        if self.fix_trace.get(role) is not None:
+            out["trace"] = True
+            out["trace_log"] = self.fix_trace[role]
         return out
 
     def _make_feed(self) -> bool:
@@ -338,7 +344,7 @@ class ExanteUpstream:
                        target=self._feed_cfg["target"],
                        password=self._feed_cfg["password"],
                        port=int(self._feed_cfg.get("port") or X.PORTS[self.network]["feed"]),
-                       on_message=self._on_feed, on_event=self._on_feed_event, **self._common())
+                       on_message=self._on_feed, on_event=self._on_feed_event, **self._common("feed"))
         return True
 
     def start(self) -> None:
@@ -362,7 +368,7 @@ class ExanteUpstream:
                         port=int(self._trade_cfg.get("port") or X.PORTS[self.network]["trade"]),
                         cancel_on_disconnect=True,
                         on_message=self._on_trade, on_event=self._on_trade_event,
-                        **self._common())
+                        **self._common("trade"))
         if self.feed is not None:
             self.feed.start()
         self.trade.start()
