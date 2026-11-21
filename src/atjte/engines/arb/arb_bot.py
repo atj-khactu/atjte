@@ -5067,12 +5067,12 @@ class ArbBot:
         tol = max(0.5 * venue_step, POS_EPS)
         mt5_tol = max(0.5 * float(getattr(self, "volume_step", 0.0) or 0.0)
                       * float(getattr(self, "contract_size", 0.0) or 0.0), POS_EPS)
-        if venue is not None and abs(self.venue_ledger.inv_units - venue) > tol:
+        if venue is not None and abs(self.venue_ledger.inv_units - venue) >= tol:
             rebased.append(f"perp {self.venue_ledger.inv_units:+.4f} -> {venue:+.4f} units")
             self.venue_ledger.seed(venue, self.venue_entry_px or self.mark_px
                                   or (self.venue_ticker.mid if self.venue_ticker else None))
         mt5_units, mt5_px = self._read_mt5_book()
-        if abs(self.mt5_ledger.inv_units - mt5_units) > mt5_tol:
+        if abs(self.mt5_ledger.inv_units - mt5_units) >= mt5_tol:
             rebased.append(f"MT5 {self.mt5_ledger.inv_units:+.4f} -> {mt5_units:+.4f} units")
             self.mt5_ledger.seed(mt5_units, mt5_px or self.mt5_mid_k)
         if rebased:

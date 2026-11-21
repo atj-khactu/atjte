@@ -2706,7 +2706,7 @@ class HedgeThresholdFromMt5Test(unittest.TestCase):
     def test_none_is_one_min_lot(self):
         pb.HEDGE_THRESHOLD_UNITS = None
         bot = make_bot([])
-        bot.volume_min, bot.contract_size = 0.01, 100.0
+        bot.volume_min, bot.volume_step, bot.contract_size = 0.01, 0.01, 100.0
         bot._resolve_hedge_threshold()
         self.assertAlmostEqual(pb.HEDGE_THRESHOLD_UNITS, 1.0)
         self.assertEqual(bot.hedge_threshold_from, "mt5_min_lot")
@@ -2714,7 +2714,7 @@ class HedgeThresholdFromMt5Test(unittest.TestCase):
     def test_a_setting_is_kept(self):
         pb.HEDGE_THRESHOLD_UNITS = 0.005
         bot = make_bot([])
-        bot.volume_min, bot.contract_size = 0.01, 100.0
+        bot.volume_min, bot.volume_step, bot.contract_size = 0.01, 0.01, 100.0
         bot._resolve_hedge_threshold()
         self.assertEqual(pb.HEDGE_THRESHOLD_UNITS, 0.005)
         bot.contract_size = 50.0
@@ -4213,6 +4213,46 @@ class VolumeCapTest(unittest.TestCase):
         bot._mt5_market(pb.OrderSide.BUY, 0.01)
         self.assertAlmostEqual(seen[0], 3_700.0)
         self.assertAlmostEqual(bot._vol_counted("mt5"), 3_700.0)  # a reject stays counted
+
+
+class SeedLedgersTest(unittest.TestCase):
+    """At startup a risk ledger off the venue's real position by HALF a size
+    step or more is re-seeded (2026-11-18: Blueberry's minimum and step are
+    1 oz, and a phantom -1 oz short - exactly one minimum - survived every
+    restart and was marked into the day's PnL, which slid while flat)."""
+
+    def _bot(self, venue_ledger_units, venue_units, mt5_ledger_units=0.0, mt5_units=0.0):
+        bot = make_bot([])
+        self.logs = []
+        pb._log = lambda m, _a=self.logs: _a.append(m)
+        bot.venue = types.SimpleNamespace(amount_min=1.0, amount_step=1.0)
+        bot.venue_ledger.seed(venue_ledger_units, 3732.45)
+        bot.mt5_ledger.seed(mt5_ledger_units, 3742.0)
+        bot.venue_pos_units = venue_units
+        bot.venue_entry_px, bot.mark_px, bot.venue_ticker = None, 3730.0, None
+        bot._read_mt5_book = lambda: (mt5_units, 3742.0)
+        bot.volume_min, bot.volume_step, bot.contract_size = 0.01, 0.01, 100.0
+        bot.day = pb.DayBook(date=pb._day())
+        return bot
+
+    def test_a_ledger_one_minimum_off_is_re_seeded(self):
+        bot = self._bot(-1.0, 0.0)
+        bot._seed_ledgers()
+        self.assertEqual(bot.venue_ledger.inv_units, 0.0)
+        self.assertTrue(any("re-seeded" in m and "perp -1.0000 -> +0.0000" in m
+                            for m in self.logs))
+
+    def test_a_matching_ledger_keeps_its_basis(self):
+        bot = self._bot(5.0, 5.2)                 # inside half a step (0.5)
+        bot._seed_ledgers()
+        self.assertEqual(bot.venue_ledger.inv_units, 5.0)
+        self.assertEqual(bot.venue_ledger.avg_cost, 3732.45)
+        self.assertFalse(any("re-seeded" in m for m in self.logs))
+
+    def test_the_hedge_ledger_one_min_lot_off_is_re_seeded(self):
+        bot = self._bot(0.0, 0.0, mt5_ledger_units=1.0, mt5_units=0.0)   # 0.01 lot = 1 oz
+        bot._seed_ledgers()
+        self.assertEqual(bot.mt5_ledger.inv_units, 0.0)
 
 
 class VenueSwapTermsTest(unittest.TestCase):
